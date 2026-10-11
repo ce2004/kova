@@ -174,9 +174,11 @@ namespace TailRemote
             Native.FollowInputDesktop = true;
             var clip = new ClipboardSetter();
             var reader = new ClipboardReader();
-            // The remote screen is taken here, at the screen: the service in session 0 cannot see it.
+            // The remote screen is taken here, at the screen: the service in session 0 cannot see it. Any of
+            // the PC's screens, as each viewer chooses.
+            var screens = new ScreenSource();
             AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), (kind, a, b) => Native.SendMouse(kind, a, b), clip.Arrived, clip.FilesArrived, reader.Read,
-                new ScreenVideo(new ScreenSource().Take));
+                new ScreenVideo(screens.Take, screens.Screens));
             return 0;
         }
 

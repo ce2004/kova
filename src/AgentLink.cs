@@ -25,7 +25,7 @@ namespace TailRemote
         // Agent to service: the clipboard it read, in answer to a GetMessage (text, or file paths).
         private const byte ClipTextMessage = (byte)'t', ClipFilesMessage = (byte)'f';
         // The remote screen, which only the agent can see: the service asks for a viewer's next picture
-        // (i32 request, i32 viewer, u8 whole, u16 widest, u8 quality, u8 most a second, i32 H.264 kbit/s) and the agent
+        // (i32 request, i32 viewer, u8 whole, u16 widest, u8 quality, u8 most a second, i32 H.264 kbit/s, u8 which screen) and the agent
         // answers (i32 request, u8 1 + the update, or u8 0: no picture to take). 'X' (i32 viewer): that
         // viewer has gone.
         private const byte VideoMessage = (byte)'V', VideoForgetMessage = (byte)'X', VideoReplyMessage = (byte)'v';
@@ -106,7 +106,7 @@ namespace TailRemote
                 _videoWaits[id] = wait;
                 try
                 {
-                    byte[] m = new byte[17];
+                    byte[] m = new byte[21];
                     BitConverter.TryWriteBytes(m.AsSpan(0), id);
                     BitConverter.TryWriteBytes(m.AsSpan(4), viewer);
                     m[8] = (byte)(whole ? 1 : 0);
@@ -114,6 +114,7 @@ namespace TailRemote
                     m[11] = (byte)settings.Quality;
                     m[12] = (byte)settings.Fps;
                     BitConverter.TryWriteBytes(m.AsSpan(13), settings.VideoKbps);
+                    BitConverter.TryWriteBytes(m.AsSpan(17), settings.Screen); // the screen and how many asks (ScreenVideo.ChooseScreen)
                     if (!_out.TryAdd((VideoMessage, m))) return TooSlow;
                     return wait.Task.Wait(5000) ? wait.Task.Result : _pipe == null ? null : TooSlow;
                 }
@@ -296,11 +297,11 @@ namespace TailRemote
                                     t => Reply(ClipTextMessage, Encoding.UTF8.GetBytes(t)),
                                     paths => Reply(ClipFilesMessage, Encoding.UTF8.GetBytes(string.Join("\n", paths))));
                                 break;
-                            case VideoMessage when n == 17 && screen != null:
+                            case VideoMessage when n == 21 && screen != null:
                                 {
                                     int id = BitConverter.ToInt32(p, 0), viewer = BitConverter.ToInt32(p, 4);
                                     bool whole = p[8] == 1;
-                                    var settings = new VideoSettings(BitConverter.ToUInt16(p, 9), p[11], p[12], BitConverter.ToInt32(p, 13));
+                                    var settings = new VideoSettings(BitConverter.ToUInt16(p, 9), p[11], p[12], BitConverter.ToInt32(p, 13), BitConverter.ToInt32(p, 17));
                                     newest[viewer] = id;
                                     pictures.TryAdd(() =>
                                     {

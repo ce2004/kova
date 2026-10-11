@@ -10,7 +10,8 @@ namespace TailRemote
     /// taken or sent until then, and closing it stops it. Opens maximized, so the picture is as near its
     /// real size as this screen allows, which suits NVDA's OCR (NVDA+R) as well as anyone watching.
     /// Escape goes back to the main window and leaves it on; Control Shift S turns it off (closes it);
-    /// F5 asks for a whole new picture; Control Shift Enter controls the remote PC.
+    /// F5 asks for a whole new picture; Control Shift Enter controls the remote PC; 1 to 9, Page Down and
+    /// Page Up choose which of the remote PC's screens is shown.
     /// Minimized, it pauses: the remote PC takes no pictures while there is nothing to look at.
     /// After a dropped connection it carries on with the next one by itself.
     /// </summary>
@@ -55,11 +56,57 @@ namespace TailRemote
 
         public static string Rate(int fps) => fps + (fps == 1 ? " frame" : " frames") + " a second";
 
-        /// <summary>The frames a second in the title bar, always, so NVDA+T reads it (0 while the screen is still).</summary>
+        /// <summary>
+        /// The frames a second in the title bar, always, so NVDA+T reads it (0 while the screen is still);
+        /// and which screen is shown when the remote PC has more than one.
+        /// </summary>
         private void ShowRate()
         {
-            string t = "Kova - remote screen, " + Rate(PerSecond);
+            string which = _stream?.Screens is { Count: > 1 } c ? "screen " + (c.Shown + 1) + " of " + c.Count + ", " : "";
+            string t = "Kova - remote screen, " + which + Rate(PerSecond);
             if (Text != t) Text = t;
+        }
+
+        // A screen was chosen here: the host's answer is said (once), rather than every time it says which.
+        private bool _sayScreen;
+
+        /// <summary>
+        /// Shows another of the remote PC's screens (0: the first, the main one). What is known already is
+        /// said here (only one screen, no such screen, that one already); otherwise the host's answer is.
+        /// </summary>
+        private void ChooseScreen(int screen)
+        {
+            var s = _stream;
+            if (s == null) { _say("Not watching the remote screen right now."); return; }
+            var c = s.Screens;
+            if (c != null)
+            {
+                if (c.Count == 1) { _say("The remote PC has only one screen."); return; }
+                if (screen >= c.Count) { _say("There is no screen " + (screen + 1) + ". The remote PC has " + c.Count + " screens."); return; }
+                if (screen == c.Shown && !c.Refused) { _say(c.Say()); return; }
+            }
+            _sayScreen = true;
+            s.ChooseScreen(screen);
+        }
+
+        /// <summary>The next or previous screen, round and round (Page Down, Page Up).</summary>
+        private void NextScreen(int by)
+        {
+            var c = _stream?.Screens;
+            if (c == null) { ChooseScreen(0); return; }
+            ChooseScreen(((c.Shown + by) % c.Count + c.Count) % c.Count);
+        }
+
+        private int? _lastShown;
+
+        private void ScreenTold(ScreenChoice c)
+        {
+            ShowRate();
+            int? before = _lastShown;
+            _lastShown = c.Shown;
+            if (_sayScreen) { _sayScreen = false; _say(c.Say()); return; }
+            // Not asked for here: the screen being shown was unplugged on the remote PC, and it went back to the main one.
+            if (before is int was && was != c.Shown && !c.Refused) _say("Screen " + (was + 1) + " is gone from the remote PC. " + c.Say());
         }
 
         /// <summary>Watching whichever connection is in front now: a new one after a reconnect or a switch of PC.</summary>
@@ -88,12 +135,21 @@ namespace TailRemote
                     {
                         _view.Note = null;
                         _view.Invalidate();
-                        if (!_saidShowing) { _saidShowing = true; _saidNote = null; _say("Showing the remote screen. Escape goes back to the main window; Control Shift S turns it off."); }
+                        if (!_saidShowing)
+                        {
+                            _saidShowing = true; _saidNote = null;
+                            // The host says how many screens it has before its first picture: the keys are
+                            // only mentioned where there is a choice to make.
+                            int count = s.Screens?.Count ?? 1;
+                            _say("Showing the remote screen. Escape goes back to the main window; Control Shift S turns it off."
+                                + (count > 1 ? " The remote PC has " + count + " screens: Page Down shows the next." : ""));
+                        }
                     });
                 }
                 catch { }
             };
             s.Note += t => { try { BeginInvoke(() => Note(t)); } catch { } };
+            s.ScreenTold += c => { try { BeginInvoke(() => { if (_stream == s) ScreenTold(c); }); } catch { } };
             if (_minimized) s.Pause(true);
             _stream = s;
             _view.Stream = s;
@@ -115,6 +171,12 @@ namespace TailRemote
             else if (e.KeyCode == Keys.S && e.Control && e.Shift && !e.Alt) { Close(); _say("unchecked. Stopped showing the remote screen."); e.Handled = true; }
             else if (e.KeyCode == Keys.F5) { _stream?.Refresh(); _say("A whole new picture."); e.Handled = true; }
             else if (e.KeyCode == Keys.Enter && e.Control && e.Shift) { _controlRemote(); e.Handled = true; }
+            // The remote PC's screens: 1 to 9 pick one (on the number row or the number pad), Page Down and
+            // Page Up go to the next and the previous.
+            else if (e.Modifiers == Keys.None && e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D9) { ChooseScreen(e.KeyCode - Keys.D1); e.Handled = true; }
+            else if (e.Modifiers == Keys.None && e.KeyCode >= Keys.NumPad1 && e.KeyCode <= Keys.NumPad9) { ChooseScreen(e.KeyCode - Keys.NumPad1); e.Handled = true; }
+            else if (e.Modifiers == Keys.None && e.KeyCode == Keys.PageDown) { NextScreen(1); e.Handled = true; }
+            else if (e.Modifiers == Keys.None && e.KeyCode == Keys.PageUp) { NextScreen(-1); e.Handled = true; }
             base.OnKeyDown(e);
         }
 

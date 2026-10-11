@@ -58,6 +58,9 @@ namespace TailRemote
         private readonly MenuItem _muteLocal = Menus.Check("&Mute the remote PC while you are not controlling it (it stays connected)");
         private readonly MenuItem _rideOut = Menus.Check("Ride out &Wi-Fi scans: when the sound keeps stalling, hold enough to cover it (a little more delay until it stops)");
         private readonly MenuItem _switchTo = new("Switch &to PC");
+        // Wake-on-LAN for saved PCs: sent from here and from every PC connected to, then it connects.
+        private readonly MenuItem _wake = new("Wa&ke a saved PC and connect");
+        private readonly MenuItem _announceHealth = Menus.Check("Announce the remote PC's heal&th: on battery, battery low, drive nearly full, processor busy, memory nearly gone");
         private readonly MenuItem _speedHere = new("Meas&ure this PC's internet speed...") { WhyNot = "A speed test is already running on this PC." };
         private readonly MenuItem _speedRemote = new("Measure the r&emote PC's internet speed...");
         private readonly MenuItem _backup = new("&Back up settings to a file...");
@@ -128,7 +131,7 @@ namespace TailRemote
             var file = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _go, _switchTo, _toggle, _watch, _restart, _remoteInfo, _updateRemote, _streaming.Item, new ToolStripSeparator(),
+                _go, _switchTo, _wake, _toggle, _watch, _restart, _remoteInfo, _updateRemote, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 _mode.Menu, _saved.Menu, _address.Item, _port.Item, _password.Item, _listenPassword.Item, _copyAddress,
                 _savePc, _forgetPc, new ToolStripSeparator(),
@@ -142,7 +145,7 @@ namespace TailRemote
             var set = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _quality.Menu, _announceQuality, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _speedUp, _sounds, new ToolStripSeparator(),
+                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _speedUp, _sounds, new ToolStripSeparator(),
                 _startup, _service, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
                 _backup, _restore, _logging,
             });
@@ -162,6 +165,7 @@ namespace TailRemote
             _logging.Checked = _settings.Logging;
             _speedUp.Checked = _settings.CatchUpBySpeed;
             _announceQuality.Checked = _settings.AnnounceQuality;
+            _announceHealth.Checked = _settings.AnnounceHealth;
             _muteLocal.Checked = _settings.MuteWhenNotControlling;
             _rideOut.Checked = _settings.RideOutStalls;
             ApplyReceiveFolder();
@@ -253,6 +257,9 @@ namespace TailRemote
             _switchTo.DropDownItems.Add("(filled in when opened)");
             _switchTo.DropDownOpening += (_, _) => FillSwitchMenu();
             _announceQuality.CheckedChanged += (_, _) => SaveSettings();
+            _announceHealth.CheckedChanged += (_, _) => SaveSettings();
+            _wake.DropDownOpening += (_, _) => FillWakeMenu();
+            _wake.DropDownItems.Add(new ToolStripMenuItem("...")); // so it shows as a submenu before it is first filled
             _muteLocal.CheckedChanged += (_, _) => { SaveSettings(); ApplyMute(); };
             _rideOut.CheckedChanged += (_, _) => { SaveSettings(); if (_player != null) _player.RideOut = _rideOut.Checked; };
             _audioSetup.Click += (_, _) => Menus.AfterMenu(() => SetUpAudio());
@@ -330,7 +337,7 @@ namespace TailRemote
             _streaming.Item.Available = !host;
             _toggle.Available = !host;
             _restart.Available = _updateRemote.Available = _remoteInfo.Available = _watch.Available = _getFiles.Available = _getClipboard.Available = _speedRemote.Available = _switchTo.Available = !host;
-            _announceQuality.Available = _muteLocal.Available = _rideOut.Available = !host;
+            _announceQuality.Available = _announceHealth.Available = _muteLocal.Available = _rideOut.Available = _wake.Available = !host;
             _startup.Available = host;
             _service.Available = host;
             _startup.Enabled = !_service.Checked; // the service replaces the at-sign-in task
@@ -963,6 +970,69 @@ namespace TailRemote
             _parked.Clear();
         }
 
+        /// <summary>The remote PC's battery, drive space, processor or memory: said if wanted, with its name when it waits in the background.</summary>
+        private void HealthSaid(Client c, string text)
+        {
+            if (!_announceHealth.Checked) return;
+            if (_parked.Find(p => p.Client == c) is Parked bg) Speak(bg.Name + ", in the background: " + text);
+            else if (c == _client) Speak(text);
+        }
+
+        /// <summary>Keeps a saved PC's network cards (told by it while connected), so it can be woken later.</summary>
+        private void RememberWake(string address, int port, string info)
+        {
+            if (info.Length == 0) return;
+            var pc = _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port));
+            if (pc == null || pc.Wake == info) return;
+            pc.Wake = info;
+            try { _settings.Save(); } catch { }
+        }
+
+        /// <summary>File, Wake a saved PC and connect: every saved PC, and whether Kova knows how to wake it yet.</summary>
+        private void FillWakeMenu()
+        {
+            var items = _wake.DropDownItems;
+            items.Clear();
+            foreach (var pc in _settings.SavedPcs)
+            {
+                bool known = Wake.Parse(pc.Wake).Count > 0;
+                var item = new ToolStripMenuItem((pc + (known ? "" : ", not known yet: connect to it once while it is on")).Replace("&", "&&"));
+                item.Click += (_, _) => Menus.AfterMenu(() => WakePc(pc));
+                items.Add(item);
+            }
+            if (items.Count == 0) items.Add(new MenuStatus("There are no saved PCs yet. Connect to one, then File, Save this PC.").Item);
+        }
+
+        private void WakePc(SavedPc pc)
+        {
+            Doing("waking " + pc);
+            if (HostMode) { Say("Waking PCs works in Control another PC mode."); return; }
+            if (_connecting && !_reconnecting) { Say("Still connecting. Try again in a moment."); return; }
+            var cards = Wake.Parse(pc.Wake);
+            if (cards.Count == 0)
+            {
+                Say("Kova does not know how to wake " + pc + " yet. Connect to it once while it is on, and Kova learns it. Its network card must also allow Wake-on-LAN.");
+                return;
+            }
+            // From every PC connected to as well: a wake signal only reaches its own network, so a PC on the
+            // sleeping one's network (another PC at home) is what gets it there when this one is away.
+            var relays = new System.Collections.Generic.List<Client>();
+            if (_client is { CanWake: true } front) relays.Add(front);
+            relays.AddRange(_parked.Select(p => p.Client).Where(c => c.CanWake));
+            foreach (var c in relays) c.SendWake(cards.Select(x => x.Mac).ToArray());
+            System.Threading.ThreadPool.QueueUserWorkItem(_ => { foreach (var (mac, broadcast) in cards) try { Wake.Send(mac, new[] { broadcast }); } catch { } });
+            Say("Sent the wake signal to " + pc + " from this PC" + (relays.Count == 0 ? "" : " and from " + relays.Count + (relays.Count == 1 ? " connected PC" : " connected PCs")) + ".");
+            _waking = pc.ToString();
+            _wakingSince = Environment.TickCount64;
+            SwitchTo(pc.Address, pc.Port, Settings.Unprotect(pc.PasswordEnc), pc.ToString());
+        }
+
+        // A PC just sent the wake signal: while it starts up, not answering is expected, not an error.
+        private string? _waking;
+        private long _wakingSince;
+        private bool WakingUp(string address, int port) =>
+            _waking != null && Environment.TickCount64 - _wakingSince < 5 * 60_000 && _settings.SavedPcs.Any(p => p.ToString() == _waking && SamePc(p.Address, p.Port, address, port));
+
         /// <summary>File, Switch to PC: every saved PC with its key and whether it is in front, in the background or not connected.</summary>
         private void FillSwitchMenu()
         {
@@ -1157,6 +1227,7 @@ namespace TailRemote
                 DiagLog.Enabled = _settings.Logging;
                 _speedUp.Checked = _settings.CatchUpBySpeed;
                 _announceQuality.Checked = _settings.AnnounceQuality;
+                _announceHealth.Checked = _settings.AnnounceHealth;
                 _muteLocal.Checked = _settings.MuteWhenNotControlling;
                 _rideOut.Checked = _settings.RideOutStalls;
                 _quality.SelectedIndex = Math.Clamp(_settings.SoundQuality + 1, 0, _quality.Count - 1);
@@ -1405,6 +1476,10 @@ namespace TailRemote
             bool isNew = pc == null;
             pc ??= new SavedPc { Address = address, Port = port };
             pc.PasswordEnc = Settings.Protect(_password.Text);
+            // Connected to it now (in front or in the background): how to wake it is known already.
+            string? wake = _client != null && SamePc(FrontAddress, FrontPort, address, port) ? _client.WakeInfo
+                : _parked.Find(x => SamePc(x.Address, x.Port, address, port))?.Client.WakeInfo;
+            if (!string.IsNullOrEmpty(wake)) pc.Wake = wake;
             if (isNew) _settings.SavedPcs.Add(pc);
             SaveSettings();
             FillSaved();
@@ -1535,6 +1610,7 @@ namespace TailRemote
             _settings.Logging = _logging.Checked;
             _settings.CatchUpBySpeed = _speedUp.Checked;
             _settings.AnnounceQuality = _announceQuality.Checked;
+            _settings.AnnounceHealth = _announceHealth.Checked;
             _settings.MuteWhenNotControlling = _muteLocal.Checked;
             _settings.RideOutStalls = _rideOut.Checked;
             _settings.SoundQuality = _quality.SelectedIndex - 1;
@@ -1791,6 +1867,9 @@ namespace TailRemote
                 c.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 c.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 c.TransferProgress += t => Later(() => ShowTransfer(t));
+                c.HealthAlert += text => Later(() => HealthSaid(c, text));
+                c.WakeInfoKnown += info => Later(() => RememberWake(address, port, info));
+                if (c.WakeInfo is string knownNow) RememberWake(address, port, knownNow); // it can come before the line above
                 _client = c;
                 if (!c.ListenOnly) _keys?.SetClient(c); // a listener never sends keys
                 ApplyMute();
@@ -1825,8 +1904,12 @@ namespace TailRemote
                 {
                     _reconnecting = true;
                     _retryTimer.Start();
-                    Tone(Sounds.Tone.Error);
-                    Say("Could not connect: " + e.Message + " Trying again every second until you press Disconnect.");
+                    if (WakingUp(address, port)) Say("Waiting for " + _waking + " to wake up. Kova connects as soon as it answers; press Disconnect to stop.");
+                    else
+                    {
+                        Tone(Sounds.Tone.Error);
+                        Say("Could not connect: " + e.Message + " Trying again every second until you press Disconnect.");
+                    }
                 }
             }
             catch { } // an abandoned attempt failing: nobody is waiting for it

@@ -550,6 +550,39 @@ namespace TailRemote
                 || AudioSetup.SignerIsVbAudio("CN=NOT BUREL VINCENT LTD, O=Someone, C=US")
                 || AudioSetup.SignerIsVbAudio("CN=Someone, OU=BUREL VINCENT, C=US"))
                 return Fail("VB-Cable's signer check took the wrong certificate names");
+            // The remote PC's health: each thing said once, at the right moment, and again only after it got better.
+            {
+                var w = new HealthWatch();
+                long t = 0;
+                HealthSample S(bool onBattery, int battery, long freeGb = 100, int cpu = 10, int mem = 40) =>
+                    new(true, onBattery, battery, "C:", freeGb << 30, 200L << 30, cpu, mem);
+                var said = new System.Collections.Generic.List<string>();
+                void Look(HealthSample s) { said.AddRange(w.Next(s, t)); t += HealthWatch.EveryMs; }
+                Look(S(false, 90));                           // plugged in, all well: nothing
+                Look(S(true, 89));                            // unplugged
+                Look(S(true, 20)); Look(S(true, 19));         // low, said once
+                Look(S(true, 9));                             // very low
+                Look(S(false, 9));                            // plugged in again
+                Look(S(false, 50, freeGb: 1)); Look(S(false, 50, freeGb: 1)); // drive nearly full, said once
+                for (int i = 0; i < 5; i++) Look(S(false, 50, cpu: 99));     // busy, but not yet a minute
+                int beforeMinute = said.Count;
+                Look(S(false, 50, cpu: 99));                  // a whole minute busy
+                Look(S(false, 50, cpu: 99));                  // still busy: not again
+                string[] want = { "now running on its battery, 89", "battery is low, 20", "very low, 9", "plugged in again, 9", "nearly full: 1.0 gigabytes", "processor has been busy" };
+                if (said.Count != want.Length || !said.Zip(want).All(p => p.First.Contains(p.Second)) || beforeMinute != 5)
+                    return Fail("health alerts said: " + string.Join(" / ", said));
+                if (HealthWatch.Standing(S(true, 8, freeGb: 1)).Count != 2 || HealthWatch.Standing(S(false, 80)).Count != 0)
+                    return Fail("health on connecting was wrong");
+            }
+            // Wake-on-LAN: the packet, and the broadcast address of the network the card was on.
+            {
+                byte[] mac = Convert.FromHexString("0A1B2C3D4E5F");
+                byte[] p = Wake.MagicPacket(mac);
+                if (p.Length != 102 || p.Take(6).Any(b => b != 0xFF) || !p.AsSpan(96, 6).SequenceEqual(mac)) return Fail("the wake packet is wrong");
+                var cards = Wake.Parse("0A1B2C3D4E5F 192.168.1.20/24\n0A1B2C3D4E60 10.0.5.9/16\nnonsense\n0A1B 1.2.3.4/24");
+                if (cards.Count != 2 || cards[0].Broadcast?.ToString() != "192.168.1.255" || cards[1].Broadcast?.ToString() != "10.0.255.255")
+                    return Fail("wake broadcast addresses: " + string.Join(", ", cards.Select(c => c.Broadcast)));
+            }
             // Release tags: a v or V, a -beta or +build, two or four parts all read as a three-part
             // version (Version.Parse failed on all but "v4.0.0"), and 3.10.0 is newer than 3.9.0.
             {
@@ -1134,6 +1167,36 @@ namespace TailRemote
                 finally { Mf.TestUnavailable = false; }
                 h264Note += "; odd sizes exact once still" + (hasH264 ? ", a forced key frame shows on a fresh decoder" : "") + ", without Media Foundation still pictures follow";
                 var real = ScreenCapture.Capture(0);
+                // Which screen: a PC with 3 says so first, then shows the one chosen at its own size; one it
+                // does not have is refused and the one shown stays. And this PC's own list has a main screen.
+                {
+                    var three = new TestScreens();
+                    var several = new ScreenVideo(three.Take, three.Screens);
+                    var exact3 = new VideoSettings(0, VideoSettings.Lossless, 15);
+                    byte[]? said = several.Update(1, true, exact3);
+                    var first = said is { Length: > 1 } && said[0] == ScreenVideo.ScreenNote ? ScreenChoice.From(said, 1, said.Length - 1) : null;
+                    if (first == null || first.Count != 3 || first.Shown != 0 || !first.Screen.Main) return Fail("a PC with 3 screens did not say so first");
+                    if (several.Update(1, true, exact3) is not { Length: > 0 } mainPicture || mainPicture[0] != ScreenVideo.StillPicture || BitConverter.ToUInt16(mainPicture, 1) != 640)
+                        return Fail("after saying which screen, the main one was not shown");
+                    said = several.Update(1, false, exact3 with { Screen = 2 });
+                    var chose = said is { Length: > 1 } && said[0] == ScreenVideo.ScreenNote ? ScreenChoice.From(said, 1, said.Length - 1) : null;
+                    if (chose == null || chose.Shown != 2 || chose.Refused || chose.Say() != "Screen 3 of 3, 320 by 480, left of the main screen.")
+                        return Fail("choosing screen 3 said " + (chose?.Say() ?? "nothing"));
+                    using (var canvas3 = new VideoCanvas())
+                    {
+                        byte[]? third = several.Update(1, false, exact3 with { Screen = 2 });
+                        if (third is not { Length: > 0 } || canvas3.Apply(third, 0) <= 0) return Fail("screen 3 was not shown after choosing it");
+                        var t3 = three.All[2];
+                        if (canvas3.At(319, 479) != t3.At(319, 479) || canvas3.At(t3.SquareX + 5, t3.SquareY + 5) != t3.At(t3.SquareX + 5, t3.SquareY + 5) || canvas3.At(320, 0) != System.Drawing.Color.Empty)
+                            return Fail("screen 3 was not shown exactly at its own size");
+                    }
+                    said = several.Update(1, false, exact3 with { Screen = 8 });
+                    var no = said is { Length: > 1 } && said[0] == ScreenVideo.ScreenNote ? ScreenChoice.From(said, 1, said.Length - 1) : null;
+                    if (no == null || !no.Refused || no.Shown != 2 || no.Asked != 8) return Fail("screen 9 of 3 was not refused (" + (no?.Say() ?? "nothing said") + ")");
+                    var mine = ScreenCapture.Screens();
+                    if (mine.Count(s => s.Main) != 1 || !mine[0].Main || mine.Any(s => s.Width <= 0 || s.Height <= 0)) return Fail("this PC's screens have no main one first (" + mine.Count + " found)");
+                    lossless += " | which screen: told, chosen, shown exactly, 9 of 3 refused; this PC has " + mine.Count + (mine.Count == 1 ? " screen" : " screens");
+                }
                 lossless += " | remote screen: exact, follows changes, pauses, climbs to lossless, says why, listeners refused; " + h264Note + "; this screen " +
                     (real == null ? "cannot be taken here" : real.Width + " by " + real.Height);
             }

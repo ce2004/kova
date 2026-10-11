@@ -58,9 +58,11 @@ namespace TailRemote
         public const byte VideoAgain = 3;           // viewer: a whole new picture, please
         public const byte VideoPause = 4;           // viewer: u8 1 = nothing to look at (minimized): no pictures taken or sent; 0 = carry on
         public const byte VideoNoH264 = 5;          // viewer: H.264 cannot be shown here (no decoder, or it keeps failing): still pictures only
+        public const byte VideoChooseScreen = 6;    // viewer: u8 which of the host's screens to show (0 = the first, the main one); an older host ignores it
         public const byte VideoPicture = 0x81;      // host: u32 number, then an update (ScreenVideo)
         public const byte VideoNote = 0x82;         // host: UTF-8, why there is no picture
         public const byte VideoStill = 0x83;        // host: nothing changed, the line is alive
+        public const byte VideoScreen = 0x84;       // host: which screen is shown and how many there are (ScreenChoice), before its first picture and after each choice
         public const int MaxViewers = 8;
 
         public static string VideoPurpose(ReadOnlySpan<byte> hostValue, ReadOnlySpan<byte> clientValue) =>
@@ -82,6 +84,7 @@ namespace TailRemote
         public const byte AudioPause = 14; // u8: 1 = send this PC no sound at all (muted while not controlling, or waiting in the background), 0 = send it again
         public const byte Mouse = 15;     // u8 kind (MouseMove: i16 dx, i16 dy; MouseWheel / MouseSideWheel: i16 amount, i16 0). Buttons go as Key (Native.VkLeftButton...)
         public const byte MouseMove = 0, MouseWheel = 1, MouseSideWheel = 2;
+        public const byte WakeRequest = 16; // 6-byte network card address: send a Wake-on-LAN packet on the host's network (Wake)
         public const byte ClipboardRequest = 13; // the controller asks the host to send its clipboard here (text or files), like Send the clipboard but pulled
         // A clipboard pull reads the clipboard and fans a transfer out to every controller; the host
         // window's message pump drowns under the progress updates if the controller mashes or holds
@@ -97,6 +100,8 @@ namespace TailRemote
         public const byte FolderList = 0x85; // u32 request id, UTF-8 lines: one per entry, tab-separated: D name, F name bytes modified-ticks, or E problem
         public const byte Info = 0x86;       // UTF-8 lines about the host PC, for Remote PC info
         public const byte SpeedResult = 0x87; // UTF-8 lines: the host's internet speed test
+        public const byte WakeInfo = 0x88;    // UTF-8 (Wake.Describe): the host's network cards, kept with the saved PC to wake it later
+        public const byte HealthAlert = 0x89; // UTF-8 sentence: something about the host PC worth saying (HealthWatch)
         public const byte Leaving = 0x83; // u8 why (Leaving*), then UTF-8 detail (the new version when updating): sent just before the host closes on purpose
         // 0x84 was CaptureBurst (1.7.x): no longer sent, never reuse it
 
@@ -127,6 +132,7 @@ namespace TailRemote
         public const uint FeatureSendTo = 256;
         public const uint FeatureVideo = 512; // the remote screen (video lanes)
         public const uint FeatureMouse = 1024; // Mouse messages and mouse buttons as keys
+        public const uint FeatureWake = 2048;  // WakeRequest
 
         /// <summary>
         /// The bitrate steps, best first. 5 ms packets down to 128 kbit/s (Opus's
@@ -148,7 +154,7 @@ namespace TailRemote
         public static int WireKbps(int step) => OpusSteps[step].Kbps + 1000 / OpusSteps[step].Ms * PacketOverheadBytes * 8 / 1000;
 
         /// <summary>What this version supports, sent to the other side after login.</summary>
-        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse;
+        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake;
 
 
         // ---- The login, damage-proof ----

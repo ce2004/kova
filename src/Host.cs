@@ -88,6 +88,7 @@ namespace TailRemote
             public long VideoFloorUntil, VideoLastDown, VideoBackoffMs = 30_000;
             public bool VideoClimbed;
             public uint PeerFeatures;
+            public long LastWakeAt;
             public volatile bool Ready; // its features message came: it has said everything it wants first (a locked bitrate)
             public volatile int Quality; // the bitrate step (0 = the best); the client asks for lower while its connection struggles
             public volatile bool Paused; // it asked for no sound (AudioPause): muted, so nothing is encoded or sent for it
@@ -113,7 +114,7 @@ namespace TailRemote
             _listenKey = string.IsNullOrEmpty(listenPassword) ? null : Protocol.DeriveKey(listenPassword, _salt);
             _status = msg => { DiagLog.Write("host: " + msg); status(msg); };
             _screenSource = new ScreenSource();
-            var screen = new ScreenVideo(_screenSource.Take);
+            var screen = new ScreenVideo(_screenSource.Take, _screenSource.Screens);
             VideoUpdate = screen.Update;
             VideoForget = screen.Forget;
 
@@ -141,6 +142,7 @@ namespace TailRemote
             // Only once the port is ours: started before it, a busy port left these two running for good.
             new Thread(LogLoop) { IsBackground = true, Name = "Kova host log" }.Start();
             new Thread(KeySafety) { IsBackground = true, Name = "Kova key safety" }.Start();
+            new Thread(HealthLoop) { IsBackground = true, Name = "Kova health", Priority = ThreadPriority.BelowNormal }.Start();
 
             // No capture yet: the sound is taken only while some PC wants it (AudioDemand).
             new Thread(AudioDemand) { IsBackground = true, Name = "Kova sound on demand" }.Start();
@@ -790,6 +792,10 @@ namespace TailRemote
                     Link = new SecureLink(key, nonce, clientNonce, isHost: true, maxReceive: role == Protocol.RoleListen ? 64 << 10 : SecureLink.MaxMessage),
                 };
                 s.Link.Send(s.Stream, Protocol.FeaturesMessage(SecureAttention != null ? Protocol.FeatureSecureAttention : 0));
+                // How to wake this PC later (its network cards), and anything about it already worth knowing.
+                if (role == Protocol.RoleControl && Wake.Describe() is { Length: > 0 } cards) Send(s, Protocol.WakeInfo, cards);
+                if (role == Protocol.RoleControl && Volatile.Read(ref _lastHealth) is HealthSample health)
+                    foreach (string line in HealthWatch.Standing(health)) Send(s, Protocol.HealthAlert, line);
                 EndHandshake(remote, tcp);
                 MarkKnown(remote); // the proof verified: this block keeps reserved slots in future floods
                 counted = false;
@@ -925,6 +931,7 @@ namespace TailRemote
             int slow = 0;
             int whole = 1, paused = 0, closed = 0; // whole: set by either thread, taken by the loop (Interlocked)
             int noH264 = 0; // the viewer cannot show H.264: still pictures only, for this line
+            int screen = 0; // which of this PC's screens the viewer asked for (0: the main one); ScreenVideo checks it
             uint acked = 0;
             var got = new AutoResetEvent(false);
             bool MayClimb(long t) => step > 0 && (step - 1 >= owner.VideoFloor || t > owner.VideoFloorUntil);
@@ -957,6 +964,9 @@ namespace TailRemote
                             // The viewer cannot show H.264 (no decoder, or it keeps failing): asking for key
                             // frames for ever would leave its picture frozen, so still pictures only.
                             case Protocol.VideoNoH264: Volatile.Write(ref noH264, 1); Volatile.Write(ref whole, 1); got.Set(); break;
+                            // Counted as well as kept (Screen = index, plus how many asks so far above it): asking for the
+                            // same screen again, after it was unplugged and is back, must count as a new ask.
+                            case Protocol.VideoChooseScreen when n == 2: Volatile.Write(ref screen, b[1] | ((((Volatile.Read(ref screen) >> 8) + 1) & 0xFFFFFF) << 8)); Volatile.Write(ref whole, 1); got.Set(); break;
                             case Protocol.VideoPause when n == 2:
                                 Volatile.Write(ref paused, b[1] != 0 ? 1 : 0);
                                 if (b[1] == 0) Volatile.Write(ref whole, 1);
@@ -988,7 +998,7 @@ namespace TailRemote
                     // H.264's share of the line while things move: most of the pace, less on the lower steps.
                     double linePace = Math.Max(16 << 10, Math.Min(TestPaceCap, Volatile.Read(ref owner.Pace)));
                     int kbps = (int)Math.Clamp(linePace * 8 / 1000 * 0.7 * Math.Pow(0.7, Math.Max(0, step - VideoSettings.Start)), 250, 40_000);
-                    var settings = VideoSettings.Ladder[step] with { VideoKbps = Volatile.Read(ref noH264) == 1 ? 0 : kbps };
+                    var settings = VideoSettings.Ladder[step] with { VideoKbps = Volatile.Read(ref noH264) == 1 ? 0 : kbps, Screen = Volatile.Read(ref screen) };
                     int fps = settings.Fps;
                     bool all = Interlocked.Exchange(ref whole, 0) == 1;
                     byte[]? update;
@@ -1030,6 +1040,15 @@ namespace TailRemote
                         // Taking the screen already waited for a change (Windows says the moment there is
                         // one), so only a moment more here: anything new shows straight away.
                         got.WaitOne(5);
+                        continue;
+                    }
+                    if (update[0] == ScreenVideo.ScreenNote)
+                    {
+                        // Not a picture: which screen is shown and how many there are (first, and after a
+                        // choice). Passed on as it is; the picture itself comes next time round, whole.
+                        Send(Protocol.VideoScreen, update.AsSpan(1));
+                        lastSent = now;
+                        Volatile.Write(ref whole, 1);
                         continue;
                     }
                     if (update.Length + 5 > SecureLink.MaxSend - 1024)
@@ -1144,6 +1163,18 @@ namespace TailRemote
                             }
                         }
                         break;
+                    case Protocol.WakeRequest when m.Length >= 7 && (m.Length - 1) % 6 == 0 && m.Length <= 1 + 6 * 8 && IsController(s):
+                        {
+                            // At most once a second per PC (each card is a few dozen packets onto this network); every
+                            // card of the PC to wake comes in the one request, so none is lost to that limit.
+                            long at = Environment.TickCount64;
+                            if (at - s.LastWakeAt < 1000) break;
+                            s.LastWakeAt = at;
+                            var macs = Enumerable.Range(0, (m.Length - 1) / 6).Select(i => m[(1 + 6 * i)..(7 + 6 * i)]).ToArray();
+                            ThreadPool.QueueUserWorkItem(_ => { foreach (var mac in macs) try { Wake.Send(mac, Array.Empty<IPAddress?>()); } catch { } });
+                            DiagLog.Write("host: " + s.Address + " asked to wake " + string.Join(", ", macs.Select(Convert.ToHexString)));
+                            break;
+                        }
                     case Protocol.Mouse when m.Length == 6 && m[1] <= Protocol.MouseSideWheel: // an unknown kind never reaches the agent
                         lock (_gate)
                         {
@@ -1282,6 +1313,44 @@ namespace TailRemote
                     // Anything else is from a newer version: ignore it.
                 }
             }
+        }
+
+        // ---- How this PC is doing (HealthWatch): said to every connected PC when something changes ----
+
+        /// <summary>Test only: readings instead of this PC's, and how often they are taken.</summary>
+        public static Func<HealthSample>? TestHealth;
+        public static int HealthEveryMs = HealthWatch.EveryMs;
+        private object? _lastHealth; // the last HealthSample (boxed, so it can be read whole from another thread)
+        private readonly HealthWatch _health = new();
+
+        private void HealthLoop()
+        {
+            while (!_stop)
+            {
+                try
+                {
+                    var sample = TestHealth?.Invoke() ?? HealthSample.Read();
+                    Volatile.Write(ref _lastHealth, sample);
+                    var lines = _health.Next(sample, Environment.TickCount64);
+                    foreach (string line in lines) DiagLog.Write("host health: " + line);
+                    // In order, one thread per PC: a PC that has stopped reading holds up nobody else.
+                    if (lines.Count > 0)
+                        foreach (var s in AllSessions().Where(x => x.Role == Protocol.RoleControl)) // a listener hears the sound, not how the PC is doing
+                            ThreadPool.QueueUserWorkItem(_ => { foreach (string line in lines) Send(s, Protocol.HealthAlert, line); });
+                }
+                catch { }
+                for (int waited = 0; waited < HealthEveryMs && !_stop; waited += 250) Thread.Sleep(Math.Min(250, HealthEveryMs));
+            }
+        }
+
+        /// <summary>A small message of one type with UTF-8 text; a PC that has gone is simply skipped.</summary>
+        private static void Send(Session s, byte type, string text)
+        {
+            byte[] t = System.Text.Encoding.UTF8.GetBytes(text);
+            byte[] m = new byte[1 + t.Length];
+            m[0] = type;
+            t.CopyTo(m, 1);
+            try { s.Link.Send(s.Stream, m); } catch { }
         }
 
         /// <summary>

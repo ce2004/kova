@@ -1,3 +1,9 @@
+4.1.0
+New feature: wake a sleeping or switched-off PC. File, Wake a saved PC and connect sends it the Wake-on-LAN signal, then connects as soon as it answers. Kova learns how to wake a saved PC the first time you connect to it while it is on. The signal is also sent through every PC you are connected to, so away from home you can connect to another PC there first and wake the rest through it. The PC's network card has to allow Wake-on-LAN.
+New feature: Kova tells you how the remote PC is doing. It says when the remote PC goes onto its battery or is plugged in, when the battery is low or very low, when its Windows drive is nearly full, when its processor has been busy for a whole minute, and when it is nearly out of memory. Each is said once, and problems that are already there are said when you connect. Turn it off in Settings, Announce the remote PC's health.
+New feature: if the remote PC has more than one screen, you can choose which one the remote screen window shows. Press 1 to 9 to pick a screen, or Page Down and Page Up for the next or previous one. Kova says which screen it is, its size and where it sits, for example "Screen 2 of 3, 1920 by 1080, right of the main screen", and the title bar says which screen you are on. This works when Kova runs as the service too.
+Changed: both PCs need Kova 4.1 for waking through another PC, health announcements and choosing a screen. With an older remote PC everything else works as before.
+
 4.0.0
 New feature: the mouse goes to the remote PC too. While you control it, moving the mouse, clicking and the wheel all happen there, and this PC's pointer stays put until you come back.
 Changed: Show the remote screen is now a checkbox in the File menu, like the other settings. Control Shift S turns it on and off.

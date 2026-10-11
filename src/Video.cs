@@ -13,9 +13,10 @@ namespace TailRemote
     /// <summary>
     /// How the screen is sent: its widest (0: as it is), the still pictures' quality (1 to 100 for JPEG;
     /// Lossless for PNG, every pixel exact) and most a second, and H.264's bitrate while things move
-    /// (kbit/s; 0: still pictures only).
+    /// (kbit/s; 0: still pictures only). Screen: which of the PC's screens the viewer asked for (0: the
+    /// first, the main one), passed along with the rest so it reaches the service's agent too.
     /// </summary>
-    internal readonly record struct VideoSettings(int MaxWidth, int Quality, int Fps, int VideoKbps = 0)
+    internal readonly record struct VideoSettings(int MaxWidth, int Quality, int Fps, int VideoKbps = 0, int Screen = 0)
     {
         public const int Lossless = 101;
 
@@ -45,6 +46,71 @@ namespace TailRemote
     }
 
     /// <summary>
+    /// One of a PC's screens, in real pixels. Windows always puts the main screen's top left corner at
+    /// 0,0, so X and Y are both where it is on the whole desktop and where it is from the main screen.
+    /// </summary>
+    internal readonly record struct ScreenInfo(int X, int Y, int Width, int Height, bool Main)
+    {
+        public Rectangle Area => new(X, Y, Width, Height);
+    }
+
+    /// <summary>
+    /// What the host says about its screens (Protocol.VideoScreen), before the first picture and after
+    /// each choice: which one is shown (0 = the first, the main one), how many there are, where the shown
+    /// one is, and whether the one just asked for does not exist (so the viewer can say so).
+    /// u8 shown, u8 count, u8 flags (1 = refused, 2 = the shown one is the main one), u8 asked,
+    /// i32 x, y, width, height, i32 the main screen's width, height.
+    /// </summary>
+    internal sealed record ScreenChoice(int Shown, int Count, bool Refused, int Asked, ScreenInfo Screen, int MainWidth, int MainHeight)
+    {
+        public const int Size = 28;
+
+        public byte[] ToBytes()
+        {
+            var b = new byte[Size];
+            b[0] = (byte)Shown; b[1] = (byte)Math.Min(255, Count); b[2] = (byte)((Refused ? 1 : 0) | (Screen.Main ? 2 : 0)); b[3] = (byte)Asked;
+            BitConverter.TryWriteBytes(b.AsSpan(4), Screen.X);
+            BitConverter.TryWriteBytes(b.AsSpan(8), Screen.Y);
+            BitConverter.TryWriteBytes(b.AsSpan(12), Screen.Width);
+            BitConverter.TryWriteBytes(b.AsSpan(16), Screen.Height);
+            BitConverter.TryWriteBytes(b.AsSpan(20), MainWidth);
+            BitConverter.TryWriteBytes(b.AsSpan(24), MainHeight);
+            return b;
+        }
+
+        /// <summary>Null when it is cut short or makes no sense (nothing is said rather than nonsense).</summary>
+        public static ScreenChoice? From(byte[] b, int offset, int n)
+        {
+            if (n < Size) return null;
+            int shown = b[offset], count = b[offset + 1];
+            if (count < 1 || shown >= count) return null;
+            var s = new ScreenInfo(BitConverter.ToInt32(b, offset + 4), BitConverter.ToInt32(b, offset + 8), BitConverter.ToInt32(b, offset + 12), BitConverter.ToInt32(b, offset + 16), (b[offset + 2] & 2) != 0);
+            if (s.Width <= 0 || s.Height <= 0) return null;
+            return new ScreenChoice(shown, count, (b[offset + 2] & 1) != 0, b[offset + 3], s, BitConverter.ToInt32(b, offset + 20), BitConverter.ToInt32(b, offset + 24));
+        }
+
+        /// <summary>Where the shown screen is, the way someone would say it: "right of the main screen".</summary>
+        public string Where()
+        {
+            if (Screen.Main) return "the main screen";
+            string across = Screen.X >= MainWidth ? "right of" : Screen.X + Screen.Width <= 0 ? "left of" : "";
+            string up = Screen.Y >= MainHeight ? "below" : Screen.Y + Screen.Height <= 0 ? "above" : "";
+            if (across == "" && up == "") return "overlapping the main screen";
+            return (up != "" && across != "" ? up + " and " + across : up + across) + " the main screen";
+        }
+
+        /// <summary>What NVDA says: "Screen 2 of 3, 1920 by 1080, right of the main screen."</summary>
+        public string Say()
+        {
+            if (Refused)
+                return Count == 1 ? "There is no screen " + (Asked + 1) + ". The remote PC has only one screen."
+                    : "There is no screen " + (Asked + 1) + ". The remote PC has " + Count + " screens; still showing screen " + (Shown + 1) + ".";
+            if (Count == 1) return "The remote PC has only one screen.";
+            return "Screen " + (Shown + 1) + " of " + Count + ", " + Screen.Width + " by " + Screen.Height + ", " + Where() + ".";
+        }
+    }
+
+    /// <summary>
     /// The screen, taken with GDI (in Windows, no packages). Run on the thread that asks: the agent's
     /// own, which follows the desktop that has the keyboard, so the lock screen and UAC prompts are
     /// seen from the service as well as the desktop. Null when there is nothing to take (a desktop
@@ -52,7 +118,8 @@ namespace TailRemote
     /// </summary>
     internal static class ScreenCapture
     {
-        public static Frame? Capture(int maxWidth)
+        /// <summary>The main screen, or the part of the desktop given (one of the other screens: ScreenInfo.Area).</summary>
+        public static Frame? Capture(int maxWidth, Rectangle? area = null)
         {
             // Real pixels: a thread not aware of the display's scaling gets a blurred, smaller copy.
             IntPtr dpi = SetThreadDpiAwarenessContext(new IntPtr(-4)); // PER_MONITOR_AWARE_V2
@@ -60,17 +127,18 @@ namespace TailRemote
             try
             {
                 if (Native.FollowInputDesktop) Native.FollowInputDesktopNow();
-                int w = GetSystemMetrics(0), h = GetSystemMetrics(1); // the main screen
+                int x0 = area?.X ?? 0, y0 = area?.Y ?? 0;
+                int w = area?.Width ?? GetSystemMetrics(0), h = area?.Height ?? GetSystemMetrics(1); // the main screen unless told
                 if (w <= 0 || h <= 0) return null;
                 int ow = w, oh = h;
                 if (maxWidth > 0 && w > maxWidth) { ow = maxWidth; oh = Math.Max(1, (int)((long)h * maxWidth / w)); }
-                screen = GetDC(IntPtr.Zero);
+                screen = GetDC(IntPtr.Zero); // the whole desktop, every screen, in desktop places
                 if (screen == IntPtr.Zero) return null;
                 mem = CreateCompatibleDC(screen);
                 bmp = CreateCompatibleBitmap(screen, w, h);
                 IntPtr was = SelectObject(mem, bmp);
-                bool ok = BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY | CAPTUREBLT);
-                if (ok) DrawCursor(mem);
+                bool ok = BitBlt(mem, 0, 0, w, h, screen, x0, y0, SRCCOPY | CAPTUREBLT);
+                if (ok) DrawCursor(mem, x0, y0);
                 SelectObject(mem, was);
                 if (!ok) return null;
                 IntPtr take = bmp;
@@ -105,7 +173,7 @@ namespace TailRemote
         }
 
         /// <summary>The mouse pointer, which a screen copy leaves out: whoever watches sees where it is.</summary>
-        private static void DrawCursor(IntPtr dc)
+        private static void DrawCursor(IntPtr dc, int x0, int y0)
         {
             var ci = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
             if (!GetCursorInfo(ref ci) || (ci.flags & 1) == 0 || ci.hCursor == IntPtr.Zero) return;
@@ -116,8 +184,52 @@ namespace TailRemote
                 if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask);
                 if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor);
             }
-            DrawIconEx(dc, ci.x - hx, ci.y - hy, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3);
+            // The pointer's place is on the whole desktop; the picture starts at this screen's corner.
+            DrawIconEx(dc, ci.x - hx - x0, ci.y - hy - y0, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3);
         }
+
+        /// <summary>
+        /// This PC's screens, in real pixels: the main one first, then the others from left to right
+        /// (top to bottom where they line up), so screen 1 is always the main one and the numbers follow
+        /// the desk. Never empty: if Windows will not say, the main screen alone.
+        /// </summary>
+        public static List<ScreenInfo> Screens()
+        {
+            IntPtr dpi = SetThreadDpiAwarenessContext(new IntPtr(-4)); // real pixels, the same as the pictures
+            var found = new List<ScreenInfo>();
+            try
+            {
+                MonitorEnumProc each = (IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data) =>
+                {
+                    var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                    if (GetMonitorInfo(monitor, ref mi) && mi.Right > mi.Left && mi.Bottom > mi.Top)
+                        found.Add(new ScreenInfo(mi.Left, mi.Top, mi.Right - mi.Left, mi.Bottom - mi.Top, (mi.Flags & 1) != 0));
+                    return true;
+                };
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, each, IntPtr.Zero);
+                GC.KeepAlive(each);
+                if (found.Count == 0)
+                {
+                    int w = GetSystemMetrics(0), h = GetSystemMetrics(1);
+                    if (w > 0 && h > 0) found.Add(new ScreenInfo(0, 0, w, h, true));
+                }
+            }
+            catch { }
+            finally { SetThreadDpiAwarenessContext(dpi); }
+            if (found.Count == 0) found.Add(new ScreenInfo(0, 0, 0, 0, true)); // nothing to go on: the main screen, as GDI finds it when it is taken
+            // Exactly one main screen, even if Windows marks none (it is the one at 0,0).
+            if (!found.Any(s => s.Main))
+            {
+                int i = Math.Max(0, found.FindIndex(s => s.X == 0 && s.Y == 0));
+                found[i] = found[i] with { Main = true };
+            }
+            return found.OrderBy(s => s.Main ? 0 : 1).ThenBy(s => s.X).ThenBy(s => s.Y).ToList();
+        }
+
+        private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data);
+        [StructLayout(LayoutKind.Sequential)] private struct MONITORINFO { public int cbSize; public int Left, Top, Right, Bottom; public int WorkLeft, WorkTop, WorkRight, WorkBottom; public int Flags; }
+        [DllImport("user32.dll")] private static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc each, IntPtr data);
+        [DllImport("user32.dll")] private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
         private const uint SRCCOPY = 0x00CC0020, CAPTUREBLT = 0x40000000;
         [StructLayout(LayoutKind.Sequential)] private struct BITMAPINFOHEADER { public int biSize, biWidth, biHeight; public short biPlanes, biBitCount; public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant; }
@@ -145,43 +257,85 @@ namespace TailRemote
     /// <summary>A way to take the screen: the picture now (at most this wide), waiting up to waitMs for a change. Null: nothing to take.</summary>
     internal delegate Frame? ScreenTaker(int maxWidth, int waitMs, out bool changed);
 
+    /// <summary>The same, from one of the PC's screens (0: the first, the main one; as ScreenSource.Screens numbers them).</summary>
+    internal delegate Frame? ScreensTaker(int maxWidth, int screen, int waitMs, out bool changed);
+
     /// <summary>
     /// The screen as this PC can take it: Desktop Duplication (Windows hands over the screen only when it
     /// changes, as fast as it changes), else GDI's copy. In the service's agent it follows the desktop
     /// that has the keyboard first, so the lock screen, the sign-in screen and UAC prompts are taken too.
-    /// One thread at a time.
+    /// Any of the PC's screens (Screens): each viewer may watch a different one. One thread at a time.
     /// </summary>
     internal sealed class ScreenSource : IDisposable
     {
-        private readonly DesktopDuplication _dd = new();
-        // GDI's last copy and pace for each width asked for: viewers on different steps take turns here,
-        // and comparing one's copy with another's (a different size) would always say "changed", so the
-        // copies would never slow down on a still screen.
+        // A duplication for each screen being watched: two viewers on different screens would otherwise
+        // start it again for every picture, which is slow.
+        private readonly Dictionary<Rectangle, DesktopDuplication> _dd = new();
+        private readonly Dictionary<Rectangle, long> _ddUsed = new(); // when each screen's duplication was last taken from
+        // GDI's last copy and pace for each screen and width asked for: viewers on different steps take
+        // turns here, and comparing one's copy with another's (a different size) would always say
+        // "changed", so the copies would never slow down on a still screen.
         private sealed class GdiCopy { public long At; public int Gap = 33; public Frame? Last; }
-        private readonly Dictionary<int, GdiCopy> _gdi = new();
+        private readonly Dictionary<(int Width, Rectangle Area), GdiCopy> _gdi = new();
         private Frame? _scaled, _scaledFrom;
         private int _scaledWidth;
+        private List<ScreenInfo>? _screens;
+        private long _screensAt;
 
         // Taking and letting go take turns (a viewer's thread may be taking when hosting stops).
         private readonly object _gate = new();
         private bool _disposed;
 
-        public Frame? Take(int maxWidth, int waitMs, out bool changed)
+        /// <summary>This PC's screens, the main one first (looked at again every 2 seconds: one may be plugged in or out).</summary>
+        public IReadOnlyList<ScreenInfo> Screens() { lock (_gate) return ScreensNow(); }
+
+        private List<ScreenInfo> ScreensNow()
         {
-            changed = false;
-            lock (_gate) return _disposed ? null : TakeNow(maxWidth, waitMs, out changed);
+            long now = Environment.TickCount64;
+            if (_screens != null && now - _screensAt < 2000) return _screens;
+            _screens = ScreenCapture.Screens();
+            _screensAt = now;
+            // A screen that is gone (unplugged, or its size changed), or that nobody has looked at for 15 seconds
+            // (a viewer stepped through the screens and back): its duplication and its copy of the screen go.
+            foreach (var gone in _dd.Keys.Where(a => !_screens.Any(s => s.Area == a) || now - _ddUsed.GetValueOrDefault(a) > 15_000).ToList())
+            {
+                _dd[gone].Dispose();
+                _dd.Remove(gone);
+                _ddUsed.Remove(gone);
+            }
+            return _screens;
         }
 
-        private Frame? TakeNow(int maxWidth, int waitMs, out bool changed)
+        /// <summary>The main screen.</summary>
+        public Frame? Take(int maxWidth, int waitMs, out bool changed) => Take(maxWidth, 0, waitMs, out changed);
+
+        /// <summary>One of the screens (Screens' number; one that does not exist: the main one).</summary>
+        public Frame? Take(int maxWidth, int screen, int waitMs, out bool changed)
+        {
+            changed = false;
+            lock (_gate)
+            {
+                if (_disposed) return null;
+                var list = ScreensNow();
+                var s = screen >= 0 && screen < list.Count ? list[screen] : list[0];
+                return TakeNow(maxWidth, s, waitMs, out changed);
+            }
+        }
+
+        private Frame? TakeNow(int maxWidth, ScreenInfo screen, int waitMs, out bool changed)
         {
             // Real pixels, and the pointer where it really is: the agent is not told the display's scaling otherwise.
             IntPtr dpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
             try
             {
                 if (Native.FollowInputDesktop) Native.FollowInputDesktopNow();
-                var f = _dd.Take(waitMs, out changed);
-                if (f == null) return FromGdi(maxWidth, out changed);
-                _gdi.Clear();
+                var area = screen.Area;
+                if (!_dd.TryGetValue(area, out var dd)) _dd[area] = dd = new DesktopDuplication(area);
+                _ddUsed[area] = Environment.TickCount64;
+                var f = dd.Take(waitMs, out changed);
+                // GDI: the main screen as Windows says it is now (also when the list could not be read), else this one's part of the desktop.
+                if (f == null) return FromGdi(maxWidth, screen.Main ? null : area, out changed);
+                foreach (var key in _gdi.Keys.Where(k => k.Area == (screen.Main ? Rectangle.Empty : area)).ToList()) _gdi.Remove(key);
                 if (maxWidth <= 0 || f.Width <= maxWidth) return f;
                 if (!changed && ReferenceEquals(_scaledFrom, f) && _scaledWidth == maxWidth && _scaled != null) return _scaled;
                 _scaledFrom = f; _scaledWidth = maxWidth;
@@ -196,20 +350,21 @@ namespace TailRemote
         /// less and less often (down to twice a second) while it stays the same, so a still screen costs
         /// little; the same picture is handed back (changed false) when nothing changed.
         /// </summary>
-        private Frame? FromGdi(int maxWidth, out bool changed)
+        private Frame? FromGdi(int maxWidth, Rectangle? area, out bool changed)
         {
             changed = false;
-            if (!_gdi.TryGetValue(maxWidth, out var g))
+            var key = (maxWidth, area ?? Rectangle.Empty);
+            if (!_gdi.TryGetValue(key, out var g))
             {
                 // A whole screen is kept per width: only the few in use now (a viewer stepping through the
                 // ladder would otherwise leave a 4K copy behind at every step it passed).
                 while (_gdi.Count >= 3) _gdi.Remove(_gdi.MinBy(x => x.Value.At).Key);
-                _gdi[maxWidth] = g = new GdiCopy();
+                _gdi[key] = g = new GdiCopy();
             }
             long wait = g.Gap - (Environment.TickCount64 - g.At);
             if (wait > 0) Thread.Sleep((int)wait);
             g.At = Environment.TickCount64;
-            var f = ScreenCapture.Capture(maxWidth);
+            var f = ScreenCapture.Capture(maxWidth, area);
             if (f == null) return null;
             if (g.Last != null && g.Last.Width == f.Width && g.Last.Height == f.Height && g.Last.Pixels.AsSpan().SequenceEqual(f.Pixels))
             {
@@ -249,7 +404,7 @@ namespace TailRemote
             return new Frame { Width = ow, Height = oh, Pixels = o };
         }
 
-        public void Dispose() { lock (_gate) { _disposed = true; _dd.Dispose(); } }
+        public void Dispose() { lock (_gate) { _disposed = true; foreach (var dd in _dd.Values) dd.Dispose(); _dd.Clear(); } }
     }
 
     /// <summary>
@@ -267,12 +422,15 @@ namespace TailRemote
     /// Still pictures: u8 1, u16 width, u16 height, u8 flags (1 = everything), u16 strips, then per strip
     /// u16 x, u16 y, u16 width, u16 height, i32 length, JPEG (or PNG, when lossless).
     /// H.264: u8 2, u16 width, u16 height, u8 flags (1 = key frame), then the frame (Annex B).
+    /// Not a picture: u8 3, then a ScreenChoice (which screen is shown, how many there are), handed back
+    /// before the first picture and whenever that changes; the host passes it on as Protocol.VideoScreen.
     /// </summary>
     internal sealed class ScreenVideo
     {
         public const int Tile = 64;
-        public const byte StillPicture = 1, VideoFrame = 2;
-        private readonly ScreenTaker _take;
+        public const byte StillPicture = 1, VideoFrame = 2, ScreenNote = 3;
+        private readonly ScreensTaker _take;
+        private readonly Func<IReadOnlyList<ScreenInfo>>? _screens; // null: one screen, nothing said about it (tests)
         private readonly object _taking = new();
         private readonly Dictionary<int, Viewer> _viewers = new();
         private static readonly ImageCodecInfo Jpeg = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
@@ -289,10 +447,17 @@ namespace TailRemote
             public long VideoOffUntil; // H.264 would not start here: still pictures only until then
             public long ResizedAt = long.MinValue / 2; // when the picture last changed size
             public readonly Queue<(long At, bool[] Tiles)> Changes = new(); // which tiles changed, when
+            public int Shown, Asked;       // the screen shown, and the last one asked for (0: the main one)
+            public int Asks;               // how many asks the viewer had made by the last one taken in
+            public int ToldCount;          // what the viewer was last told: how many screens, and the one shown
+            public ScreenInfo ToldScreen;
         }
 
-        public ScreenVideo(ScreenTaker take) => _take = take;
+        public ScreenVideo(ScreenTaker take) => _take = (int w, int _, int wait, out bool changed) => take(w, wait, out changed);
         public ScreenVideo(Func<int, Frame?> take) : this((int w, int _, out bool changed) => { changed = true; return take(w); }) { }
+
+        /// <summary>Any of the PC's screens, as each viewer chooses (VideoSettings.Screen).</summary>
+        public ScreenVideo(ScreensTaker take, Func<IReadOnlyList<ScreenInfo>> screens) { _take = take; _screens = screens; }
 
         public int Viewers { get { lock (_viewers) return _viewers.Count; } }
 
@@ -304,8 +469,10 @@ namespace TailRemote
         {
             Viewer v;
             lock (_viewers) if (!_viewers.TryGetValue(viewer, out v!)) _viewers[viewer] = v = new Viewer();
+            byte[]? told = ChooseScreen(v, settings.Screen);
+            if (told != null) return told;
             Frame? f;
-            lock (_taking) f = _take(settings.MaxWidth, 16, out _);
+            lock (_taking) f = _take(settings.MaxWidth, v.Shown, 16, out _);
             if (f == null) return null;
             long now = Environment.TickCount64;
             double part = 0;
@@ -355,6 +522,46 @@ namespace TailRemote
             byte[] update = Stills(v, f, everything, settings);
             if (everything && update.Length > 0) v.NeedsWhole = false;
             return update;
+        }
+
+        /// <summary>
+        /// Follows the screen the viewer asked for: one that does not exist is refused (and the one shown
+        /// stays), and if the one shown goes (unplugged) it is the main one again. Hands back what to tell
+        /// the viewer (a ScreenNote) when that changed, else null.
+        /// </summary>
+        private byte[]? ChooseScreen(Viewer v, int asking)
+        {
+            int asked = asking & 0xFF, asks = asking >> 8;
+            if (_screens == null) return null;
+            IReadOnlyList<ScreenInfo> list;
+            try { list = _screens(); } catch { return null; }
+            if (list.Count == 0) return null;
+            bool refused = false, switched = false;
+            if (asked != v.Asked || asks != v.Asks)
+            {
+                v.Asked = asked;
+                v.Asks = asks;
+                if (asked >= 0 && asked < list.Count) { switched = asked != v.Shown; v.Shown = asked; }
+                else refused = true;
+                v.ToldCount = 0; // a choice is always answered, even "that one again"
+            }
+            if (v.Shown >= list.Count) { v.Shown = 0; switched = true; }
+            if (switched)
+            {
+                // Another screen: nothing on the viewer's copy is worth keeping, and its motion is not this one's.
+                v.Changes.Clear();
+                v.NeedsWhole = true;
+            }
+            var shown = list[v.Shown];
+            if (!refused && v.ToldCount == list.Count && v.ToldScreen == shown) return null;
+            v.ToldCount = list.Count; v.ToldScreen = shown;
+            var main = list.FirstOrDefault(s => s.Main);
+            var choice = new ScreenChoice(v.Shown, list.Count, refused, Math.Clamp(asked, 0, 255), shown, main.Width, main.Height);
+            byte[] body = choice.ToBytes();
+            byte[] m = new byte[1 + body.Length];
+            m[0] = ScreenNote;
+            body.CopyTo(m, 1);
+            return m;
         }
 
         private static byte[]? Encode(Viewer v, Frame f, bool key, int kbps)
@@ -682,6 +889,19 @@ namespace TailRemote
         /// <summary>A whole new picture, rather than only what changes.</summary>
         public void Refresh() => Send(new[] { Protocol.VideoAgain });
 
+        /// <summary>What the host last said about its screens (which one is shown, how many); null until it says.</summary>
+        public ScreenChoice? Screens { get; private set; }
+        /// <summary>The host said which screen it shows (before the first picture, and after each choice). Raised on the stream's own thread.</summary>
+        public event Action<ScreenChoice>? ScreenTold;
+        private volatile int _screen = -1; // the screen chosen here (-1: none chosen, the host shows its main one)
+
+        /// <summary>Show this one of the host's screens (0: the first, the main one). The host answers with ScreenTold, refusing one it does not have.</summary>
+        public void ChooseScreen(int screen)
+        {
+            _screen = Math.Clamp(screen, 0, 255);
+            Send(new[] { Protocol.VideoChooseScreen, (byte)_screen });
+        }
+
         private void Send(byte[] m)
         {
             var tcp = _tcp; var link = _link;
@@ -706,6 +926,7 @@ namespace TailRemote
                     stream.ReadTimeout = 15_000; // the host says something at least every few seconds
                     if (_paused) Send(new[] { Protocol.VideoPause, (byte)1 });
                     if (_noH264) Send(new[] { Protocol.VideoNoH264 }); // a new line: the host has to be told again
+                    if (_screen >= 0) Send(new[] { Protocol.VideoChooseScreen, (byte)_screen }); // and which screen
                     byte[]? buffer = null;
                     while (!_stop)
                     {
@@ -753,6 +974,13 @@ namespace TailRemote
                             case Protocol.VideoNote:
                                 toldWhy = true;
                                 Note?.Invoke(System.Text.Encoding.UTF8.GetString(buffer, 1, n - 1));
+                                break;
+                            case Protocol.VideoScreen:
+                                if (ScreenChoice.From(buffer, 1, n - 1) is { } choice)
+                                {
+                                    Screens = choice;
+                                    ScreenTold?.Invoke(choice);
+                                }
                                 break;
                         }
                     }
@@ -815,5 +1043,28 @@ namespace TailRemote
 
         /// <summary>Close enough for a JPEG: each colour within the given distance.</summary>
         public static bool Near(Color a, Color b, int by) => Math.Abs(a.R - b.R) <= by && Math.Abs(a.G - b.G) <= by && Math.Abs(a.B - b.B) <= by;
+    }
+
+    /// <summary>Test only: a made-up PC with 3 screens of different sizes (main; one to its right; one to its left), each a TestScreen.</summary>
+    internal sealed class TestScreens
+    {
+        public readonly TestScreen[] All =
+        {
+            new() { Width = 640, Height = 360 },
+            new() { Width = 480, Height = 320, SquareX = 300, SquareY = 200 },
+            new() { Width = 320, Height = 480, SquareX = 20, SquareY = 400 },
+        };
+        private readonly ScreenInfo[] _where =
+        {
+            new(0, 0, 640, 360, true),
+            new(640, 0, 480, 320, false),
+            new(-320, -60, 320, 480, false),
+        };
+        public IReadOnlyList<ScreenInfo> Screens() => _where;
+        public Frame? Take(int maxWidth, int screen, int waitMs, out bool changed)
+        {
+            changed = true;
+            return All[screen >= 0 && screen < All.Length ? screen : 0].Take(maxWidth);
+        }
     }
 }

@@ -7,8 +7,9 @@ namespace TailRemote
     /// <summary>
     /// The screen through Desktop Duplication (DXGI, in Windows): Windows hands over the screen only
     /// when something on it changed, straight from the graphics card, so a still screen costs nothing
-    /// and a moving one is taken as fast as it changes, up to the display's own rate. The main screen
-    /// only. The mouse pointer is drawn in (duplication leaves it out). When Windows switches desktop
+    /// and a moving one is taken as fast as it changes, up to the display's own rate. One screen: the one
+    /// whose top left corner is where it was told (the main one at 0,0), on whichever graphics chip shows
+    /// it. The mouse pointer is drawn in (duplication leaves it out). When Windows switches desktop
     /// (the lock screen, a UAC prompt) duplication has to start again: done by itself on the next call.
     /// Anything it cannot do (no duplication on this PC, a desktop it may not see) makes Take return
     /// null, and ScreenCapture's GDI copy is used instead.
@@ -20,6 +21,27 @@ namespace TailRemote
         private bool _systemMemory;
         private Frame? _last;
         private long _failedAt;
+        private readonly int _left, _top; // where this screen's top left corner is on the whole desktop
+        private int _cursorSeen = -1;
+        private bool _cursorWasHere;
+
+        public DesktopDuplication() : this(System.Drawing.Rectangle.Empty) { }
+        public DesktopDuplication(System.Drawing.Rectangle screen) { _left = screen.X; _top = screen.Y; }
+
+        /// <summary>
+        /// The pointer moved or changed shape since this screen last looked, on this screen or off it (it
+        /// left, so it is taken off the picture). Moving about on another screen changes nothing here.
+        /// </summary>
+        private bool CursorMoved()
+        {
+            Cursor.Look();
+            if (Cursor.Version == _cursorSeen) return false;
+            _cursorSeen = Cursor.Version;
+            bool here = Cursor.Current is var (x, y, w, h, _) && _width > 0 && x - _left < _width && x - _left + w > 0 && y - _top < _height && y - _top + h > 0;
+            bool moved = here || _cursorWasHere;
+            _cursorWasHere = here;
+            return moved;
+        }
 
         private static readonly Guid IID_IDXGIFactory1 = new("770aae78-f26f-4dba-a829-253c83d1b387");
         private static readonly Guid IID_IDXGIOutput1 = new("00cddea8-939b-4b83-a340-a685226666cc");
@@ -40,7 +62,7 @@ namespace TailRemote
             if (hr == unchecked((int)0x887A0027)) // DXGI_ERROR_WAIT_TIMEOUT: nothing changed
             {
                 if (_last == null) return null;
-                if (Cursor.Moved()) { changed = true; return WithCursor(_last); }
+                if (CursorMoved()) { changed = true; return WithCursor(_last); }
                 return _shown ?? _last;
             }
             if (hr < 0)
@@ -68,7 +90,7 @@ namespace TailRemote
                 Call(_dup, 14); // ReleaseFrame
             }
             if (_last == null) return null;
-            if (Cursor.Moved()) changed = true;
+            if (CursorMoved()) changed = true;
             if (!changed) return _shown ?? _last;
             return WithCursor(_last);
         }
@@ -78,7 +100,7 @@ namespace TailRemote
 
         private Frame WithCursor(Frame f)
         {
-            _shown = Cursor.Current == null ? f : Cursor.DrawOn(Copy(f));
+            _shown = Cursor.Current == null ? f : Cursor.DrawOn(Copy(f), _left, _top);
             return _shown;
         }
 
@@ -141,7 +163,7 @@ namespace TailRemote
             if (_failedAt != 0 && Environment.TickCount64 - _failedAt < 5000) return false;
             try
             {
-                if (!FindMainOutput(out IntPtr adapter, out IntPtr output)) { _failedAt = Environment.TickCount64; return false; }
+                if (!FindOutput(_left, _top, out IntPtr adapter, out IntPtr output)) { _failedAt = Environment.TickCount64; return false; }
                 try
                 {
                     IntPtr device, context;
@@ -175,8 +197,12 @@ namespace TailRemote
             catch { Stop(); _failedAt = Environment.TickCount64; return false; }
         }
 
-        /// <summary>The adapter and output showing the main screen (the one at 0,0): on a laptop with two graphics chips, the right one.</summary>
-        private static bool FindMainOutput(out IntPtr adapter, out IntPtr output)
+        /// <summary>
+        /// The adapter and output showing the screen whose top left corner is here (the main one: 0,0),
+        /// looking through every graphics chip: on a laptop with two, or a PC with screens on two cards,
+        /// the right one. Two screens never share a corner (copies of one screen are one to Windows).
+        /// </summary>
+        private static bool FindOutput(int left, int top, out IntPtr adapter, out IntPtr output)
         {
             adapter = output = IntPtr.Zero;
             Guid iid = IID_IDXGIFactory1;
@@ -192,7 +218,7 @@ namespace TailRemote
                         IntPtr outp;
                         if (Call(ad, 7, o, (IntPtr)(&outp)) < 0) break; // EnumOutputs
                         DXGI_OUTPUT_DESC desc;
-                        if (Call(outp, 7, (IntPtr)(&desc)) >= 0 && desc.AttachedToDesktop != 0 && desc.Left == 0 && desc.Top == 0)
+                        if (Call(outp, 7, (IntPtr)(&desc)) >= 0 && desc.AttachedToDesktop != 0 && desc.Left == left && desc.Top == top)
                         {
                             adapter = ad; output = outp;
                             return true;
@@ -257,8 +283,16 @@ namespace TailRemote
             private static int _x = int.MinValue, _y;
             private static readonly Dictionary<IntPtr, (int Hx, int Hy, int W, int H, byte[] Bgra)> Shapes = new();
 
-            /// <summary>Reads where the pointer is and what it looks like; true if that changed since last time.</summary>
-            public static bool Moved()
+            /// <summary>
+            /// Counts each change of where the pointer is or what it looks like. Shared by every screen's
+            /// duplication, so each keeps the count it last saw rather than being told "moved" once.
+            /// </summary>
+            public static int Version;
+
+            /// <summary>Reads where the pointer is (on the whole desktop) and what it looks like; Version goes up if that changed.</summary>
+            public static void Look() { if (Moved()) Version++; }
+
+            private static bool Moved()
             {
                 var ci = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
                 if (!GetCursorInfo(ref ci) || (ci.flags & 1) == 0 || ci.hCursor == IntPtr.Zero)
@@ -279,9 +313,11 @@ namespace TailRemote
                 return true;
             }
 
-            public static Frame DrawOn(Frame f)
+            /// <summary>Draws the pointer onto a picture of the screen whose top left corner is at left, top on the whole desktop.</summary>
+            public static Frame DrawOn(Frame f, int left, int top)
             {
-                if (Current is not var (cx, cy, w, h, src)) return f;
+                if (Current is not var (px, py, w, h, src)) return f;
+                int cx = px - left, cy = py - top;
                 for (int y = 0; y < h; y++)
                 {
                     int ty = cy + y;

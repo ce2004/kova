@@ -52,6 +52,48 @@ namespace TailRemote
 
         /// <summary>Raised (on the network thread) when the host says what it can do, which comes just after the login.</summary>
         public event Action? FeaturesKnown;
+
+        /// <summary>The host's network cards (Wake.Describe), told just after the login: how to wake it later. Null until then.</summary>
+        public string? WakeInfo { get; private set; }
+        public event Action<string>? WakeInfoKnown;
+        /// <summary>
+        /// Something about the host PC worth saying (battery, drive space, processor, memory). Raised on a network
+        /// thread. What is already wrong comes just after the login, before the window has subscribed: it is kept
+        /// and handed to the first handler added.
+        /// </summary>
+        public event Action<string>? HealthAlert
+        {
+            add
+            {
+                string[] early;
+                lock (_healthGate) { _health += value; early = _healthEarly.ToArray(); _healthEarly.Clear(); }
+                foreach (string line in early) value?.Invoke(line);
+            }
+            remove { lock (_healthGate) _health -= value; }
+        }
+        private Action<string>? _health;
+        private readonly List<string> _healthEarly = new();
+        private readonly object _healthGate = new();
+
+        private void HealthSaid(string line)
+        {
+            Action<string>? h;
+            lock (_healthGate) { h = _health; if (h == null && _healthEarly.Count < 8) _healthEarly.Add(line); }
+            h?.Invoke(line);
+        }
+
+        public bool CanWake => !ListenOnly && (_peerFeatures & Protocol.FeatureWake) != 0;
+
+        /// <summary>Asks the host to send a Wake-on-LAN packet for these cards (up to 8) on its own network.</summary>
+        public void SendWake(params byte[][] macs)
+        {
+            var cards = macs.Where(x => x.Length == 6).Take(8).ToArray();
+            if (_closed || cards.Length == 0) return;
+            byte[] m = new byte[1 + 6 * cards.Length];
+            m[0] = Protocol.WakeRequest;
+            for (int i = 0; i < cards.Length; i++) cards[i].CopyTo(m, 1 + 6 * i);
+            Write(m);
+        }
         /// <summary>Clipboard text from the host. Raised on a network thread.</summary>
         public event Action<string>? ClipboardReceived;
         /// <summary>True when the host let us in with its listen-only password: audio only, no keys.</summary>
@@ -717,6 +759,13 @@ namespace TailRemote
                         LastPingMs = (int)((Stopwatch.GetTimestamp() - sent) * 1000 / Stopwatch.Frequency);
                         _lastPong = Environment.TickCount64;
                     }
+                    else if (m.Length >= 1 && m[0] == Protocol.WakeInfo)
+                    {
+                        WakeInfo = System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1);
+                        WakeInfoKnown?.Invoke(WakeInfo);
+                    }
+                    else if (m.Length >= 2 && m[0] == Protocol.HealthAlert)
+                        HealthSaid(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1));
                     else if (m.Length >= 1 && m[0] == Protocol.Message)
                     {
                         Leaving = 0; // still here after all (a restart that failed says so this way)

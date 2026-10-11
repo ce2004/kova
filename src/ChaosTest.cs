@@ -1023,6 +1023,60 @@ namespace TailRemote
                     finally { moving = false; }
                 });
 
+                Scenario("the remote screen of a PC with 3 screens: screen 2 chosen shows exactly its pixels once still, screen 9 is refused and screen 2 stays; through the service's agent too", 150, () =>
+                {
+                    // One run: told 3 screens (the main one shown), then screen 2 chosen and shown exactly,
+                    // then screen 9 asked for, refused, and screen 2 still shown. Null when all is well.
+                    string? Check(Func<int, bool, VideoSettings, byte[]?> update, Action<int> forget, TestScreens three, string how)
+                    {
+                        host.VideoUpdate = update;
+                        host.VideoForget = forget;
+                        using var watch = ctrl.WatchScreen();
+                        if (watch == null) return "FAIL: the host did not offer its screen";
+                        var told = new System.Collections.Concurrent.ConcurrentQueue<ScreenChoice>();
+                        watch.ScreenTold += c => told.Enqueue(c);
+                        if (!WaitFor(() => watch.Pictures >= 1 && watch.Screens != null, 10_000)) return "FAIL" + how + ": no first picture, or not told which screen (" + watch.Pictures + " pictures)";
+                        var first = watch.Screens!;
+                        if (first.Count != 3 || first.Shown != 0 || !first.Screen.Main || first.Refused) return "FAIL" + how + ": first told " + first.Say();
+                        var two = three.All[1];
+                        // Exactly screen 2: its size (480 by 320: nothing at 480 across) and its pixels, square and all.
+                        bool Exact() => watch.Canvas.At(479, 319) != System.Drawing.Color.Empty && watch.Canvas.At(480, 0) == System.Drawing.Color.Empty
+                            && new[] { (5, 5), (two.SquareX + 5, two.SquareY + 5), (479, 319), (200, 100) }.All(p => watch.Canvas.At(p.Item1, p.Item2) == two.At(p.Item1, p.Item2));
+                        watch.ChooseScreen(1);
+                        if (!WaitFor(Exact, 60_000)) return "FAIL" + how + ": screen 2 was not shown exactly (told " + (watch.Screens?.Say() ?? "nothing") + ")";
+                        var shown = watch.Screens!;
+                        if (shown.Shown != 1 || shown.Refused || shown.Say() != "Screen 2 of 3, 480 by 320, right of the main screen.") return "FAIL" + how + ": after choosing screen 2 it said " + shown.Say();
+                        int before = told.Count;
+                        watch.ChooseScreen(8);
+                        if (!WaitFor(() => told.Count > before && told.Last().Refused, 5000)) return "FAIL" + how + ": screen 9 was not refused";
+                        var refused = told.Last();
+                        if (refused.Shown != 1 || refused.Asked != 8) return "FAIL" + how + ": refusing screen 9 it said " + refused.Say();
+                        Thread.Sleep(1500);
+                        if (!Exact()) return "FAIL" + how + ": after screen 9 was refused, screen 2 was no longer shown";
+                        return null;
+                    }
+                    var three = new TestScreens();
+                    var screen = new ScreenVideo(three.Take, three.Screens);
+                    string? direct = Check(screen.Update, screen.Forget, three, "");
+                    if (direct != null) return direct;
+                    // The same through the service: its agent, at the screen, takes the pictures. A pipe name of
+                    // its own: the agent scenario above leaves its link connected on the usual test name.
+                    string pipes = Names.TestPipes;
+                    Names.TestPipes = pipes + "Screens";
+                    AgentLink.TestAnyOwner = true;
+                    try
+                    {
+                        var server = new AgentLink.Server();
+                        var agentThree = new TestScreens();
+                        new Thread(() => AgentLink.Run((_, _, _, _) => { }, (_, _, _) => { }, _ => { }, _ => { }, null, new ScreenVideo(agentThree.Take, agentThree.Screens))) { IsBackground = true }.Start();
+                        Thread.Sleep(1500); // the agent connects
+                        string? viaAgent = Check(server.Video, server.ForgetVideo, agentThree, " through the agent");
+                        if (viaAgent != null) return viaAgent;
+                    }
+                    finally { Names.TestPipes = pipes; }
+                    return "told 3 screens with the main one shown; screen 2 was shown exactly once still and said as \"Screen 2 of 3, 480 by 320, right of the main screen.\"; screen 9 was refused and screen 2 stayed; the same through the service's agent";
+                });
+
                 Scenario("the main connection damaged in the middle of 256 MB: it reconnects and the transfer carries on", 120, () =>
                 {
                     string big = Big("resume.bin", 256);
@@ -1139,6 +1193,74 @@ namespace TailRemote
                 catch { }
                 long at = clock.ElapsedMilliseconds;
                 return at < Host.LoginDeadlineMs + 3000 ? "cut off after " + at / 1000 + " s; " + Healthy(host, "afterwards") : "FAIL: still connected after " + at / 1000 + " s";
+            });
+
+            Scenario("the remote PC's health: battery alerts heard once each, a full drive told to a PC that connects later (fake readings)", 30, () =>
+            {
+                long gen = CurrentGeneration;
+                var reading = new HealthSample(true, false, 80, "C:", 100L << 30, 200L << 30, 10, 40);
+                Host.TestHealth = () => reading;
+                Host.HealthEveryMs = 200;
+                var heard = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                var c7 = Connect(Password);
+                try
+                {
+                    c7.HealthAlert += heard.Enqueue;
+                    Thread.Sleep(800);
+                    reading = reading with { OnBattery = true, BatteryPercent = 15 };
+                    if (!WaitFor(() => heard.Count >= 2, 5000)) return "FAIL: heard " + string.Join(" / ", heard);
+                    Thread.Sleep(1000); // a few more looks: nothing new to say
+                    var first = heard.ToArray();
+                    bool once = first.Length == 2 && first[0].Contains("on its battery, 15") && first[1].Contains("battery is low, 15");
+                    reading = reading with { DiskFree = 1L << 29 };
+                    Thread.Sleep(600);
+                    var late = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    var p = new Player(Player.NoDevice, _ => { });
+                    // Subscribed from the very start, through the status callback the window gets too? No: health has its own event.
+                    using var c8 = Client.Connect("127.0.0.1", Port, Password, p, _ => { });
+                    c8.HealthAlert += late.Enqueue;
+                    // What was already wrong arrives just after the login: maybe before the handler above, so wait for the
+                    // next change too (the battery going critical) to be sure the line works, and look for the drive in either.
+                    reading = reading with { BatteryPercent = 5 };
+                    bool lateHeard = WaitFor(() => late.Any(l => l.Contains("very low")), 5000) && late.Any(l => l.Contains("nearly full")); // told on connecting, kept until it subscribed
+                    return once && lateHeard
+                        ? "heard on battery and battery low once each; a PC connecting later heard the next change (" + string.Join(" / ", late) + ")"
+                        : "FAIL: first PC heard " + string.Join(" / ", first) + "; the later one heard " + string.Join(" / ", late);
+                }
+                finally
+                {
+                    if (CurrentGeneration == gen) { Host.TestHealth = null; Host.HealthEveryMs = HealthWatch.EveryMs; }
+                    c7.Dispose();
+                }
+            });
+
+            Scenario("waking a PC through the host: the wake signal goes out on its network, and a listener cannot send one", 30, () =>
+            {
+                using var c9 = Connect(Password);
+                using var l9 = Connect(ListenPassword);
+                if (!WaitFor(() => c9.CanWake, 3000)) return "FAIL: the host did not offer waking";
+                if (l9.CanWake) return "FAIL: a listener was offered waking";
+                bool told = WaitFor(() => c9.WakeInfo != null, 3000);
+                UdpClient? ear;
+                try { ear = new UdpClient(new IPEndPoint(IPAddress.Any, 9)) { EnableBroadcast = true }; }
+                catch { return "skipped listening (port 9 is taken on this PC); the host offered waking" + (told ? " and told its network cards" : ""); }
+                using (ear)
+                {
+                    byte[] mac = Convert.FromHexString("0A1B2C3D4E5F");
+                    ear.Client.ReceiveTimeout = 1500;
+                    l9.SendWake(mac); // ignored
+                    var any = new IPEndPoint(IPAddress.Any, 0);
+                    bool fromListener = false;
+                    try { ear.Receive(ref any); fromListener = true; } catch { }
+                    c9.SendWake(mac);
+                    byte[]? got = null;
+                    ear.Client.ReceiveTimeout = 3000;
+                    try { got = ear.Receive(ref any); } catch { }
+                    bool right = got != null && got.AsSpan().SequenceEqual(Wake.MagicPacket(mac));
+                    return right && !fromListener
+                        ? "the wake signal went out on this network" + (told ? ", the host told its network cards," : "") + " and the listener's request did nothing"
+                        : "FAIL: wake packet heard " + (got != null) + ", right " + right + ", from the listener " + fromListener;
+                }
             });
 
             Scenario("the connection drops before the window is listening: it still hears about it", 30, () =>

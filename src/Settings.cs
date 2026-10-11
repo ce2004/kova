@@ -12,6 +12,8 @@ namespace TailRemote
         public string Address { get; set; } = "";
         public int Port { get; set; } = Protocol.DefaultPort;
         public string PasswordEnc { get; set; } = "";
+        /// <summary>Its network cards (Wake.Describe), learnt while connected: how to wake it. Empty until then.</summary>
+        public string Wake { get; set; } = "";
         public override string ToString() => Port == Protocol.DefaultPort ? Address : Address + ", port " + Port;
     }
 
@@ -32,6 +34,7 @@ namespace TailRemote
         /// <summary>Catch up by speeding up the sound instead of skipping (changes the pitch a little).</summary>
         public bool CatchUpBySpeed { get; set; }
         public bool AnnounceQuality { get; set; }
+        public bool AnnounceHealth { get; set; } = true;
         public bool MuteWhenNotControlling { get; set; }
         public bool RideOutStalls { get; set; } = true;
         /// <summary>Piano tones for connecting, clipboard, files and the rest (Sounds.cs).</summary>
