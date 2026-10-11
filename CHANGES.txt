@@ -1,3 +1,22 @@
+4.1.1
+Bug fixed: if you connected straight over the internet with IPv6 and stayed connected for about a day, the sound stopped, file transfers stalled and the remote screen went blank, and Kova wrongly said the UDP port was blocked. Windows changes its IPv6 address daily, and Kova now allows for that.
+Bug fixed: if a PC waited in the background, the PC in front could drop its sound quality for no reason, and a moment of the old PC's sound could play when you switched.
+Bug fixed: if the remote screen window lost its connection for a moment, Kova could say "Screen 2 is gone from the remote PC" when nothing was unplugged, and it forgot which screen you had chosen. Now it keeps your screen and only says a screen is gone when it really was unplugged.
+Bug fixed: if a screen was unplugged on the remote PC while you watched a different one, the window could silently switch to the wrong screen. Kova now follows the screen you chose, wherever it moves in the list.
+Bug fixed: health announcements such as "the C drive is nearly full" were said again every time the connection dropped and came back. Now the same news from the same PC is said once in half an hour.
+Bug fixed: after waking a PC, if the connection dropped within five minutes, Kova said it was waiting for the PC to wake up instead of telling you what went wrong.
+Bug fixed: a file transfer that finished could be announced twice, with two tones and two lines in the history.
+Bug fixed: on a remote PC running the Kova service, the Files line could get stuck on a transfer that had already finished, so the end was never said and Stop stayed on.
+Bug fixed: getting two files at once, where one was called "name (2)" and a "name" was already in Downloads, failed with "the same file sent twice". Now each gets its own name.
+Bug fixed: files with very long names could fail to arrive when a copy with the same name was already there.
+Bug fixed: if the clipboard files you were sent kept their "(incomplete)" name, Control V could not paste them.
+Bug fixed: on a PC running the Kova service, cleaning up old clipboard files and reading the PC's clipboard files now happen as the signed-in user, never with the service's full rights.
+Bug fixed: removing the Kova service turned on Start hosting when you sign in, even if it was never on. For a service set up with 4.1.1 or later, it now only comes back if it was on before.
+Bug fixed: Send the clipboard and Get the remote PC's clipboard shared the letter B in the Clipboard menu, so Alt C, B did not send the clipboard. Get the remote PC's clipboard is now Alt C, R.
+Bug fixed: "Updated to version" and "Sent the wake signal" were cut off by "Connecting to" before NVDA could say them. Now you hear both.
+Bug fixed: if sending on the connection timed out halfway through, the other PC said the connection damaged data. Now Kova reconnects cleanly.
+Bug fixed: Kova slowly used more memory while a sound device refused to open.
+
 4.1.0
 New feature: wake a sleeping or switched-off PC. File, Wake a saved PC and connect sends it the Wake-on-LAN signal, then connects as soon as it answers. Kova learns how to wake a saved PC the first time you connect to it while it is on. The signal is also sent through every PC you are connected to, so away from home you can connect to another PC there first and wake the rest through it. The PC's network card has to allow Wake-on-LAN.
 New feature: Kova tells you how the remote PC is doing. It says when the remote PC goes onto its battery or is plugged in, when the battery is low or very low, when its Windows drive is nearly full, when its processor has been busy for a whole minute, and when it is nearly out of memory. Each is said once, and problems that are already there are said when you connect. Turn it off in Settings, Announce the remote PC's health.

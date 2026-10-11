@@ -25,7 +25,7 @@ $quick = if ($full) { @() } else { @('-p:PublishTrimmed=false', '-p:EnableCompre
 
 foreach ($a in $Arch) {
     $pub = "obj\publish\$a"
-    & $dotnet publish TailRemote.csproj -c Release -r "win-$a" -o $pub -p:BaseOutputPath=obj\pubout\ --nologo -v:q @quick
+    & $dotnet publish kova.csproj -c Release -r "win-$a" -o $pub -p:BaseOutputPath=obj\pubout\ --nologo -v:q @quick
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
     $dest = Join-Path $PSScriptRoot "bin\$a"

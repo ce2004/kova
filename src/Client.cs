@@ -108,6 +108,10 @@ namespace TailRemote
         /// <summary>UDP gets no answer while the connection works (a firewall, usually): no sound can come.</summary>
         public bool UdpBlocked => _udpBlocked;
         public int Port => _hostUdp.Port;
+        /// <summary>The host's address and port: whether a new connection is to the same PC.</summary>
+        public IPEndPoint HostEndPoint => _hostUdp;
+        /// <summary>When this connection was made (Environment.TickCount64).</summary>
+        public long ConnectedAt { get; } = Environment.TickCount64;
         private volatile bool _udpBlocked;
         private long _lastUdpPong;
         private long _lastPongStamp = long.MinValue; // the newest audio pong's stamp (UDP receive thread only)
@@ -759,7 +763,7 @@ namespace TailRemote
                         LastPingMs = (int)((Stopwatch.GetTimestamp() - sent) * 1000 / Stopwatch.Frequency);
                         _lastPong = Environment.TickCount64;
                     }
-                    else if (m.Length >= 1 && m[0] == Protocol.WakeInfo)
+                    else if (m.Length >= 1 && m.Length <= 4097 && m[0] == Protocol.WakeInfo) // a few network cards' addresses; more is nonsense kept out of the settings file
                     {
                         WakeInfo = System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1);
                         WakeInfoKnown?.Invoke(WakeInfo);
@@ -943,7 +947,16 @@ namespace TailRemote
         /// <summary>Plays what waited behind a missing packet once its wait is over, with no new packet needed to notice.</summary>
         private void FlushDue()
         {
-            try { lock (_queue) Drain(Player.Now); }
+            try
+            {
+                lock (_queue)
+                {
+                    // Just sent to the background: what waited is thrown away, never played into the Player
+                    // the PC now in front is using (the packet that would clear it never comes once muted).
+                    if (Muted) { _queue.Clear(); _haveNext = false; Volatile.Write(ref _waiting, false); return; }
+                    Drain(Player.Now);
+                }
+            }
             catch (Exception e) { DiagLog.Write("client: audio packet failed: " + e.Message); }
         }
 
@@ -1112,7 +1125,7 @@ namespace TailRemote
             {
                 Thread.Sleep(QualityTickMs);
                 try { AdaptQuality(); } catch { }
-                if (++tick % (1000 / QualityTickMs) == 0 && DiagLog.Enabled) LogSecond();
+                if (++tick % (1000 / QualityTickMs) == 0 && DiagLog.Enabled && !Muted) LogSecond(); // the shared Player's figures are the front PC's
             }
         }
 
@@ -1143,6 +1156,15 @@ namespace TailRemote
         /// </summary>
         private void AdaptQuality()
         {
+            // In the background: the Player and its counts are the front PC's (one Player for all), so
+            // taking them here stole that PC's figures and made it judge its line wrongly.
+            if (Muted)
+            {
+                int held = _lockedStep;
+                if (held >= 0) lock (_stepGate) SetStep(held);
+                _judgeAfresh = true;
+                return;
+            }
             var (packets, lost, late) = _player.TakeStats();
             int bytes = Interlocked.Exchange(ref _qBytes, 0), arrived = Interlocked.Exchange(ref _qPackets, 0), ticksIn = Interlocked.Exchange(ref _qTicks, 0);
             if (TestHoldQuality) return;

@@ -92,11 +92,23 @@ namespace TailRemote
             Span<byte> nonce = stackalloc byte[12];
             lock (_sendLock)
             {
+                if (_broken) throw new IOException("The connection was cut part-way through a message.");
                 CounterNonce(nonce, _sendCounter++);
                 _send.Encrypt(nonce, message, frame.AsSpan(HeadBytes, message.Length), frame.AsSpan(HeadBytes + message.Length, TagSize));
-                s.Write(frame);
+                try { s.Write(frame); }
+                catch
+                {
+                    // A write that failed (a send timeout, often) may have sent part of the frame: the next
+                    // one from another thread would land after it and the other PC would call the line
+                    // damaged. The link ends here instead, and both PCs reconnect the usual way.
+                    _broken = true;
+                    try { if (s is System.Net.Sockets.NetworkStream ns) ns.Socket.Close(); } catch { }
+                    throw;
+                }
             }
         }
+
+        private bool _broken; // under _sendLock
 
         /// <summary>
         /// Encrypts one message into a ready-to-send frame, without sending it. The

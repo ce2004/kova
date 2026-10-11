@@ -43,6 +43,8 @@ namespace TailRemote
             public string CaptureDevice { get; set; } = "";
             public bool Logging { get; set; }
             public bool WeSetSasPolicy { get; set; }
+            /// <summary>Hosting at sign-in was on before the service replaced it: Remove turns it back on unless this is false.</summary>
+            public bool? HadStartupTask { get; set; }
 
             // Null-safe: a "null" in the file (edited by hand, or damaged) used to stop hosting with a crash.
             public static string Seal(string? s) => string.IsNullOrEmpty(s) ? "" : Convert.ToBase64String(Native.Protect(System.Text.Encoding.UTF8.GetBytes(s), true, machine: true));
@@ -143,6 +145,8 @@ namespace TailRemote
                     CaptureDevice = s.CaptureDevice,
                     Logging = s.Logging,
                     WeSetSasPolicy = old?.WeSetSasPolicy ?? false,
+                    // Asked before the task goes (below); a reinstall keeps what the first install found.
+                    HadStartupTask = old != null ? old.HadStartupTask : Startup.IsEnabled(),
                 };
                 // Ctrl+Alt+Del from a service needs this policy (1 = services may send it).
                 using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"))
@@ -198,10 +202,10 @@ namespace TailRemote
                     k?.DeleteValue("SoftwareSASGeneration", false);
                 }
 
-                // Undo what Install() did: close the port it opened, and bring
-                // back the at-sign-in task the service had replaced.
+                // Undo what Install() did: close the port it opened, and bring back the at-sign-in task
+                // the service had replaced, only if there was one ("this PC stops hosting" means just that).
                 Firewall.Apply(false, cfg?.Port ?? Protocol.DefaultPort);
-                Startup.Apply(true);
+                if (cfg?.HadStartupTask != false) Startup.Apply(true); // not known (installed before 4.1.1): as it always did
                 // Each on its own: the window often runs from InstallDir, which then cannot go, and
                 // that must not leave the service's saved passwords behind in DataDir.
                 foreach (string dir in new[] { DataDir, InstallDir })

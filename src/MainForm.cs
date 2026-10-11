@@ -53,7 +53,7 @@ namespace TailRemote
         private readonly MenuItem _watch = new("Show the remote &screen") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.S };
         private VideoForm? _screen;
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
-        private readonly MenuItem _getClipboard = new("Get the remote PC's clip&board") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
+        private readonly MenuItem _getClipboard = new("Get the &remote PC's clipboard") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
         private readonly MenuItem _announceQuality = Menus.Check("A&nnounce when the sound quality changes");
         private readonly MenuItem _muteLocal = Menus.Check("&Mute the remote PC while you are not controlling it (it stays connected)");
         private readonly MenuItem _rideOut = Menus.Check("Ride out &Wi-Fi scans: when the sound keeps stalling, hold enough to cover it (a little more delay until it stops)");
@@ -927,7 +927,9 @@ namespace TailRemote
             _parked.Add(new Parked(NameFor(FrontAddress, FrontPort), FrontAddress, FrontPort, FrontPassword, c));
             while (_parked.Count > MaxParked)
             {
-                Speak(_parked[0].Name + ", the longest in the background, was disconnected: at most " + MaxParked + " wait there.");
+                string gone = _parked[0].Name + ", the longest in the background, was disconnected: at most " + MaxParked + " wait there.";
+                Later(() => Speak(gone)); // after "Connecting to ...", which would otherwise cut it off
+
                 _parked[0].Client.Dispose();
                 _parked.RemoveAt(0);
             }
@@ -974,9 +976,20 @@ namespace TailRemote
         private void HealthSaid(Client c, string text)
         {
             if (!_announceHealth.Checked) return;
+            // The host tells every new login what is wrong now, so a line that keeps dropping and reconnecting
+            // would say "drive nearly full" each time: that report (the first seconds of a connection) is
+            // not said again if the same news from the same PC was said in the last 30 minutes. Changes
+            // while connected (unplugged, plugged in again) are always said.
+            string key = c.HostEndPoint + "|" + System.Text.RegularExpressions.Regex.Replace(text, "[0-9.,]+", "#"); // "18 percent" and "17 percent" are the same news
+            long now = Environment.TickCount64;
+            bool standing = now - c.ConnectedAt < 5000;
+            if (standing && _healthSaid.TryGetValue(key, out long at) && now - at < 30 * 60_000) return;
+            if (_healthSaid.Count > 200) _healthSaid.Clear();
+            _healthSaid[key] = now;
             if (_parked.Find(p => p.Client == c) is Parked bg) Speak(bg.Name + ", in the background: " + text);
             else if (c == _client) Speak(text);
         }
+        private readonly System.Collections.Generic.Dictionary<string, long> _healthSaid = new();
 
         /// <summary>Keeps a saved PC's network cards (told by it while connected), so it can be woken later.</summary>
         private void RememberWake(string address, int port, string info)
@@ -1021,10 +1034,11 @@ namespace TailRemote
             relays.AddRange(_parked.Select(p => p.Client).Where(c => c.CanWake));
             foreach (var c in relays) c.SendWake(cards.Select(x => x.Mac).ToArray());
             System.Threading.ThreadPool.QueueUserWorkItem(_ => { foreach (var (mac, broadcast) in cards) try { Wake.Send(mac, new[] { broadcast }); } catch { } });
-            Say("Sent the wake signal to " + pc + " from this PC" + (relays.Count == 0 ? "" : " and from " + relays.Count + (relays.Count == 1 ? " connected PC" : " connected PCs")) + ".");
             _waking = pc.ToString();
             _wakingSince = Environment.TickCount64;
             SwitchTo(pc.Address, pc.Port, Settings.Unprotect(pc.PasswordEnc), pc.ToString());
+            // After switching, queued: "Connecting to ..." used to cut this off.
+            Speak("Sent the wake signal to " + pc + " from this PC" + (relays.Count == 0 ? "" : " and from " + relays.Count + (relays.Count == 1 ? " connected PC" : " connected PCs")) + ".");
         }
 
         // A PC just sent the wake signal: while it starts up, not answering is expected, not an error.
@@ -1344,6 +1358,7 @@ namespace TailRemote
         // those that ended while others still went: the Files line sums them up once all are done.
         private readonly System.Collections.Generic.Dictionary<int, FileChannel.Transfer> _going = new();
         private readonly System.Collections.Generic.List<FileChannel.Transfer> _ended = new();
+        private readonly System.Collections.Generic.HashSet<FileChannel.Transfer> _endedBefore = new(System.Collections.Generic.ReferenceEqualityComparer.Instance); // ends already shown
 
         /// <summary>How transfers are going, either way: the Files line and bars. Never spoken, so a lot of them cannot flood NVDA; the sounds say they started and ended.</summary>
         /// <summary>A transfer of files coming to this PC ended (RemoteFilesForm marks what it asked for).</summary>
@@ -1353,7 +1368,16 @@ namespace TailRemote
 
         private void ShowTransfer(FileChannel.Transfer t)
         {
-            if (t.Finished) { _going.Remove(t.Serial); if (!_ended.Contains(t)) _ended.Add(t); }
+            if (t.Finished)
+            {
+                // A progress report queued just before the end arrives after it, holding the same (now
+                // finished) transfer: its end is said, sounded and remembered only once.
+                if (_endedBefore.Contains(t) || t.Result == null) return; // no result yet: the report with it follows
+                if (_endedBefore.Count > 64) _endedBefore.Clear();
+                _endedBefore.Add(t);
+                _going.Remove(t.Serial); if (!_ended.Contains(t)) _ended.Add(t);
+            }
+            else if (_endedBefore.Contains(t)) return;
             else _going[t.Serial] = t;
             _transferShown = _going.Values.FirstOrDefault();
             if (_going.Count == 0)
@@ -1511,7 +1535,14 @@ namespace TailRemote
                 Activate();
                 Speech.Speak(Text + ". Alt opens the menus.", interrupt: false);
             }
-            if (_updated) Say("Updated to version " + Updater.Current + ".");
+            if (_updated)
+            {
+                // Connecting or hosting straight after would cut it off (each line interrupts the one before):
+                // then it starts that line instead.
+                string updated = "Updated to version " + Updater.Current + ".";
+                bool goes = (_autoHost && !_service.Checked) || (_autoConnect && !HostMode && _address.Text.Trim().Length > 0);
+                if (goes) _sayFirst = updated; else Say(updated);
+            }
             OfferServiceUpdate();
             if (_autoHost && _service.Checked) Log("The Kova service is hosting this PC, so this window does not.");
             else if (_autoHost)
@@ -1523,6 +1554,8 @@ namespace TailRemote
                 BeginInvoke(() => HideToTray(announce: false)); // started with Windows: out of the way
             }
             else if (_autoConnect && !HostMode && _address.Text.Trim().Length > 0) Go();
+            // Go said nothing (a setting needed fixing, say): "Updated to version" is said now, not glued to something later.
+            if (_sayFirst is string pending) { _sayFirst = null; Say(pending); }
         }
 
         /// <summary>
@@ -1688,7 +1721,7 @@ namespace TailRemote
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
                 if (Wasapi.OutputDevices().Count == 0)
-                    Say("This PC has no sound output, so the other PC will hear nothing. Press Set up audio device if you want Kova to add one.");
+                    Speak("This PC has no sound output, so the other PC will hear nothing. Press Set up audio device if you want Kova to add one.");
                 if (!Startup.IsElevated()) Log("Not running as administrator, so keys cannot reach administrator windows. Start hosting when Windows starts runs it as administrator.");
             }
             catch (Exception e) { Say("Could not start hosting: " + e.Message); }
@@ -1875,6 +1908,7 @@ namespace TailRemote
                 ApplyMute();
                 bool wasReconnecting = _reconnecting;
                 _reconnecting = false;
+                _waking = null; // awake now: a later drop is a real error again
                 _retryTimer.Stop();
                 string start = _expectUpdate != null ? "The remote PC is back" + (_expectUpdate.Length > 0 ? ", updated to " + _expectUpdate : "") + "."
                     : _expectRestart ? "The remote PC is back." : wasReconnecting ? "Reconnected." : "Connected.";
@@ -2001,6 +2035,7 @@ namespace TailRemote
             _expectUpdate = null;
             _attempt++;
             _reconnecting = false;
+            _waking = null;
             _connecting = false; // the abandoned attempt's own finally no longer counts, so it is cleared here
             _frontAddress = _frontPassword = null;
             _go.Enabled = true;
@@ -2272,6 +2307,8 @@ namespace TailRemote
             try { if (IsHandleCreated && !IsDisposed) BeginInvoke(a); } catch { }
         }
 
+        private string? _sayFirst; // said at the start of the next Say, rather than cut off by it
+
         /// <summary>Logs a line and speaks it after whatever is being said, without cutting it off.</summary>
         private void Speak(string line)
         {
@@ -2282,6 +2319,7 @@ namespace TailRemote
         /// <summary>Logs a line and speaks it.</summary>
         private void Say(string line)
         {
+            if (_sayFirst != null) { line = _sayFirst + " " + line; _sayFirst = null; }
             Log(line);
             Speech.Speak(line);
         }

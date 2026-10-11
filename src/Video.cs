@@ -58,17 +58,18 @@ namespace TailRemote
     /// What the host says about its screens (Protocol.VideoScreen), before the first picture and after
     /// each choice: which one is shown (0 = the first, the main one), how many there are, where the shown
     /// one is, and whether the one just asked for does not exist (so the viewer can say so).
-    /// u8 shown, u8 count, u8 flags (1 = refused, 2 = the shown one is the main one), u8 asked,
+    /// u8 shown, u8 count, u8 flags (1 = refused, 2 = the shown one is the main one, 4 = the screen
+    /// shown until now was unplugged, so it is the main one again), u8 asked,
     /// i32 x, y, width, height, i32 the main screen's width, height.
     /// </summary>
-    internal sealed record ScreenChoice(int Shown, int Count, bool Refused, int Asked, ScreenInfo Screen, int MainWidth, int MainHeight)
+    internal sealed record ScreenChoice(int Shown, int Count, bool Refused, int Asked, ScreenInfo Screen, int MainWidth, int MainHeight, bool Gone = false)
     {
         public const int Size = 28;
 
         public byte[] ToBytes()
         {
             var b = new byte[Size];
-            b[0] = (byte)Shown; b[1] = (byte)Math.Min(255, Count); b[2] = (byte)((Refused ? 1 : 0) | (Screen.Main ? 2 : 0)); b[3] = (byte)Asked;
+            b[0] = (byte)Shown; b[1] = (byte)Math.Min(255, Count); b[2] = (byte)((Refused ? 1 : 0) | (Screen.Main ? 2 : 0) | (Gone ? 4 : 0)); b[3] = (byte)Asked;
             BitConverter.TryWriteBytes(b.AsSpan(4), Screen.X);
             BitConverter.TryWriteBytes(b.AsSpan(8), Screen.Y);
             BitConverter.TryWriteBytes(b.AsSpan(12), Screen.Width);
@@ -86,7 +87,7 @@ namespace TailRemote
             if (count < 1 || shown >= count) return null;
             var s = new ScreenInfo(BitConverter.ToInt32(b, offset + 4), BitConverter.ToInt32(b, offset + 8), BitConverter.ToInt32(b, offset + 12), BitConverter.ToInt32(b, offset + 16), (b[offset + 2] & 2) != 0);
             if (s.Width <= 0 || s.Height <= 0) return null;
-            return new ScreenChoice(shown, count, (b[offset + 2] & 1) != 0, b[offset + 3], s, BitConverter.ToInt32(b, offset + 20), BitConverter.ToInt32(b, offset + 24));
+            return new ScreenChoice(shown, count, (b[offset + 2] & 1) != 0, b[offset + 3], s, BitConverter.ToInt32(b, offset + 20), BitConverter.ToInt32(b, offset + 24), (b[offset + 2] & 4) != 0);
         }
 
         /// <summary>Where the shown screen is, the way someone would say it: "right of the main screen".</summary>
@@ -451,6 +452,7 @@ namespace TailRemote
             public int Asks;               // how many asks the viewer had made by the last one taken in
             public int ToldCount;          // what the viewer was last told: how many screens, and the one shown
             public ScreenInfo ToldScreen;
+            public Rectangle ShownArea;    // where the shown screen is on the desktop: followed when others come and go
         }
 
         public ScreenVideo(ScreenTaker take) => _take = (int w, int _, int wait, out bool changed) => take(w, wait, out changed);
@@ -536,7 +538,17 @@ namespace TailRemote
             IReadOnlyList<ScreenInfo> list;
             try { list = _screens(); } catch { return null; }
             if (list.Count == 0) return null;
-            bool refused = false, switched = false;
+            bool refused = false, switched = false, gone = false;
+            // The screen shown is followed by where it is, not by its place in the list: unplugging another
+            // screen moves the rest up the list. Not found with fewer screens than before: it was the one
+            // unplugged, so the main one again. Not found with as many: only its size changed, it stays.
+            if (v.ShownArea != default)
+            {
+                int at = -1;
+                for (int i = 0; i < list.Count; i++) if (list[i].Area == v.ShownArea) { at = i; break; }
+                if (at >= 0) { if (at != v.Shown) { v.Shown = at; v.ToldCount = 0; } }
+                else if (list.Count < v.ToldCount) { gone = true; v.Shown = 0; switched = true; }
+            }
             if (asked != v.Asked || asks != v.Asks)
             {
                 v.Asked = asked;
@@ -545,7 +557,8 @@ namespace TailRemote
                 else refused = true;
                 v.ToldCount = 0; // a choice is always answered, even "that one again"
             }
-            if (v.Shown >= list.Count) { v.Shown = 0; switched = true; }
+            if (v.Shown >= list.Count) { v.Shown = 0; switched = true; gone = true; }
+            v.ShownArea = list[v.Shown].Area;
             if (switched)
             {
                 // Another screen: nothing on the viewer's copy is worth keeping, and its motion is not this one's.
@@ -556,7 +569,7 @@ namespace TailRemote
             if (!refused && v.ToldCount == list.Count && v.ToldScreen == shown) return null;
             v.ToldCount = list.Count; v.ToldScreen = shown;
             var main = list.FirstOrDefault(s => s.Main);
-            var choice = new ScreenChoice(v.Shown, list.Count, refused, Math.Clamp(asked, 0, 255), shown, main.Width, main.Height);
+            var choice = new ScreenChoice(v.Shown, list.Count, refused, Math.Clamp(asked, 0, 255), shown, main.Width, main.Height, gone);
             byte[] body = choice.ToBytes();
             byte[] m = new byte[1 + body.Length];
             m[0] = ScreenNote;
@@ -894,13 +907,16 @@ namespace TailRemote
         /// <summary>The host said which screen it shows (before the first picture, and after each choice). Raised on the stream's own thread.</summary>
         public event Action<ScreenChoice>? ScreenTold;
         private volatile int _screen = -1; // the screen chosen here (-1: none chosen, the host shows its main one)
+        /// <summary>The screen chosen here (-1: none), so a new stream to the same PC can keep it.</summary>
+        public int Chosen => _screen;
 
         /// <summary>Show this one of the host's screens (0: the first, the main one). The host answers with ScreenTold, refusing one it does not have.</summary>
         public void ChooseScreen(int screen)
         {
-            _screen = Math.Clamp(screen, 0, 255);
+            _screen = _asked = Math.Clamp(screen, 0, 255);
             Send(new[] { Protocol.VideoChooseScreen, (byte)_screen });
         }
+        private volatile int _asked = -1; // the last screen asked for on the line: only the host's answers to it move _screen
 
         private void Send(byte[] m)
         {
@@ -926,7 +942,7 @@ namespace TailRemote
                     stream.ReadTimeout = 15_000; // the host says something at least every few seconds
                     if (_paused) Send(new[] { Protocol.VideoPause, (byte)1 });
                     if (_noH264) Send(new[] { Protocol.VideoNoH264 }); // a new line: the host has to be told again
-                    if (_screen >= 0) Send(new[] { Protocol.VideoChooseScreen, (byte)_screen }); // and which screen
+                    if (_screen is int again and >= 0) { _asked = again; Send(new[] { Protocol.VideoChooseScreen, (byte)again }); } // and which screen
                     byte[]? buffer = null;
                     while (!_stop)
                     {
@@ -979,6 +995,11 @@ namespace TailRemote
                                 if (ScreenChoice.From(buffer, 1, n - 1) is { } choice)
                                 {
                                     Screens = choice;
+                                    // What is asked for again on a new line follows what the host shows: back to
+                                    // the main one when ours was unplugged, its new place when another was.
+                                    // Only notes answering our latest ask count: an older one (sent before the
+                                    // host took that ask in) would undo it.
+                                    if (!choice.Refused && _asked >= 0 && choice.Asked == _asked) _screen = choice.Gone ? -1 : choice.Shown;
                                     ScreenTold?.Invoke(choice);
                                 }
                                 break;

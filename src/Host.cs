@@ -652,7 +652,7 @@ namespace TailRemote
                     Session? owner = null;
                     for (int i = 0; i < 40 && owner == null; i++)
                     {
-                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && c.Address.Equals(remote));
+                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && Bucket(c.Address).Equals(Bucket(remote))); // the block, not the exact address: IPv6 privacy addresses change daily, and LaneProof proves who it is
                         if (owner == null) Thread.Sleep(50);
                     }
                     if (owner == null) { tcp.Dispose(); return; }
@@ -673,7 +673,7 @@ namespace TailRemote
                     Session? owner = null;
                     for (int i = 0; i < 40 && owner == null; i++)
                     {
-                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && c.Address.Equals(remote));
+                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && Bucket(c.Address).Equals(Bucket(remote))); // the block, not the exact address: IPv6 privacy addresses change daily, and LaneProof proves who it is
                         if (owner == null) Thread.Sleep(50);
                     }
                     if (owner == null) { tcp.Dispose(); return; }
@@ -1495,7 +1495,7 @@ namespace TailRemote
                 s = Array.Find(AllSessions(), x => d.AsSpan(1, 8).SequenceEqual(x.Token));
                 if (s == null) continue;
                 var from = any.Address.IsIPv4MappedToIPv6 ? any.Address.MapToIPv4() : any.Address;
-                if (!from.Equals(s.Address)) continue;
+                if (!Bucket(from).Equals(Bucket(s.Address))) continue; // the block: a new IPv6 privacy address each day must not silence the sound (the signed hello proves who)
                 // Only the PC that logged in can make a hello, and only a newer one counts (the stamp
                 // is its own clock, which only goes forward), so a recorded hello played back from
                 // another port cannot send the sound there.

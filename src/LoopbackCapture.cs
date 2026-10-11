@@ -113,9 +113,20 @@ namespace TailRemote
             var fmt = Wasapi.ReadFormat(fmtPtr);
             DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
             DiagLog.Write("host capture: opened " + DeviceInfo + (followDefault ? " (Windows default)" : " (chosen device)"));
-            client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                200_000, 0, fmtPtr, IntPtr.Zero);
-            Marshal.FreeCoTaskMem(fmtPtr);
+            try
+            {
+                client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    200_000, 0, fmtPtr, IntPtr.Zero);
+            }
+            catch
+            {
+                // Tried again every few seconds while the device refuses (another program has it alone):
+                // nothing may be left behind each time.
+                try { Marshal.ReleaseComObject(client); } catch { }
+                try { Marshal.ReleaseComObject(dev); } catch { }
+                throw;
+            }
+            finally { Marshal.FreeCoTaskMem(fmtPtr); }
 
             using var ev = new AutoResetEvent(false);
             client.SetEventHandle(ev.SafeWaitHandle.DangerousGetHandle());

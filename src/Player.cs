@@ -406,7 +406,15 @@ namespace TailRemote
             // makes Windows reconfigure the device for every program, which cut
             // all sound on the PC for about a second on connect and disconnect,
             // and a period of 3 ms or less underruns (crackles) on a busy PC.
-            client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, fmtPtr, IntPtr.Zero);
+            try { client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, fmtPtr, IntPtr.Zero); }
+            catch
+            {
+                // Tried again every second while the device refuses: nothing may be left behind each time.
+                Marshal.FreeCoTaskMem(fmtPtr);
+                try { Marshal.ReleaseComObject(client); } catch { }
+                try { Marshal.ReleaseComObject(dev); } catch { }
+                throw;
+            }
             client.GetDevicePeriod(out long def, out _);
             double periodMs = def / 10000.0;
             DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "") + ", period " + periodMs.ToString("0.0") + " ms";

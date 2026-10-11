@@ -127,7 +127,9 @@ namespace TailRemote
             public IReadOnlyList<(string Name, long Done, long Total)> Files = Array.Empty<(string, long, long)>();
             public double BytesPerSecond;
             public string? Result;
-            public TimeSpan? Left => BytesPerSecond > 1 && Total > Done ? TimeSpan.FromSeconds((Total - Done) / BytesPerSecond) : null;
+            // Read once (another thread changes it), and at most a year: a stalled line's speed falls towards
+            // nothing, and huge numbers of seconds made TimeSpan throw on the window's thread.
+            public TimeSpan? Left { get { double bps = BytesPerSecond; long rest = Total - Done; return bps > 1 && rest > 0 ? TimeSpan.FromSeconds(Math.Min(rest / bps, 365.0 * 86400)) : null; } }
         }
 
         /// <summary>Where arriving clipboard files are held until pasted: %LOCALAPPDATA%\TailRemote\Clipboard.</summary>
@@ -900,12 +902,14 @@ namespace TailRemote
             }
             t.Done = o.Outcome == EndedWell ? o.Total : Interlocked.Read(ref o.Acked); // the receiver has it all, whatever confirmations are still on their way
             t.BytesPerSecond = t.Done / Math.Max(0.001, moving > 0.5 ? moving : clock.Elapsed.TotalSeconds); // over the time it was moving, not any waiting
-            t.Finished = true;
             t.Waiting = false;
             t.Files = Array.Empty<(string, long, long)>();
             if (o.Outcome == EndedWell)
                 t.Result = "Sent " + o.What + (o.Kind == KindText ? "" : Summary(o.Entries.Select(e => (e.Rel, e.Length)))) + At(t) + ".";
             else { t.Failed = true; t.Cancelled = o.Outcome == EndedStopped; t.Result = o.Why; }
+            // Last: the window may be reading this transfer from an earlier report, and must never see it
+            // finished without its result.
+            Volatile.Write(ref t.Finished, true);
             DiagLog.Write("files: " + o.What + ": " + t.Result);
             Progress?.Invoke(t);
         }
@@ -1290,7 +1294,9 @@ namespace TailRemote
                 if (b.Kind == KindFiles)
                 {
                     lock (ActiveStaging) ActiveStaging.Add(folder);
-                    CleanStaging();
+                    // As the signed-in user on the service: the holding folder is theirs to change, and as
+                    // SYSTEM a link put in its place would delete whatever it pointed at.
+                    b.As(CleanStaging);
                 }
                 b.Folder = folder;
                 if (b.Kind != KindTo) b.As(() => Directory.CreateDirectory(folder)); // as the signed-in user when the service receives
@@ -1402,7 +1408,8 @@ namespace TailRemote
             string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
             string mark = n == 1 ? " (incomplete)" : " (incomplete " + n + ")";
             int room = 255 - mark.Length - ext.Length;
-            if (stem.Length > room && room > 0) stem = stem[..room];
+            if (room <= 0) { ext = ext[..Math.Max(1, ext.Length + room - 1)]; room = 1; } // an absurdly long extension gives way too
+            if (stem.Length > room) stem = stem[..room];
             return stem + mark + ext;
         }
 
@@ -1428,6 +1435,7 @@ namespace TailRemote
             int count = b.Entries.Length;
             {
                 var renamed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var chosenTops = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // renamed's new names, quick to look up
                 var tops = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var made = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 // Two different entries (whatever their index) must never resolve to the same file: on
@@ -1454,7 +1462,7 @@ namespace TailRemote
                             {
                                 while (true)
                                 {
-                                    fresh = Unique(b.Folder!, top);
+                                    fresh = Unique(b.Folder!, top, chosenTops);
                                     string chosen = Path.Combine(b.Folder!, fresh);
                                     if (!nested && length == 0) { using (File.OpenHandle(chosen, FileMode.CreateNew, FileAccess.Write)) { } reserved.Add(chosen); break; }
                                     if (!nested && length > 0)
@@ -1478,6 +1486,7 @@ namespace TailRemote
                                 }
                             }
                             renamed[top] = fresh;
+                            chosenTops.Add(fresh);
                         }
                         rel = fresh + rel[top.Length..];
                         if (nested && partialRel != null) partialRel = fresh + partialRel[top.Length..]; // in the same folder as its file
@@ -1635,7 +1644,6 @@ namespace TailRemote
                     if (b.Length(i) > 0 && !b.Renamed[i])
                         try { Finish(b, i); } catch { unnamed++; } // all of it is there, but it kept its "(incomplete)" name
             var t = b.T;
-            t.Finished = true;
             t.Files = Array.Empty<(string, long, long)>();
             t.Done = b.Done;
             t.BytesPerSecond = b.Done / Math.Max(0.001, b.Moving > 0.5 ? b.Moving : b.Clock.Elapsed.TotalSeconds);
@@ -1644,7 +1652,15 @@ namespace TailRemote
             string[]? paths = null;
             if (b.Kind == KindFiles)
             {
-                paths = b.Tops.Select(x => Path.Combine(b.Folder!, x)).ToArray();
+                // A file on its own that kept its "(incomplete)" name is pasted by that name: its own does not exist.
+                lock (b.Gate)
+                    paths = b.Tops.Select(x =>
+                    {
+                        string whole = Path.Combine(b.Folder!, x);
+                        for (int i = 0; i < b.Entries.Length; i++)
+                            if (b.Length(i) > 0 && !b.Renamed[i] && string.Equals(b.Finals[i], whole, StringComparison.OrdinalIgnoreCase)) return b.Paths[i];
+                        return whole;
+                    }).ToArray();
                 t.Result = "The other PC sent " + t.What + Summary(b.Entries.Select(e => e!.Value)) + " to your clipboard, at " + Speed(t.BytesPerSecond) + ". Press Control V to paste.";
             }
             else if (b.Kind is KindDownloads or KindTo) t.Result = "Received " + t.What + Summary(b.Entries.Select(e => e!.Value)) + At(t) + ". It is in " + Where(b.Folder!) + ".";
@@ -1655,6 +1671,7 @@ namespace TailRemote
                 t.Result = "Received the clipboard text.";
             }
             if (unnamed > 0) t.Result += " " + unnamed + (unnamed == 1 ? " file arrived whole but could not be given its own name, so it is still" : " files arrived whole but could not be given their own names, so they are still") + " called incomplete.";
+            Volatile.Write(ref t.Finished, true); // last, as in Run: never seen finished without its result
             lock (_inGate)
             {
                 if (_in == b) _in = null;
@@ -1778,9 +1795,10 @@ namespace TailRemote
             DiagLog.Write("files: " + why);
             var t = b.T;
             t.Files = Array.Empty<(string, long, long)>();
-            t.Finished = t.Failed = true;
+            t.Failed = true;
             t.Cancelled = outcome == EndedStopped;
             t.Result = why;
+            Volatile.Write(ref t.Finished, true); // last, as in Run
             try { Progress?.Invoke(t); } catch { }
             // Clipboard files: whatever arrived goes onto the clipboard, as a finished batch would.
             // Only what is really there: a file cut off part-way now has "(incomplete)" in its name,
@@ -1865,15 +1883,23 @@ namespace TailRemote
 
         private static readonly object ReserveGate = new();
 
-        /// <summary>A name that is not taken in the folder yet: name, name (2), name (3)...</summary>
-        private static string Unique(string folder, string name)
+        /// <summary>
+        /// A name that is not taken in the folder yet: name, name (2), name (3)... taken: names this batch
+        /// chose already but has not made on disk yet (a file waiting under its "(incomplete)" name), so two
+        /// of its files never get the same one. Shortened if need be to fit Windows' 255 characters.
+        /// </summary>
+        private static string Unique(string folder, string name, ICollection<string>? taken = null)
         {
-            if (!File.Exists(Path.Combine(folder, name)) && !Directory.Exists(Path.Combine(folder, name))) return name;
+            bool Free(string n) => !File.Exists(Path.Combine(folder, n)) && !Directory.Exists(Path.Combine(folder, n)) && (taken == null || !taken.Contains(n));
+            if (Free(name)) return name;
             string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
             for (int i = 2; ; i++)
             {
-                string n = stem + " (" + i + ")" + ext;
-                if (!File.Exists(Path.Combine(folder, n)) && !Directory.Exists(Path.Combine(folder, n))) return n;
+                string mark = " (" + i + ")", s = stem;
+                int room = 255 - mark.Length - ext.Length;
+                if (s.Length > room && room > 0) s = s[..room];
+                string n = s + mark + ext;
+                if (Free(n)) return n;
             }
         }
 
@@ -1960,9 +1986,16 @@ namespace TailRemote
             try
             {
                 if (!Directory.Exists(Staging)) return;
+                // Never through a junction or link: only real folders of our own are cleared.
+                // Only the holding folder and Kova's folder above it are the user's to swap for a link;
+                // further up (a profile moved to another drive by a junction) is the PC's own setup.
+                var hold = new DirectoryInfo(Staging);
+                foreach (var d in new[] { hold, hold.Parent })
+                    if (d != null && d.Exists && (d.Attributes & FileAttributes.ReparsePoint) != 0) return;
                 var cutoff = DateTime.UtcNow.AddMinutes(-10);
                 foreach (var old in new DirectoryInfo(Staging).GetDirectories().OrderByDescending(d => d.Name).Skip(1))
                 {
+                    if ((old.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                     if (old.CreationTimeUtc >= cutoff) continue;
                     lock (ActiveStaging) if (ActiveStaging.Contains(old.FullName)) continue;
                     try

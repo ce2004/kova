@@ -105,8 +105,10 @@ namespace TailRemote
             int? before = _lastShown;
             _lastShown = c.Shown;
             if (_sayScreen) { _sayScreen = false; _say(c.Say()); return; }
-            // Not asked for here: the screen being shown was unplugged on the remote PC, and it went back to the main one.
-            if (before is int was && was != c.Shown && !c.Refused) _say("Screen " + (was + 1) + " is gone from the remote PC. " + c.Say());
+            // Not asked for here: the host says the screen being shown was unplugged on the remote PC, and it
+            // went back to the main one. Only the host's word counts: a new line first shows the main one
+            // until our choice reaches it, and unplugging another screen renumbers this one.
+            if (c.Gone && !c.Refused) _say((before is int was && was != c.Shown ? "Screen " + (was + 1) : "The screen shown") + " is gone from the remote PC. " + c.Say());
         }
 
         /// <summary>Watching whichever connection is in front now: a new one after a reconnect or a switch of PC.</summary>
@@ -114,10 +116,14 @@ namespace TailRemote
         {
             var c = _client();
             if (c == _watching && (_stream != null || c == null)) return;
+            // A reconnect to the same PC keeps the screen chosen; another PC starts on its main one.
+            int keep = _stream != null && c != null && _watching != null && _watching.HostEndPoint.Equals(c.HostEndPoint) ? _stream.Chosen : -1;
             _stream?.Dispose();
             _stream = null;
             _view.Stream = null;
             _watching = c;
+            _lastShown = null;
+            if (keep < 0) _sayScreen = false; // a choice just made on the same PC is still answered, by the new stream
             if (c == null) return;
             if (!c.CanWatch)
             {
@@ -151,6 +157,7 @@ namespace TailRemote
             s.Note += t => { try { BeginInvoke(() => Note(t)); } catch { } };
             s.ScreenTold += c => { try { BeginInvoke(() => { if (_stream == s) ScreenTold(c); }); } catch { } };
             if (_minimized) s.Pause(true);
+            if (keep >= 0) s.ChooseScreen(keep);
             _stream = s;
             _view.Stream = s;
         }

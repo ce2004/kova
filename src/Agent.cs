@@ -96,10 +96,12 @@ namespace TailRemote
             _host.UpdateRequested += ServiceHost.UpdateFor;
             // A controller pulled this PC's clipboard. The service runs in session 0 and cannot read a
             // user's clipboard, so the agent at the screen reads it and sends it back, and the service
-            // fans it out to the controllers exactly as Send the clipboard does. SYSTEM opens the files.
+            // fans it out to the controllers exactly as Send the clipboard does. The files are opened as the
+            // signed-in user, never as SYSTEM: a list on the clipboard could name files that user may not
+            // read. Nobody signed in: nothing is sent (the host lets the identity go when the sends are done).
             _host.ClipboardRequested += () => agent.GetClipboard();
             agent.ClipboardText = text => _host?.SendClipboard(text);
-            agent.ClipboardFiles = paths => _host?.SendClipboardFiles(paths);
+            agent.ClipboardFiles = paths => { if (NativeService.ConsoleUser() is { } user) _host?.SendClipboardFiles(paths, user); };
             ServiceHost.Log("Hosting on port " + cfg.Port + ", from the service.");
             ServiceHost.HostingStarted(); // only now can a new version count as good
             // Audio settings and device names are never touched here: only Set up audio device, when pressed.

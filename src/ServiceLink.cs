@@ -397,7 +397,9 @@ namespace TailRemote
                 int serial = r.ReadInt32();
                 if (!_transfers.TryGetValue(serial, out var t))
                 {
-                    if (_transfers.Count > 16) _transfers.Clear();
+                    // Only ever ones still going are kept (finished ones leave below), so this is a safety
+                    // net: forgetting one still going would leave it on the window's Files line for good.
+                    if (_transfers.Count > 256) _transfers.Clear();
                     _transfers[serial] = t = new FileChannel.Transfer();
                 }
                 t.Outgoing = r.ReadBoolean(); t.Finished = r.ReadBoolean(); t.Failed = r.ReadBoolean(); t.Clipboard = r.ReadBoolean(); t.Cancelled = r.ReadBoolean(); t.Waiting = r.ReadBoolean();
@@ -408,6 +410,7 @@ namespace TailRemote
                 var files = new (string, long, long)[n];
                 for (int i = 0; i < n; i++) files[i] = (r.ReadString(), r.ReadInt64(), r.ReadInt64());
                 t.Files = files;
+                if (t.Finished) _transfers.Remove(serial);
                 return t;
             }
         }
