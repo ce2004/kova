@@ -53,7 +53,10 @@ namespace TailRemote
             }
             try
             {
-                if (info.LastPresentTime != 0 || _last == null)
+                // Only a frame Windows really drew is read: the first after duplication (re)starts may carry
+                // only a pointer move, with nothing in the picture yet (black). Until a real one comes,
+                // null, so GDI's copy is shown instead.
+                if (info.LastPresentTime != 0)
                 {
                     var f = Read(resource);
                     if (f != null) { _last = f; changed = true; }
@@ -158,6 +161,10 @@ namespace TailRemote
                     finally { Marshal.Release(output1); }
                     DXGI_OUTDUPL_DESC d;
                     CallVoid(_dup, 7, (IntPtr)(&d)); // GetDesc
+                    // A turned display (portrait, or upside down) is handed over unturned, so it would arrive
+                    // sideways: GDI's copy, which is the right way round, is used for it (looked at again
+                    // every 30 seconds, in case the display is turned back).
+                    if (d.Rotation > 1) { Stop(); _failedAt = Environment.TickCount64 + 25_000; return false; }
                     _width = (int)d.Width; _height = (int)d.Height; _systemMemory = d.DesktopImageInSystemMemory != 0;
                     _last = null; _shown = null;
                     _failedAt = 0;

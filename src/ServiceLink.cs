@@ -78,7 +78,20 @@ namespace TailRemote
         public sealed class Server
         {
             private readonly Host _host;
-            private readonly List<BlockingCollection<(byte, byte[])>> _windows = new();
+            private readonly List<Window> _windows = new();
+
+            /// <summary>
+            /// A connected window, with the session it was in when it linked up. After switching user
+            /// the old session's window stays connected (its user is only switched away), and must not
+            /// keep getting what arrives for the new user's clipboard and files.
+            /// </summary>
+            private sealed class Window
+            {
+                public readonly BlockingCollection<(byte, byte[])> Outbox = new(256);
+                public readonly NamedPipeServerStream Pipe;
+                public readonly uint Session;
+                public Window(NamedPipeServerStream pipe, uint session) { Pipe = pipe; Session = session; }
+            }
 
             private readonly Func<uint> _session;
 
@@ -94,13 +107,21 @@ namespace TailRemote
             /// <summary>Hands something to every connected window; false if none is connected (the agent then does it itself).</summary>
             public bool Forward(byte type, byte[] payload, bool mayDrop = false)
             {
-                BlockingCollection<(byte, byte[])>[] windows;
+                Window[] windows;
                 lock (_windows) windows = _windows.ToArray();
+                uint now = _session();
+                int handed = 0;
                 // Outside the lock, and never long: a window that has stopped reading must not hold
                 // up a transfer (this runs on the file lanes' threads).
-                foreach (var q in windows)
-                    try { if (!q.TryAdd((type, payload)) && !mayDrop) q.TryAdd((type, payload), 250); } catch { } // a window that has just gone
-                return windows.Length > 0;
+                foreach (var w in windows)
+                {
+                    // A window of a session no longer at the screen (switched away from) is closed, not
+                    // told: what arrives is for whoever is at the screen now. Its Serve tidies up.
+                    if (w.Session != now) { try { w.Pipe.Dispose(); } catch { } continue; }
+                    handed++;
+                    try { if (!w.Outbox.TryAdd((type, payload)) && !mayDrop) w.Outbox.TryAdd((type, payload), 250); } catch { } // a window that has just gone
+                }
+                return handed > 0;
             }
 
             public bool Text(string text) => Forward(GotText, Encoding.UTF8.GetBytes(text));
@@ -143,8 +164,10 @@ namespace TailRemote
                 sec.AddAccessRule(new PipeAccessRule(system, PipeAccessRights.FullControl, AccessControlType.Allow));
                 sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.InteractiveSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
                 // Owned by SYSTEM, which the window checks: nobody else can pose as the service.
-                using (var me = WindowsIdentity.GetCurrent()) if (me.IsSystem) sec.SetOwner(system);
-                bool first = true, warned = false;
+                bool asSystem;
+                using (var me = WindowsIdentity.GetCurrent()) asSystem = me.IsSystem;
+                if (asSystem) sec.SetOwner(system);
+                bool first = true, warned = false, warnedOwner = false;
                 while (true)
                 {
                     // Claimed before the attempt, win or lose (as AgentLink does): if something squats on the
@@ -160,6 +183,18 @@ namespace TailRemote
                         // one must be the first of its name: if another program made it first, it is not ours.
                         var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 16, PipeTransmissionMode.Byte,
                             PipeOptions.Asynchronous | (useFirst ? PipeOptions.FirstPipeInstance : 0), 0, 0, sec);
+                        // A later instance takes the rules of the name's first one, whoever made it. Not ours
+                        // (a program squatted on the name first): its maker could connect here posing as a
+                        // window. Let it go and only take a pipe that really is the first of its name again.
+                        if (asSystem && !OwnedBySystem(pipe))
+                        {
+                            pipe.Dispose();
+                            if (!warnedOwner) ServiceHost.Log("Service link: another program holds the pipe " + PipeName + "; waiting for it to go.");
+                            warnedOwner = true;
+                            first = true;
+                            Thread.Sleep(1000);
+                            continue;
+                        }
                         pipe.WaitForConnection();
                         // Only a window in this session (the one at the screen): never another account
                         // that is also signed in, which would otherwise hear what arrives for the clipboard.
@@ -169,26 +204,35 @@ namespace TailRemote
                             pipe.Dispose();
                             continue;
                         }
-                        new Thread(() => Serve(pipe)) { IsBackground = true, Name = "Kova service link window" }.Start();
+                        var window = new Window(pipe, session);
+                        new Thread(() => Serve(window)) { IsBackground = true, Name = "Kova service link window" }.Start();
                     }
                     catch (Exception e)
                     {
-                        if (!warned) ServiceHost.Log("Service link: " + e.Message + (first ? " Another program may hold the pipe TailRemoteFiles." : ""));
+                        if (!warned) ServiceHost.Log("Service link: " + e.Message + (useFirst ? " Another program may hold the pipe " + PipeName + "." : ""));
                         warned = true; // said once, not every second
                         Thread.Sleep(1000);
                     }
                 }
             }
 
-            private void Serve(NamedPipeServerStream pipe)
+            /// <summary>Whether a pipe (either end) is owned by SYSTEM, as the service's own pipes are.</summary>
+            internal static bool OwnedBySystem(PipeStream pipe)
             {
-                var outbox = new BlockingCollection<(byte, byte[])>(256);
+                try { return (pipe.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier)?.IsWellKnown(WellKnownSidType.LocalSystemSid) == true; }
+                catch { return false; }
+            }
+
+            private void Serve(Window window)
+            {
+                var pipe = window.Pipe;
+                var outbox = window.Outbox;
                 WindowsIdentity? user = null;
                 try
                 {
                     // Who the window runs as: files it sends are opened as that user, never as SYSTEM.
                     pipe.RunAsClient(() => user = WindowsIdentity.GetCurrent(TokenAccessLevels.Query | TokenAccessLevels.Impersonate | TokenAccessLevels.Duplicate));
-                    lock (_windows) _windows.Add(outbox);
+                    lock (_windows) _windows.Add(window);
                     ServiceHost.Log("Service link: the Kova window of " + user?.Name + " is connected.");
                     new Thread(() =>
                     {
@@ -214,24 +258,39 @@ namespace TailRemote
                     while (pipe.IsConnected)
                     {
                         var (type, p) = Read(pipe);
-                        var asUser = user;
+                        // Switched away from: this window's user is no longer at the screen, so nothing
+                        // more is taken from it either. It links up again when they come back.
+                        if (window.Session != _session()) break;
+                        // Each send gets a copy of its own: the files go out after this window may have gone,
+                        // and this one is let go when it does.
+                        WindowsIdentity? AsUser() => user == null ? null : new WindowsIdentity(user.AccessToken.DangerousGetHandle());
                         switch (type)
                         {
                             case SendText: { string text = Encoding.UTF8.GetString(p); _host.SendClipboard(text); break; }
-                            case SendClipFiles: _host.SendClipboardFiles(Paths(p), asUser); break;
-                            case SendDownloads: _host.SendFiles(Paths(p), asUser); break;
+                            case SendClipFiles: _host.SendClipboardFiles(Paths(p), AsUser()); break; // the host lets the copy go when the sends are done
+                            case SendDownloads: _host.SendFiles(Paths(p), AsUser()); break;
                             case CancelAll: _host.CancelTransfer(); break;
-                            case ReceiveIn: ChooseFolder(Encoding.UTF8.GetString(p), asUser); break;
+                            case ReceiveIn: ChooseFolder(Encoding.UTF8.GetString(p), user); break;
                         }
                     }
                 }
                 catch { }
                 finally
                 {
-                    lock (_windows) _windows.Remove(outbox);
+                    bool anyLeft;
+                    lock (_windows)
+                    {
+                        _windows.Remove(window);
+                        uint now = _session();
+                        anyLeft = _windows.Exists(w => w.Session == now);
+                    }
+                    // The folder this window chose is its user's: with no window of the user at the screen
+                    // left, received files go back to the usual place, never on into someone's folder.
+                    if (!anyLeft) FolderChosen?.Invoke(null);
                     outbox.CompleteAdding();
                     outbox.Dispose();
                     try { pipe.Dispose(); } catch { }
+                    user?.Dispose();
                 }
             }
         }
@@ -292,7 +351,6 @@ namespace TailRemote
                     try
                     {
                         // Impersonation allowed: the agent opens the files this user sends as this user.
-                        // Impersonation allowed: the agent opens the files this user sends as this user.
                         var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Impersonation);
                         pipe.Connect(2000);
                         // Really the service's agent: its pipe is owned by SYSTEM (or administrators). A
@@ -306,7 +364,9 @@ namespace TailRemote
                             continue;
                         }
                         _pipe = pipe;
-                        if (_folder.Length > 0) Send(ReceiveIn, Encoding.UTF8.GetBytes(_folder)); // the service may have restarted since
+                        // Always, even when empty (the usual place): the service may have restarted since, or
+                        // still hold a folder from before, which must not outlive this window's choice.
+                        Send(ReceiveIn, Encoding.UTF8.GetBytes(_folder));
                         while (!_stop)
                         {
                             var (type, p) = Read(pipe);

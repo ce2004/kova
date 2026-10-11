@@ -48,7 +48,8 @@ namespace TailRemote
         private readonly MenuItem _restart = new("Restart rem&ote PC and reconnect...");
         private readonly MenuItem _updateRemote = new("Update the remote P&C to this PC's version");
         private readonly MenuItem _remoteInfo = new("Remote PC &info...") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.I };
-        // The remote screen: off unless opened (nothing is taken or sent until then); opened again, it closes.
+        // The remote screen: a checkbox, off unless ticked (nothing is taken or sent until then). Escape in
+        // its window comes back here and leaves it on; unticking it (here or Control Shift S) turns it off.
         private readonly MenuItem _watch = new("Show the remote &screen") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.S };
         private VideoForm? _screen;
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
@@ -57,8 +58,8 @@ namespace TailRemote
         private readonly MenuItem _muteLocal = Menus.Check("&Mute the remote PC while you are not controlling it (it stays connected)");
         private readonly MenuItem _rideOut = Menus.Check("Ride out &Wi-Fi scans: when the sound keeps stalling, hold enough to cover it (a little more delay until it stops)");
         private readonly MenuItem _switchTo = new("Switch &to PC");
-        private readonly MenuItem _speedHere = new("Internet &speed test on this PC...") { WhyNot = "A speed test is already running on this PC." };
-        private readonly MenuItem _speedRemote = new("Internet speed test on the r&emote PC...");
+        private readonly MenuItem _speedHere = new("Meas&ure this PC's internet speed...") { WhyNot = "A speed test is already running on this PC." };
+        private readonly MenuItem _speedRemote = new("Measure the r&emote PC's internet speed...");
         private readonly MenuItem _backup = new("&Back up settings to a file...");
         private readonly MenuItem _restore = new("&Restore settings from a backup...");
         // Several PCs at once: the one in front is _client; these wait in the background, connected
@@ -67,7 +68,9 @@ namespace TailRemote
         private readonly System.Collections.Generic.List<Parked> _parked = new();
         private const int MaxParked = 8;
         private bool _loadingSettings; // a restored backup is going into the window: nothing is saved halfway
-        private readonly System.Collections.Generic.HashSet<Client> _versionTold = new();
+        // Remote PCs already told they are older, by address, port and version: once each (holding the
+        // Client objects themselves kept every closed connection alive).
+        private readonly System.Collections.Generic.HashSet<string> _versionTold = new();
         private Client? _seenClient;  // the connection the version and quality below belong to
         private int _qualitySaid;      // the bitrate step last announced
         private bool _expectRestart; // the remote PC was asked to restart: say when it is back
@@ -328,7 +331,7 @@ namespace TailRemote
 
         private void UpdateButtons()
         {
-            bool busy = _client != null || _host != null || _reconnecting || _parked.Count > 0;
+            bool busy = _client != null || _host != null || _reconnecting || _connecting || _parked.Count > 0;
             _mode.Menu.Enabled = !busy;
             // Alt C and Alt S are the Clipboard and Settings menus, so the button uses other letters.
             if (HostMode) _go.Text = _service.Checked ? "Appl&y settings to the service" : _host == null ? "Start &hosting" : "Stop &hosting";
@@ -740,22 +743,31 @@ namespace TailRemote
             Say("Asked the remote PC to update to Kova " + want + ".");
         }
 
-        /// <summary>Opens the remote screen, or closes it if it is open: on or off, nothing else to choose (it follows the line by itself).</summary>
+        /// <summary>Turns the remote screen on (its window opens) or off: a checkbox, nothing else to choose (it follows the line by itself).</summary>
         private void ShowScreen()
         {
             Doing("showing the remote screen");
             if (_screen != null && !_screen.IsDisposed)
             {
                 _screen.Close();
-                Say("Stopped showing the remote screen.");
+                Say("unchecked. Stopped showing the remote screen.");
                 return;
             }
             if (_client == null) { Say("Connect to a PC first."); return; }
             if (_client.ListenOnly) { Say("A listen-only connection cannot see the remote screen."); return; }
             if (!_client.CanWatch) { Say("The remote PC's Kova is too old to show its screen. Update it there."); return; }
-            _screen = new VideoForm(() => _client, Say, () => _keys?.Toggle());
-            _screen.FormClosed += (_, _) => _screen = null;
+            _screen = new VideoForm(() => _client, Say, () => _keys?.Toggle(), BackFromScreen);
+            _screen.FormClosed += (_, _) => { _screen = null; _watch.Checked = false; UpdateTitle(); };
+            _watch.Checked = true;
             _screen.Show(this);
+        }
+
+        /// <summary>Escape in the screen window: back here, the screen still on (and its frames a second in this title).</summary>
+        private void BackFromScreen()
+        {
+            Activate();
+            UpdateTitle();
+            Say("Back to the main window. The remote screen stays on; Control Shift S turns it off.");
         }
 
         private async void RemoteInfo()
@@ -790,7 +802,7 @@ namespace TailRemote
                 _seenClient = c;
                 _qualitySaid = c.AudioQuality;
                 _updateRemote.Text = "Update the remote P&C to this PC's version (it has " + hv + ", this PC has " + Updater.Current + ")";
-                if (hv < Updater.Current && !c.ListenOnly && _versionTold.Add(c))
+                if (hv < Updater.Current && !c.ListenOnly && _versionTold.Add(FrontAddress + ":" + FrontPort + ":" + hv))
                     Speak("The remote PC has Kova " + hv + ", older than this PC's " + Updater.Current + ". File, Update the remote PC brings it up to date.");
                 return;
             }
@@ -836,6 +848,26 @@ namespace TailRemote
 
         private int CurrentPort => int.TryParse(_port.Text.Trim(), out int p) ? p : 0;
 
+        // The PC in front (or being reconnected to), as it was when connected to: Address, Port and Saved
+        // PCs can be changed meanwhile, and must not rename it, park it under another PC's name or make a
+        // reconnect go somewhere else.
+        private string? _frontAddress, _frontPassword;
+        private int _frontPort;
+        private string FrontAddress => _frontAddress ?? _address.Text.Trim();
+        private int FrontPort => _frontAddress != null ? _frontPort : CurrentPort;
+        private string FrontPassword => _frontPassword ?? _password.Text;
+
+        /// <summary>"pc:47120", "1.2.3.4:47120" or "[fe80::1]:47120": the address and the port typed with it; null if there is none.</summary>
+        internal static (string Address, int Port)? SplitPort(string text)
+        {
+            text = text.Trim();
+            if (text.StartsWith('[') && text.IndexOf("]:", StringComparison.Ordinal) is int end and > 0)
+                return int.TryParse(text[(end + 2)..], out int p6) && p6 is > 0 and < 65536 ? (text[1..end], p6) : null;
+            int colon = text.LastIndexOf(':');
+            if (colon <= 0 || text.IndexOf(':') != colon) return null; // none, or a bare IPv6 address
+            return int.TryParse(text[(colon + 1)..], out int p) && p is > 0 and < 65536 ? (text[..colon], p) : null;
+        }
+
         private string NameFor(string address, int port) =>
             _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port))?.ToString() ?? (port == Protocol.DefaultPort ? address : address + ", port " + port);
 
@@ -845,10 +877,10 @@ namespace TailRemote
         {
             if (HostMode) { Say("Switching PCs works in Control another PC mode."); return; }
             if (_connecting && !_reconnecting) { Say("Still connecting. Try again in a moment."); return; }
-            if ((_client != null || _reconnecting) && SamePc(_address.Text, CurrentPort, address, port)) { Say("Already on " + name + "."); return; }
+            if ((_client != null || _reconnecting) && SamePc(FrontAddress, FrontPort, address, port)) { Say("Already on " + name + "."); return; }
             var target = FindParked(address, port);
             if (_client != null) Park(_client);
-            else if (_reconnecting) { _attempt++; _reconnecting = false; _retryTimer.Stop(); _resumeRemote = false; }
+            else if (_reconnecting) { _attempt++; _reconnecting = false; _retryTimer.Stop(); _resumeRemote = false; _connecting = false; _go.Enabled = true; }
             _address.Text = address;
             _port.Text = port.ToString();
             _password.Text = password;
@@ -864,8 +896,13 @@ namespace TailRemote
             _keys?.SetClient(null);
             c.Muted = true;
             c.LockedStep = Protocol.OpusSteps.Length - 1; // a few kilobits, so it takes nothing from the one in front
-            _parked.Add(new Parked(NameFor(_address.Text, CurrentPort), _address.Text.Trim(), CurrentPort, _password.Text, c));
-            while (_parked.Count > MaxParked) { _parked[0].Client.Dispose(); _parked.RemoveAt(0); }
+            _parked.Add(new Parked(NameFor(FrontAddress, FrontPort), FrontAddress, FrontPort, FrontPassword, c));
+            while (_parked.Count > MaxParked)
+            {
+                Speak(_parked[0].Name + ", the longest in the background, was disconnected: at most " + MaxParked + " wait there.");
+                _parked[0].Client.Dispose();
+                _parked.RemoveAt(0);
+            }
             _client = null;
         }
 
@@ -873,7 +910,9 @@ namespace TailRemote
         {
             _parked.Remove(p);
             var c = p.Client;
+            _player?.ResetSoon(); // the sound starts fresh: nothing measured on the last PC carries over
             _client = c;
+            (_frontAddress, _frontPort, _frontPassword) = (p.Address, p.Port, p.Password);
             c.Muted = false;
             c.LockedStep = _quality.SelectedIndex - 1;
             c.StartBest();
@@ -893,6 +932,7 @@ namespace TailRemote
             _parked.Remove(p);
             c.Dispose();
             Speak(p.Name + ", in the background, disconnected: " + why + " Switching to it connects again.");
+            UpdateButtons();
             UpdateTitle();
         }
 
@@ -908,7 +948,7 @@ namespace TailRemote
             var items = _switchTo.DropDownItems;
             items.Clear();
             string State(string address, int port) =>
-                (_client != null || _reconnecting || _connecting) && SamePc(_address.Text, CurrentPort, address, port) ? (_client != null ? "in front" : "connecting")
+                (_client != null || _reconnecting || _connecting) && SamePc(FrontAddress, FrontPort, address, port) ? (_client != null ? "in front" : "connecting")
                 : FindParked(address, port) != null ? "in the background" : "not connected";
             for (int i = 0; i < _settings.SavedPcs.Count; i++)
             {
@@ -925,8 +965,8 @@ namespace TailRemote
                 item.Click += (_, _) => Menus.AfterMenu(() => SwitchTo(p.Address, p.Port, p.Password, p.Name));
                 items.Add(item);
             }
-            if (_client != null && !_settings.SavedPcs.Any(s => SamePc(s.Address, s.Port, _address.Text, CurrentPort)))
-                items.Add(new ToolStripMenuItem((NameFor(_address.Text, CurrentPort) + ", in front").Replace("&", "&&")));
+            if (_client != null && !_settings.SavedPcs.Any(s => SamePc(s.Address, s.Port, FrontAddress, FrontPort)))
+                items.Add(new ToolStripMenuItem((NameFor(FrontAddress, FrontPort) + ", in front").Replace("&", "&&")));
             // Never an empty or all-greyed-out menu: with nothing NVDA can land on, it froze.
             if (items.Count == 0) items.Add(new MenuStatus("There are no saved PCs to switch to yet. Connect to one, then File, Save this PC.").Item);
             if (_parked.Count > 0)
@@ -937,6 +977,7 @@ namespace TailRemote
                     int n = _parked.Count;
                     DropBackground();
                     Say("Disconnected " + n + (n == 1 ? " PC" : " PCs") + " in the background.");
+                    UpdateButtons();
                     UpdateTitle();
                 }));
             }
@@ -1056,6 +1097,8 @@ namespace TailRemote
                 data = System.IO.File.ReadAllBytes(path);
             }
             catch (Exception e) { Say("Could not read the file: " + e.Message); return; }
+            // Checked before asking for a password: typing one only to hear the file was something else entirely wastes it.
+            if (!Settings.LooksLikeBackup(data)) { Say("That is not a Kova settings backup."); return; }
             Settings? restored = null;
             string? problem = null;
             while (restored == null)
@@ -1120,6 +1163,7 @@ namespace TailRemote
             // A checkbox must be ticked before Restart turns on, so a reflexive Enter cannot restart the remote PC.
             using (var dlg = new RestartConfirmForm())
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            if (_client != c) { Say("Not restarted: the PC in front changed meanwhile."); return; }
             _expectRestart = true;
             c.RestartHost();
             Say("Asked the remote PC to restart.");
@@ -1402,7 +1446,7 @@ namespace TailRemote
 
         private void ModeChanged(bool remote)
         {
-            _toggle.Text = remote ? "Control &this PC" : "Control &remote PC";
+            _toggle.Text = remote ? "Stop controlling the &remote PC" : "Control &remote PC";
             ApplyMute();
             if (_quietModeChange) _quietModeChange = false; // the reconnect message says it
             else { Say(remote ? "Controlling remote PC." : "Controlling this PC."); Tone(remote ? Sounds.Tone.ControlRemote : Sounds.Tone.ControlLocal); }
@@ -1423,6 +1467,7 @@ namespace TailRemote
                 if (_client.Muted) t += ", sound muted while you are not controlling it";
                 else if (_client.ReducedSound is string reduced) t += ", sound at " + reduced;
                 if (_parked.Count > 0) t += ", " + _parked.Count + " more in the background";
+                if (_screen is { IsDisposed: false } screen) t += ", screen " + VideoForm.Rate(screen.PerSecond);
                 WatchConnection(_client);
             }
             else if (_reconnecting) t = "Kova - reconnecting";
@@ -1482,9 +1527,15 @@ namespace TailRemote
             new System.Threading.Thread(() =>
             {
                 bool reported = false;
+                long lastPass = Environment.TickCount64;
                 while (!IsDisposed)
                 {
                     System.Threading.Thread.Sleep(1000);
+                    // Back from sleep: the clock moved on while nothing ran at all, which is not the window hanging.
+                    long now = Environment.TickCount64;
+                    bool slept = now - lastPass > 5000;
+                    lastPass = now;
+                    if (slept) System.Threading.Interlocked.Exchange(ref _answeredAt, now);
                     // Answering clears the label too: a report then always names what was really going on.
                     try { if (IsHandleCreated) BeginInvoke(() => { _answeredAt = Environment.TickCount64; _doing = "nothing in particular"; }); } catch { return; }
                     long stuck = Environment.TickCount64 - System.Threading.Interlocked.Read(ref _answeredAt);
@@ -1632,15 +1683,48 @@ namespace TailRemote
         /// <summary>Connects with the saved settings. Quiet attempts are reconnects: only success is spoken.</summary>
         private async void Connect(bool quiet)
         {
-            string address = _address.Text.Trim();
-            if (address.Length == 0) { Later(() => _address.Ask(this, "Type the address first.")); return; }
-            if (!CheckPassword(hosting: false)) return;
-            if (!CheckPort(out int port)) return;
+            if (HostMode) { if (_reconnecting) StopReconnecting("Stopped trying to reconnect: this PC is hosting now."); return; }
+            string address;
+            int port;
+            string pw;
+            if (quiet && _frontAddress != null)
+            {
+                // Trying again: the PC that was in front, never a box asking for something (one would
+                // open every second, each inside the last).
+                (address, port, pw) = (_frontAddress, _frontPort, _frontPassword ?? "");
+            }
+            else if (quiet)
+            {
+                address = _address.Text.Trim();
+                pw = _password.Text;
+                if (address.Length == 0 || pw.Length == 0 || !int.TryParse(_port.Text.Trim(), out port) || port is <= 0 or > 65535)
+                {
+                    StopReconnecting("Stopped trying: the address, port or password is empty or not valid. Fix it, then press Connect.");
+                    return;
+                }
+            }
+            else
+            {
+                address = _address.Text.Trim();
+                if (SplitPort(address) is (string bare, int typedPort))
+                {
+                    // "pc:47120" typed into Address: the port goes where it belongs.
+                    address = bare;
+                    _address.Text = bare;
+                    _port.Text = typedPort.ToString();
+                    SaveSettings();
+                }
+                if (address.Length == 0) { Later(() => _address.Ask(this, "Type the address first.")); return; }
+                if (!CheckPassword(hosting: false)) return;
+                if (!CheckPort(out port)) return;
+                pw = _password.Text;
+            }
             if (!quiet && FindParked(address, port) is Parked waiting) { Unpark(waiting); return; } // already connected, in the background
+            (_frontAddress, _frontPort, _frontPassword) = (address, port, pw);
             _connecting = true;
             int attempt = ++_attempt;
             if (!quiet) { _go.Enabled = false; Say("Connecting to " + address + "."); }
-            string pw = _password.Text;
+            UpdateButtons();
             string device = _devices[Math.Max(0, _device.SelectedIndex)].Id;
             try
             {
@@ -1657,8 +1741,13 @@ namespace TailRemote
                 // Trying again: a short wait for an answer, so a PC that is starting up is caught the
                 // moment it hosts, instead of every 8 seconds or more.
                 int answerMs = _reconnecting ? 2500 : 8000;
+                Client? made = null;
+                // What a PC says while it waits in the background is said with its name: "Host audio is not
+                // available" from a background PC sounded as if it came from the one in front.
+                void Told(string msg) => Later(() => Say(_parked.Find(x => x.Client == made) is Parked bg ? bg.Name + ", in the background: " + msg : msg));
                 var c = await System.Threading.Tasks.Task.Run(() =>
-                    Client.Connect(address, port, pw, player, msg => Later(() => Say(msg)), locked, answerMs));
+                    Client.Connect(address, port, pw, player, Told, locked, answerMs));
+                made = c;
                 if (attempt != _attempt || HostMode || _client != null)
                 {
                     // Stopped, switched to hosting, or already connected while this was under way.
@@ -1742,6 +1831,7 @@ namespace TailRemote
             if (!byUser && leaving is Protocol.LeavingRestarting or Protocol.LeavingShutdown) _expectRestart = true; // whoever asked for it
             if (byUser)
             {
+                _frontAddress = _frontPassword = null; // the next Connect goes wherever Address says
                 _expectRestart = false;
                 _expectUpdate = null;
                 Say(why);
@@ -1795,6 +1885,9 @@ namespace TailRemote
             _expectUpdate = null;
             _attempt++;
             _reconnecting = false;
+            _connecting = false; // the abandoned attempt's own finally no longer counts, so it is cleared here
+            _frontAddress = _frontPassword = null;
+            _go.Enabled = true;
             _retryTimer.Stop();
             Say(why);
             UpdateButtons();

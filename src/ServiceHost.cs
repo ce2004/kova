@@ -44,14 +44,18 @@ namespace TailRemote
             public bool Logging { get; set; }
             public bool WeSetSasPolicy { get; set; }
 
-            public static string Seal(string s) => s.Length == 0 ? "" : Convert.ToBase64String(Native.Protect(System.Text.Encoding.UTF8.GetBytes(s), true, machine: true));
-            public static string Open(string s) => s.Length == 0 ? "" : System.Text.Encoding.UTF8.GetString(Native.Protect(Convert.FromBase64String(s), false, machine: true));
+            // Null-safe: a "null" in the file (edited by hand, or damaged) used to stop hosting with a crash.
+            public static string Seal(string? s) => string.IsNullOrEmpty(s) ? "" : Convert.ToBase64String(Native.Protect(System.Text.Encoding.UTF8.GetBytes(s), true, machine: true));
+            public static string Open(string? s) => string.IsNullOrEmpty(s) ? "" : System.Text.Encoding.UTF8.GetString(Native.Protect(Convert.FromBase64String(s), false, machine: true));
         }
 
+        /// <summary>The service's settings, or the copy kept before the last change if they are damaged; null if neither can be read.</summary>
         public static Config? LoadConfig()
         {
-            try { return JsonSerializer.Deserialize<Config>(File.ReadAllText(ConfigPath)); }
-            catch { return null; }
+            if (LoadConfigFrom(ConfigPath) is { } cfg) return cfg;
+            cfg = LoadConfigFrom(ConfigPath + ".bak");
+            if (cfg != null) Log("The service's settings could not be read, so the copy kept before the last change is used.");
+            return cfg;
         }
 
         public static void Log(string line)
@@ -102,20 +106,30 @@ namespace TailRemote
         /// </summary>
         public static int Install()
         {
+            // Once the service is stopped, any failure must not leave it stopped: on a PC reached only
+            // through Kova that would lose the PC. Started again in finally unless the install did it.
+            bool stopped = false, started = false;
+            string fresh = InstalledExe + ".new";
             try
             {
                 var s = Settings.Load();
                 if (s.Password.Length < MainForm.MinPasswordLength) return Fail("Set a password of at least " + MainForm.MinPasswordLength + " characters first.");
 
+                // The new copy goes in next to the old one first, while the service still runs: a full
+                // disk or a refused copy then fails here, with the service still up.
+                Directory.CreateDirectory(InstallDir);
+                bool copy = !string.Equals(Path.GetFullPath(Environment.ProcessPath!), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
+                if (copy) File.Copy(Environment.ProcessPath!, fresh, true);
+
                 RunHidden("sc.exe", "stop " + Name);
+                stopped = true;
                 WaitForStopped();
 
-                Directory.CreateDirectory(InstallDir);
-                if (!string.Equals(Path.GetFullPath(Environment.ProcessPath!), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase))
+                if (copy)
                 {
                     for (int i = 0; ; i++)
                     {
-                        try { File.Copy(Environment.ProcessPath!, InstalledExe, true); break; }
+                        try { File.Move(fresh, InstalledExe, overwrite: true); break; }
                         catch when (i < 20) { Thread.Sleep(250); } // the old agent is still letting go
                     }
                 }
@@ -149,9 +163,25 @@ namespace TailRemote
                 Firewall.Apply(true, s.Port);
 
                 if (RunHidden("sc.exe", "start " + Name) != 0) return Fail("The service was installed but would not start.");
+                started = true;
                 return 0;
             }
             catch (Exception e) { return Fail(e.Message); }
+            finally
+            {
+                // Whatever failed, the service (the old copy, if the new one never got in) runs again.
+                // A start sent while the old one was still stopping fails, and it then stayed stopped: wait for
+                // it to really stop, and keep trying for a minute (1056: it is already running, which is fine).
+                if (stopped && !started)
+                    for (int i = 0; i < 12; i++)
+                    {
+                        WaitForStopped();
+                        int rc = RunHidden("sc.exe", "start " + Name);
+                        if (rc == 0 || rc == 1056) break;
+                        Thread.Sleep(5000);
+                    }
+                try { File.Delete(fresh); } catch { } // a copy that never got in
+            }
         }
 
         public static int Remove()
@@ -202,14 +232,38 @@ namespace TailRemote
         private static void WriteConfig(Config cfg)
         {
             var dir = Directory.CreateDirectory(DataDir);
-            // Only SYSTEM and administrators, nothing inherited.
+            // A link made by someone else would send the passwords wherever it points.
+            if (dir.Attributes.HasFlag(FileAttributes.ReparsePoint)) throw new InvalidOperationException(DataDir + " is a link to somewhere else, so the service's settings were not saved there.");
+            // Only SYSTEM and administrators, nothing inherited. Owned by administrators too: an ordinary
+            // user who made the folder first would otherwise still own it, and an owner may always change
+            // who can read it.
+            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
             var sec = new DirectorySecurity();
+            sec.SetOwner(admins);
             sec.SetAccessRuleProtection(true, false);
             foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
                 sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
                     InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
             dir.SetAccessControl(sec);
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+            // Never written in place: a crash or power cut half way left settings the service could not
+            // read. Written whole beside it, then put in place in one step, with the last good copy kept
+            // as .bak (LoadConfig falls back to it). Old files are deleted, not overwritten, so each new
+            // one takes this folder's rules rather than any rules an old one was given.
+            string tmp = ConfigPath + ".tmp", bak = ConfigPath + ".bak";
+            File.Delete(tmp);
+            File.WriteAllText(tmp, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+            if (LoadConfigFrom(ConfigPath) != null)
+            {
+                File.Delete(bak);
+                File.Copy(ConfigPath, bak);
+            }
+            File.Move(tmp, ConfigPath, overwrite: true);
+        }
+
+        private static Config? LoadConfigFrom(string path)
+        {
+            try { return JsonSerializer.Deserialize<Config>(File.ReadAllText(path)); }
+            catch { return null; }
         }
 
         /// <summary>Creates the Kova service, or brings its settings up to date. False if Windows would not create it.</summary>
@@ -300,7 +354,7 @@ namespace TailRemote
         {
             _statusHandle = NativeService.RegisterServiceCtrlHandlerExW(Name, _handler!, IntPtr.Zero);
             Report(NativeService.SERVICE_START_PENDING);
-            CheckRollback();
+            if (_rolledBack) Environment.Exit(1); // a failed start: Windows' recovery setting starts the restored copy
             // Hosting starts at once, from the service itself: before the sign-in screen exists.
             new Thread(Agent.StartHosting) { IsBackground = true, Name = "Kova service hosting" }.Start();
             new Thread(UpdateLoop) { IsBackground = true, Name = "Kova service updates" }.Start();
@@ -311,7 +365,8 @@ namespace TailRemote
 
             Process? agent = null;
             uint agentSession = uint.MaxValue;
-            long lastStart = 0, wait = 2000;
+            long lastStart = 0, nextStart = 0, wait = 2000;
+            bool counted = true; // whether the agent that ended (or never started) has been counted in wait yet
             while (!Stop.WaitOne(0))
             {
                 if (Restarting)
@@ -325,17 +380,25 @@ namespace TailRemote
                 }
                 uint session = NativeService.WTSGetActiveConsoleSessionId();
                 bool alive = agent != null && !agent.HasExited;
-                if (session != 0xFFFFFFFF && (!alive || session != agentSession) && Environment.TickCount64 - lastStart > wait)
+                // Counted as soon as it is seen to have ended (within a second), by how long it really ran.
+                // It used to be measured only at the next start, by which time it always looked long-lived,
+                // so the wait went 2, 4, 8, 16 seconds and back to 2, never reaching a minute.
+                if (!alive && !counted)
+                {
+                    wait = NextWait(wait, Environment.TickCount64 - lastStart, session == agentSession);
+                    nextStart = lastStart + wait;
+                    counted = true;
+                }
+                bool moved = session != agentSession;
+                if (session != 0xFFFFFFFF && (!alive || moved) && Environment.TickCount64 >= (moved ? lastStart + 2000 : nextStart))
                 {
                     try { if (alive) agent!.Kill(); } catch { }
-                    // An agent that keeps failing straight away is retried less and less often
-                    // (up to once a minute), so it cannot fill the log or keep the CPU busy.
-                    bool quickFailure = !alive && session == agentSession && Environment.TickCount64 - lastStart < 10_000;
-                    wait = quickFailure ? Math.Min(wait * 2, 60_000) : 2000;
+                    if (moved) wait = 2000; // someone else at the screen: a fresh start
                     agent?.Dispose();
                     lastStart = Environment.TickCount64;
                     agent = StartAgent(session);
                     agentSession = session;
+                    counted = false;
                 }
                 WaitHandle.WaitAny(new WaitHandle[] { Stop, Wake }, 1000);
             }
@@ -345,6 +408,14 @@ namespace TailRemote
             Log("Service stopped.");
             Report(NativeService.SERVICE_STOPPED);
         }
+
+        /// <summary>
+        /// How long to wait before starting the agent again, after one that ran livedMs. One that keeps
+        /// failing straight away (under 10 seconds, in the same session) is retried less and less often,
+        /// up to once a minute, so it cannot fill the log or keep the CPU busy; otherwise 2 seconds.
+        /// </summary>
+        internal static long NextWait(long wait, long livedMs, bool sameSession) =>
+            sameSession && livedMs < 10_000 ? Math.Min(wait * 2, 60_000) : 2000;
 
         private static Process? StartAgent(uint session)
         {
@@ -358,13 +429,24 @@ namespace TailRemote
                 if (!NativeService.SetTokenInformation(token, NativeService.TokenSessionId, ref sid, 4)) throw new InvalidOperationException("SetTokenInformation " + Marshal.GetLastWin32Error());
                 var si = new NativeService.STARTUPINFO { cb = Marshal.SizeOf<NativeService.STARTUPINFO>(), lpDesktop = "winsta0\\default" };
                 string exe = Environment.ProcessPath!;
-                if (!NativeService.CreateProcessAsUserW(token, null, "\"" + exe + "\" --agent", IntPtr.Zero, IntPtr.Zero, false,
+                // This service's number goes with it: the agent ends when this service does, so one left
+                // behind by a crash never fights the next service's agent for the pipe.
+                if (!NativeService.CreateProcessAsUserW(token, null, "\"" + exe + "\" --agent " + Environment.ProcessId, IntPtr.Zero, IntPtr.Zero, false,
                         NativeService.CREATE_NO_WINDOW | NativeService.CREATE_UNICODE_ENVIRONMENT, IntPtr.Zero, Path.GetDirectoryName(exe), ref si, out var pi))
                     throw new InvalidOperationException("CreateProcessAsUser " + Marshal.GetLastWin32Error());
                 NativeService.CloseHandle(pi.hThread);
-                NativeService.CloseHandle(pi.hProcess);
-                Log("Agent started in session " + session + ".");
-                return Process.GetProcessById(pi.dwProcessId);
+                // Looked up while its handle is still held, so its number cannot have gone to another
+                // process yet. One that already ended counts as a failed start.
+                Process? agent;
+                try
+                {
+                    agent = Process.GetProcessById(pi.dwProcessId);
+                    _ = agent.Handle; // its own handle now, so later checks see this process and no other
+                }
+                catch (Exception) { agent = null; }
+                finally { NativeService.CloseHandle(pi.hProcess); }
+                Log(agent != null ? "Agent started in session " + session + "." : "The agent in session " + session + " ended as soon as it started.");
+                return agent;
             }
             catch (Exception e)
             {
@@ -496,9 +578,12 @@ namespace TailRemote
         /// that will not run: Windows restarts a failing service again and again, but the same broken
         /// copy each time. So each start after an update is counted, and the fourth start without the
         /// new version having stayed up for 2 minutes puts the previous version back and restarts into
-        /// it. After 2 minutes up, the update counts as good and the note goes.
+        /// it. After 2 minutes really hosting, the update counts as good and the note goes.
+        ///
+        /// Counted first thing in Main (Program), before anything else the new copy does can fail: a copy
+        /// that crashed before reaching the service itself used to never be counted, so never rolled back.
         /// </summary>
-        private static void CheckRollback()
+        public static void CountStart()
         {
             try
             {
@@ -512,19 +597,37 @@ namespace TailRemote
                     string exe = InstalledExe;
                     string bad = exe + ".old-failed-" + DateTime.UtcNow.Ticks;
                     File.Move(exe, bad);
-                    File.Move(old, exe);
+                    // Never no copy at all: if the old one cannot go back, the failing one does, and is
+                    // tried again (and counted again) rather than leaving Windows nothing to start.
+                    try { File.Move(old, exe); }
+                    catch { File.Move(bad, exe); throw; }
                     File.Delete(RollbackNote);
                     Log("Version " + Updater.Current + " kept failing to start, so the service went back to " + oldVersion + ".");
-                    Environment.Exit(1); // Windows' recovery setting starts the restored copy
+                    // Not yet: a process that ends before it has reached the service manager may not count
+                    // as a failed start, and nothing would start the restored copy. ServiceMain exits.
+                    _rolledBack = true;
+                    return;
                 }
                 File.WriteAllLines(RollbackNote, new[] { old, oldVersion, starts.ToString() });
-                new Thread(() =>
-                {
-                    Thread.Sleep(TimeSpan.FromMinutes(2));
-                    try { File.Delete(RollbackNote); Log("Version " + Updater.Current + " is running well; the previous copy is no longer kept."); } catch { }
-                }) { IsBackground = true, Name = "Kova update check" }.Start();
             }
             catch (Exception e) { Log("Roll back check failed: " + e.Message); }
+        }
+
+        private static int _hostingStarted;
+        private static bool _rolledBack; // CountStart put the previous version back: this copy ends as soon as Windows knows it started
+
+        /// <summary>
+        /// Hosting really started (Agent.StartHosting). Only from now does the 2 minutes count: a new copy
+        /// that ran but never managed to host used to count as good, and was never rolled back.
+        /// </summary>
+        public static void HostingStarted()
+        {
+            if (!File.Exists(RollbackNote) || Interlocked.Exchange(ref _hostingStarted, 1) == 1) return;
+            new Thread(() =>
+            {
+                Thread.Sleep(TimeSpan.FromMinutes(2));
+                try { File.Delete(RollbackNote); Log("Version " + Updater.Current + " is running well; the previous copy is no longer kept."); } catch { }
+            }) { IsBackground = true, Name = "Kova update check" }.Start();
         }
 
         /// <summary>A nudge from TailRemote after it updated itself: check now. At most once a minute.</summary>
@@ -533,20 +636,46 @@ namespace TailRemote
             var sec = new PipeSecurity();
             sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
             sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
-            sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
+            // Whoever is signed in at the PC, not only an elevated window: the window usually runs without
+            // administrator rights, and its nudge was refused, so the service never followed its update.
+            // Safe to allow: a nudge only makes the service fetch GitHub's newest release, checked against
+            // GitHub's fingerprint, at most once a minute. Nobody over the network.
+            sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.InteractiveSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
             long last = -60_000;
+            System.Threading.Timer? later = null;
             while (!Stop.WaitOne(0))
             {
                 try
                 {
-                    using var pipe = NamedPipeServerStreamAcl.Create(Names.UpdatePipe, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, 0, sec);
+                    using var pipe = NamedPipeServerStreamAcl.Create(Names.UpdatePipe, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, sec);
                     pipe.WaitForConnection();
-                    if (pipe.ReadByte() == 1 && Environment.TickCount64 - last >= 60_000)
+                    // Four bytes within 2 seconds: anyone signed in may open this pipe, and one that opened it
+                    // and never wrote used to block every nudge after it.
+                    byte[] nudge = new byte[4];
+                    int got = 0;
+                    using (var cut = new CancellationTokenSource(2000))
+                        try { while (got < 4) { int r = pipe.ReadAsync(nudge, got, 4 - got, cut.Token).GetAwaiter().GetResult(); if (r == 0) break; got += r; } }
+                        catch (OperationCanceledException) { }
+                    if (got < 4 || nudge[0] != 1) continue;
+                    // The version is always taken, even inside the minute: the newest nudge says what the
+                    // window runs now, and the check it asks for still happens, when the minute is up. One
+                    // older than this service is nobody's real window (it would hold updates back): ignored.
+                    var told = new Version(nudge[1], nudge[2], nudge[3]);
+                    if (told < Updater.Current) continue;
+                    _windowVersion = told;
+                    long since = Environment.TickCount64 - last;
+                    if (since >= 60_000)
                     {
-                        int a = pipe.ReadByte(), b = pipe.ReadByte(), c = pipe.ReadByte();
-                        _windowVersion = a >= 0 && b >= 0 && c >= 0 ? new Version(a, b, c) : null;
                         last = Environment.TickCount64;
                         CheckNow.Set();
+                    }
+                    else if (since >= 0) // below 0: a check is already set for when the minute is up
+                    {
+                        // One check, when the minute is up, however many nudges come before then.
+                        long due = 60_000 - since;
+                        last = Environment.TickCount64 + due;
+                        later ??= new System.Threading.Timer(_ => CheckNow.Set());
+                        later.Change(due, Timeout.Infinite);
                     }
                 }
                 catch { Thread.Sleep(1000); }

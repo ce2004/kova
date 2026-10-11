@@ -7,6 +7,18 @@ namespace TailRemote
     /// <summary>The handful of WASAPI interfaces TailRemote needs, declared by hand.</summary>
     internal static class Wasapi
     {
+        /// <summary>
+        /// The device went away or changed under us (headphones or Bluetooth unplugged, its sample rate
+        /// changed): reopening is all it takes, at once and without a word. Anything else is a real problem.
+        /// </summary>
+        public static bool DeviceReset(Exception e) => e.HResult == unchecked((int)0x88890004); // AUDCLNT_E_DEVICE_INVALIDATED
+
+        /// <summary>Lets go of a COM object now rather than whenever the garbage collector gets to it.</summary>
+        public static void Release(object? o)
+        {
+            if (o == null || !Marshal.IsComObject(o)) return;
+            try { Marshal.ReleaseComObject(o); } catch { }
+        }
         public const int eRender = 0, eConsole = 0;
         public const uint DEVICE_STATE_ACTIVE = 1;
         public const uint CLSCTX_ALL = 23;

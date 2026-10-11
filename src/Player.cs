@@ -131,6 +131,16 @@ namespace TailRemote
         /// open, so connecting never opens or closes a device. Call only while no
         /// connection is feeding it.
         /// </summary>
+        // Set by ResetSoon (the window thread); the next Push does the Reset on the network thread,
+        // where Push's own state lives.
+        private volatile bool _resetSoon;
+
+        /// <summary>
+        /// Another PC's sound comes next (switching to a PC in the background): the last one's lateness,
+        /// its Wi-Fi ride-out and its packet numbers must not shape this one's.
+        /// </summary>
+        public void ResetSoon() => _resetSoon = true;
+
         public void Reset()
         {
             lock (_gate)
@@ -208,6 +218,7 @@ namespace TailRemote
         /// </summary>
         public void Push(uint seq, ReadOnlySpan<short> pcm, int ticks, bool concealed = false, double arrivedAt = 0)
         {
+            if (_resetSoon) { _resetSoon = false; Reset(); }
             int rate = _deviceRate;
             if (rate == 0) return;
             if (_rs == null || _rsRate != rate)
@@ -339,6 +350,21 @@ namespace TailRemote
             _scratch[_scratchLen++] = r;
         }
 
+        private int _resets;
+        private long _resetAt;
+
+        /// <summary>
+        /// A device reset is reopened quietly, but not for ever: ten in a row within seconds of each other (a
+        /// Bluetooth device half there) go the normal way, with a message and the usual wait.
+        /// </summary>
+        private bool QuickReset()
+        {
+            long now = Environment.TickCount64;
+            if (now - _resetAt > 5000) _resets = 0;
+            _resetAt = now;
+            return ++_resets <= 10;
+        }
+
         private void Run()
         {
             Native.ProAudioThread();
@@ -349,6 +375,13 @@ namespace TailRemote
                 {
                     PlayUntilDeviceChanges();
                     lastError = null;
+                }
+                catch (Exception e) when (Wasapi.DeviceReset(e) && !_stop && QuickReset())
+                {
+                    // Headphones unplugged, or the device changed: straight onto whatever plays now, no
+                    // message and no second of silence.
+                    DiagLog.Write("player: the device changed under us; reopening");
+                    Thread.Sleep(20);
                 }
                 catch (Exception e)
                 {
@@ -421,6 +454,7 @@ namespace TailRemote
                         // the chosen output that was missing comes back.
                         var want = Wasapi.OutputDevice(_deviceId);
                         want.GetId(out string curId);
+                        Wasapi.Release(want);
                         if (curId != devId && (followDefault || curId == _deviceId)) return;
                     }
                 }
@@ -429,6 +463,9 @@ namespace TailRemote
             {
                 _deviceRate = 0;
                 try { client.Stop(); } catch { }
+                Wasapi.Release(render);
+                Wasapi.Release(client);
+                Wasapi.Release(dev);
             }
         }
 

@@ -60,7 +60,8 @@ namespace TailRemote
                     }
                 }
                 finally { WlanFreeMemory(list); }
-                if (done.Count > 0) State = done.Exists(d => d.Contains("refused")) ? "Wi-Fi would not hold off its scans for networks (its driver refused)" : "Wi-Fi scans for networks held off while connected";
+                if (done.Count == 0) State = null; // no Wi-Fi in use now (on a cable): nothing to say about it
+                else State = done.Exists(d => d.Contains("refused")) ? "Wi-Fi would not hold off its scans for networks (its driver refused)" : "Wi-Fi scans for networks held off while connected";
                 DiagLog.Write(who + ": Wi-Fi " + (done.Count == 0 ? "none" : string.Join("; ", done)));
             }
             catch (Exception e) { DiagLog.Write(who + ": Wi-Fi settings not changed: " + e.Message); }
@@ -71,6 +72,7 @@ namespace TailRemote
             if (_handle == IntPtr.Zero) return;
             try { WlanCloseHandle(_handle, IntPtr.Zero); } catch { } // Windows restores both settings
             _handle = IntPtr.Zero;
+            State = null;
         });
     }
 }

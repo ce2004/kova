@@ -9,7 +9,8 @@ namespace TailRemote
     /// The remote screen (File, Show the remote screen; Control Shift S). Off unless opened: nothing is
     /// taken or sent until then, and closing it stops it. Opens maximized, so the picture is as near its
     /// real size as this screen allows, which suits NVDA's OCR (NVDA+R) as well as anyone watching.
-    /// Escape closes, F5 asks for a whole new picture, Control Shift Enter controls the remote PC.
+    /// Escape goes back to the main window and leaves it on; Control Shift S turns it off (closes it);
+    /// F5 asks for a whole new picture; Control Shift Enter controls the remote PC.
     /// Minimized, it pauses: the remote PC takes no pictures while there is nothing to look at.
     /// After a dropped connection it carries on with the next one by itself.
     /// </summary>
@@ -17,7 +18,7 @@ namespace TailRemote
     {
         private readonly Func<Client?> _client;
         private readonly Action<string> _say;
-        private readonly Action _controlRemote;
+        private readonly Action _controlRemote, _back;
         private readonly ScreenView _view = new();
         private readonly Timer _follow = new() { Interval = 1000 };
         private Client? _watching;
@@ -25,12 +26,13 @@ namespace TailRemote
         private bool _saidShowing, _minimized;
         private string? _saidNote;
 
-        public VideoForm(Func<Client?> client, Action<string> say, Action controlRemote)
+        public VideoForm(Func<Client?> client, Action<string> say, Action controlRemote, Action back)
         {
             _client = client;
             _say = say;
             _controlRemote = controlRemote;
-            Text = "Kova - remote screen";
+            _back = back;
+            Text = "Kova - remote screen, " + Rate(0);
             KeyPreview = true;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(1024, 640);
@@ -48,11 +50,15 @@ namespace TailRemote
             Menus.FocusWhenShown(this, () => _view);
         }
 
-        /// <summary>The frames a second in the title bar while pictures come; just the name while the screen is still.</summary>
+        /// <summary>Frames a second right now: 0 while the remote screen is still (nothing to send).</summary>
+        public int PerSecond => _stream?.PerSecond ?? 0;
+
+        public static string Rate(int fps) => fps + (fps == 1 ? " frame" : " frames") + " a second";
+
+        /// <summary>The frames a second in the title bar, always, so NVDA+T reads it (0 while the screen is still).</summary>
         private void ShowRate()
         {
-            int fps = _stream?.PerSecond ?? 0;
-            string t = fps > 0 ? "Kova - remote screen, " + fps + (fps == 1 ? " frame" : " frames") + " a second" : "Kova - remote screen";
+            string t = "Kova - remote screen, " + Rate(PerSecond);
             if (Text != t) Text = t;
         }
 
@@ -82,7 +88,7 @@ namespace TailRemote
                     {
                         _view.Note = null;
                         _view.Invalidate();
-                        if (!_saidShowing) { _saidShowing = true; _saidNote = null; _say("Showing the remote screen. Escape closes it."); }
+                        if (!_saidShowing) { _saidShowing = true; _saidNote = null; _say("Showing the remote screen. Escape goes back to the main window; Control Shift S turns it off."); }
                     });
                 }
                 catch { }
@@ -105,7 +111,8 @@ namespace TailRemote
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.Escape) { Close(); e.Handled = true; }
+            if (e.KeyCode == Keys.Escape) { _back(); e.Handled = true; }
+            else if (e.KeyCode == Keys.S && e.Control && e.Shift && !e.Alt) { Close(); _say("unchecked. Stopped showing the remote screen."); e.Handled = true; }
             else if (e.KeyCode == Keys.F5) { _stream?.Refresh(); _say("A whole new picture."); e.Handled = true; }
             else if (e.KeyCode == Keys.Enter && e.Control && e.Shift) { _controlRemote(); e.Handled = true; }
             base.OnKeyDown(e);

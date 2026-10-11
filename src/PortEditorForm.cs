@@ -55,7 +55,7 @@ namespace TailRemote
             _open.Click += (_, _) => Change(Selected, true);
             _close.Click += (_, _) => Change(Selected, false);
             _add.Click += (_, _) => Add();
-            _newPort.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Add(); } };
+            _newPort.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (_add.Enabled) Add(); } }; // not while a change still waits on its administrator prompt
             _list.SelectedIndexChanged += (_, _) => UpdateButtons();
 
             foreach (int p in _settings.KnownPorts) _state[p] = null;

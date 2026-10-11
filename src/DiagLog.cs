@@ -20,7 +20,11 @@ namespace TailRemote
         private static volatile bool _enabled;
         private static Timer? _flush;
 
-        public static string FilePath => Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "Kova-log.txt");
+        // Next to Kova, unless that folder can't be written (a copy in Program Files run without
+        // administrator): then in AppData\Local\Kova, and FilePath says so, rather than claiming to log.
+        private static string? _fallback;
+        private static string NextToKova => Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "Kova-log.txt");
+        public static string FilePath => _fallback ?? NextToKova;
 
         public static bool Enabled
         {
@@ -87,7 +91,20 @@ namespace TailRemote
                 var fs = new FileStream(FilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
                 _writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = false };
             }
-            catch { _writer = null; }
+            catch
+            {
+                _writer = null;
+                if (_fallback != null) return;
+                try
+                {
+                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Kova");
+                    Directory.CreateDirectory(dir);
+                    _fallback = Path.Combine(dir, "Kova-log.txt");
+                    var fs = new FileStream(_fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                    _writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = false };
+                }
+                catch { _writer = null; }
+            }
         }
 
         private static void Flush()

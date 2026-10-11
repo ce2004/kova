@@ -163,10 +163,86 @@ namespace TailRemote
         /// <summary>Set by the service: it cannot reach the screen, so its agent in the signed-in session types the keys.</summary>
         public static Func<ushort, ushort, bool, bool, bool>? KeySink;
 
+        // Mouse buttons travel as the keys Windows gives them (left, right, middle, back, forward): they are held
+        // and let go like keys, so everything that releases held keys (disconnecting, a silent line, the
+        // secure desktop) lets go of a held mouse button too, here, through the agent and in the tests.
+        public const ushort VkLeftButton = 1, VkRightButton = 2, VkMiddleButton = 4, VkBackButton = 5, VkForwardButton = 6;
+        public static bool IsMouseButton(ushort vk) => vk is VkLeftButton or VkRightButton or VkMiddleButton or VkBackButton or VkForwardButton;
+
+        private const uint MOUSEEVENTF_MOVE = 1, MOUSEEVENTF_LEFTDOWN = 2, MOUSEEVENTF_LEFTUP = 4, MOUSEEVENTF_RIGHTDOWN = 8, MOUSEEVENTF_RIGHTUP = 0x10,
+            MOUSEEVENTF_MIDDLEDOWN = 0x20, MOUSEEVENTF_MIDDLEUP = 0x40, MOUSEEVENTF_XDOWN = 0x80, MOUSEEVENTF_XUP = 0x100,
+            MOUSEEVENTF_WHEEL = 0x800, MOUSEEVENTF_HWHEEL = 0x1000, MOUSEEVENTF_VIRTUALDESK = 0x4000, MOUSEEVENTF_ABSOLUTE = 0x8000;
+
+        /// <summary>Mouse moves and wheels (Protocol.Mouse*): like KeySink, the service hands them to its agent.</summary>
+        public static Func<byte, int, int, bool>? MouseSink;
+
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+        [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+        private const int SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79;
+
+        private static bool SendMouseInput(uint flags, int dx = 0, int dy = 0, int data = 0)
+        {
+            var input = new INPUT { type = 0 };
+            input.u.mi.dx = dx;
+            input.u.mi.dy = dy;
+            input.u.mi.mouseData = unchecked((uint)data);
+            input.u.mi.dwFlags = flags;
+            return SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>()) == 1;
+        }
+
+        /// <summary>
+        /// A move (dx, dy in pixels, already shaped by the controlling PC's own mouse settings), a wheel
+        /// turn (a = the amount, 120 a notch) or a sideways wheel turn. The move is placed exactly where the
+        /// cursor is plus the distance: a relative move would put this PC's pointer speed on top of the
+        /// other PC's, and the pointer would race away.
+        /// </summary>
+        public static bool SendMouse(byte kind, int a, int b)
+        {
+            if (MouseSink is { } sink) return sink(kind, a, b);
+            if (FollowInputDesktop) FollowDesktop();
+            switch (kind)
+            {
+                case Protocol.MouseMove:
+                    {
+                        // In real pixels: the service's agent is not DPI aware, and at 150% scaling every move
+                        // went 1.5 times as far (and jumped between screens of different scaling).
+                        IntPtr oldDpi = SetThreadDpiAwarenessContext(new IntPtr(-4)); // per monitor v2
+                        try
+                        {
+                        int left = GetSystemMetrics(SM_XVIRTUALSCREEN), top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                        int width = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN)), height = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+                        if (!GetCursorPos(out var p)) return SendMouseInput(MOUSEEVENTF_MOVE, a, b); // the lock screen can refuse: move relative then
+                        int x = Math.Clamp(p.X + a, left, left + width - 1), y = Math.Clamp(p.Y + b, top, top + height - 1);
+                        // 0 to 65535 across the whole of every screen.
+                        int nx = (int)(((long)(x - left) * 65535 + width / 2) / Math.Max(1, width - 1));
+                        int ny = (int)(((long)(y - top) * 65535 + height / 2) / Math.Max(1, height - 1));
+                        return SendMouseInput(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, Math.Clamp(nx, 0, 65535), Math.Clamp(ny, 0, 65535));
+                        }
+                        finally { if (oldDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(oldDpi); }
+                    }
+                case Protocol.MouseWheel: return SendMouseInput(MOUSEEVENTF_WHEEL, data: a);
+                case Protocol.MouseSideWheel: return SendMouseInput(MOUSEEVENTF_HWHEEL, data: a);
+                default: return false;
+            }
+        }
+
+        private static bool SendMouseButton(ushort vk, bool up) => vk switch
+        {
+            VkLeftButton => SendMouseInput(up ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_LEFTDOWN),
+            VkRightButton => SendMouseInput(up ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_RIGHTDOWN),
+            VkMiddleButton => SendMouseInput(up ? MOUSEEVENTF_MIDDLEUP : MOUSEEVENTF_MIDDLEDOWN),
+            VkBackButton => SendMouseInput(up ? MOUSEEVENTF_XUP : MOUSEEVENTF_XDOWN, data: 1),
+            _ => SendMouseInput(up ? MOUSEEVENTF_XUP : MOUSEEVENTF_XDOWN, data: 2),
+        };
+
         public static bool SendKey(ushort vk, ushort scan, bool up, bool extended)
         {
             if (KeySink is { } sink) return sink(vk, scan, up, extended);
             if (FollowInputDesktop) FollowDesktop();
+            if (IsMouseButton(vk)) return SendMouseButton(vk, up);
             var input = new INPUT { type = 1 };
             input.u.ki.wVk = vk;
             input.u.ki.wScan = scan;

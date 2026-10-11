@@ -31,17 +31,40 @@ namespace TailRemote
         {
             var cfg = ServiceHost.LoadConfig();
             DiagLog.Enabled = cfg?.Logging == true;
-            if (cfg == null) { ServiceHost.Log("No settings, so not hosting."); return; }
+            if (cfg == null) { ServiceHost.Log("The service's settings are missing or damaged, so it is not hosting. Turn the service off and on again in Kova to fix it."); return; }
+            // Read once, before the retries below: a password that cannot be read (settings copied from
+            // another PC, or damaged) will never become readable, and retrying it forever hosted nothing
+            // and said so only once, in words that sounded like the network.
+            // Tried for a minute first: early at boot Windows' protection of saved secrets may not be ready yet,
+            // and giving up at once would leave the PC unreachable until someone restarted the service.
+            string password = "", listenPassword = "";
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    password = ServiceHost.Config.Open(cfg.PasswordEnc);
+                    listenPassword = ServiceHost.Config.Open(cfg.ListenPasswordEnc);
+                    break;
+                }
+                catch (Exception e)
+                {
+                    if (attempt < 30 && !_stopping) { Thread.Sleep(2000); continue; }
+                    ServiceHost.Log("The service's saved passwords could not be read (" + e.Message + "), so it is not hosting. Turn the service off and on again in Kova to fix it.");
+                    return;
+                }
+            }
+            if (password.Length == 0) { ServiceHost.Log("The service has no password saved, so it is not hosting. Turn the service off and on again in Kova to fix it."); return; }
             ChooseFolders();
             _folders = new System.Threading.Timer(_ => ChooseFolders(), null, 5000, 5000);
             var agent = new AgentLink.Server();
             Native.KeySink = agent.Key; // keys are typed by the agent, at the screen
+            Native.MouseSink = agent.Mouse; // and the mouse moved there
             string? lastError = null;
             while (!_stopping)
             {
                 try
                 {
-                    _host = new Host(cfg.Port, ServiceHost.Config.Open(cfg.PasswordEnc), ServiceHost.Config.Open(cfg.ListenPasswordEnc), ServiceHost.Log,
+                    _host = new Host(cfg.Port, password, listenPassword, ServiceHost.Log,
                         string.IsNullOrEmpty(cfg.CaptureDevice) ? null : cfg.CaptureDevice)
                     {
                         SecureAttention = SendSecureAttention,
@@ -65,7 +88,7 @@ namespace TailRemote
             // window, what the controlling PC sends goes onto the clipboard through the agent.
             var link = new ServiceLink.Server(_host, NativeService.WTSGetActiveConsoleSessionId)
             {
-                FolderChosen = folder => { _windowFolder = folder; ChooseFolders(); }, // picked in the window, checked as its user
+                FolderChosen = folder => { _windowFolderSession = NativeService.WTSGetActiveConsoleSessionId(); _windowFolder = folder; ChooseFolders(); }, // picked in the window, checked as its user
             };
             _host.ClipboardReceived += text => { if (!link.Text(text)) agent.Text(text); };
             _host.ClipboardFilesReceived += paths => { if (!link.Files(paths)) agent.Files(paths); };
@@ -78,6 +101,7 @@ namespace TailRemote
             agent.ClipboardText = text => _host?.SendClipboard(text);
             agent.ClipboardFiles = paths => _host?.SendClipboardFiles(paths);
             ServiceHost.Log("Hosting on port " + cfg.Port + ", from the service.");
+            ServiceHost.HostingStarted(); // only now can a new version count as good
             // Audio settings and device names are never touched here: only Set up audio device, when pressed.
         }
 
@@ -102,6 +126,9 @@ namespace TailRemote
         private static void ChooseFolders()
         {
             uint session = NativeService.WTSGetActiveConsoleSessionId();
+            // A folder the window chose belongs to the user who chose it: once someone else is at the
+            // screen (switched user, signed out), their files must not go on landing in it.
+            if (_windowFolder != null && session != _windowFolderSession) _windowFolder = null;
             string? profile = NativeService.UserProfile(session);
             string root = profile ?? Path.Combine(Environment.GetEnvironmentVariable("PUBLIC") ?? @"C:\Users\Public");
             // The signed-in user's own folders, wherever they really are (Downloads moved to another
@@ -115,17 +142,40 @@ namespace TailRemote
 
         /// <summary>Where the TailRemote window says received files go; null: the signed-in user's Downloads\TailRemote.</summary>
         private static volatile string? _windowFolder;
+        /// <summary>The session at the screen when the window chose _windowFolder.</summary>
+        private static uint _windowFolderSession = uint.MaxValue;
 
         // ================= In the session at the screen (--agent) =================
 
-        public static int Run()
+        /// <summary>servicePid: the service that started this agent; the agent ends when it does. 0: not watched.</summary>
+        public static int Run(int servicePid = 0)
         {
+            // Tied to the service that started it. A service that crashed or was killed used to leave its
+            // agent behind, which then fought the next service's agent for the pipe (the newest one to
+            // connect takes it), so keys went now to one, now to the other.
+            if (servicePid != 0)
+            {
+                System.Diagnostics.Process service;
+                try
+                {
+                    service = System.Diagnostics.Process.GetProcessById(servicePid);
+                    // Started after this agent: the service is gone and its number was given to another process.
+                    using var me = System.Diagnostics.Process.GetCurrentProcess();
+                    if (service.StartTime > me.StartTime) return 1;
+                }
+                catch { return 1; } // already gone
+                new Thread(() =>
+                {
+                    try { service.WaitForExit(); } catch { }
+                    Environment.Exit(0);
+                }) { IsBackground = true, Name = "Kova agent watches the service" }.Start();
+            }
             // Keys go to whichever desktop has the keyboard: the lock screen, sign-in and UAC prompts too.
             Native.FollowInputDesktop = true;
             var clip = new ClipboardSetter();
             var reader = new ClipboardReader();
             // The remote screen is taken here, at the screen: the service in session 0 cannot see it.
-            AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), clip.Arrived, clip.FilesArrived, reader.Read,
+            AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), (kind, a, b) => Native.SendMouse(kind, a, b), clip.Arrived, clip.FilesArrived, reader.Read,
                 new ScreenVideo(new ScreenSource().Take));
             return 0;
         }

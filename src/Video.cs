@@ -154,9 +154,11 @@ namespace TailRemote
     internal sealed class ScreenSource : IDisposable
     {
         private readonly DesktopDuplication _dd = new();
-        private long _gdiAt;
-        private int _gdiGap = 33;
-        private Frame? _gdiLast;
+        // GDI's last copy and pace for each width asked for: viewers on different steps take turns here,
+        // and comparing one's copy with another's (a different size) would always say "changed", so the
+        // copies would never slow down on a still screen.
+        private sealed class GdiCopy { public long At; public int Gap = 33; public Frame? Last; }
+        private readonly Dictionary<int, GdiCopy> _gdi = new();
         private Frame? _scaled, _scaledFrom;
         private int _scaledWidth;
 
@@ -179,7 +181,7 @@ namespace TailRemote
                 if (Native.FollowInputDesktop) Native.FollowInputDesktopNow();
                 var f = _dd.Take(waitMs, out changed);
                 if (f == null) return FromGdi(maxWidth, out changed);
-                _gdiLast = null;
+                _gdi.Clear();
                 if (maxWidth <= 0 || f.Width <= maxWidth) return f;
                 if (!changed && ReferenceEquals(_scaledFrom, f) && _scaledWidth == maxWidth && _scaled != null) return _scaled;
                 _scaledFrom = f; _scaledWidth = maxWidth;
@@ -197,18 +199,25 @@ namespace TailRemote
         private Frame? FromGdi(int maxWidth, out bool changed)
         {
             changed = false;
-            long wait = _gdiGap - (Environment.TickCount64 - _gdiAt);
+            if (!_gdi.TryGetValue(maxWidth, out var g))
+            {
+                // A whole screen is kept per width: only the few in use now (a viewer stepping through the
+                // ladder would otherwise leave a 4K copy behind at every step it passed).
+                while (_gdi.Count >= 3) _gdi.Remove(_gdi.MinBy(x => x.Value.At).Key);
+                _gdi[maxWidth] = g = new GdiCopy();
+            }
+            long wait = g.Gap - (Environment.TickCount64 - g.At);
             if (wait > 0) Thread.Sleep((int)wait);
-            _gdiAt = Environment.TickCount64;
+            g.At = Environment.TickCount64;
             var f = ScreenCapture.Capture(maxWidth);
             if (f == null) return null;
-            if (_gdiLast != null && _gdiLast.Width == f.Width && _gdiLast.Height == f.Height && _gdiLast.Pixels.AsSpan().SequenceEqual(f.Pixels))
+            if (g.Last != null && g.Last.Width == f.Width && g.Last.Height == f.Height && g.Last.Pixels.AsSpan().SequenceEqual(f.Pixels))
             {
-                _gdiGap = Math.Min(500, _gdiGap * 2);
-                return _gdiLast;
+                g.Gap = Math.Min(500, g.Gap * 2);
+                return g.Last;
             }
-            _gdiGap = 33;
-            _gdiLast = f;
+            g.Gap = 33;
+            g.Last = f;
             changed = true;
             return f;
         }
@@ -278,6 +287,7 @@ namespace TailRemote
             public H264Encoder? Encoder;
             public bool Moving, NeedsWhole;
             public long VideoOffUntil; // H.264 would not start here: still pictures only until then
+            public long ResizedAt = long.MinValue / 2; // when the picture last changed size
             public readonly Queue<(long At, bool[] Tiles)> Changes = new(); // which tiles changed, when
         }
 
@@ -302,7 +312,7 @@ namespace TailRemote
             if (!ReferenceEquals(f, v.Seen))
             {
                 bool[]? tiles = v.Seen == null || v.Seen.Width != f.Width || v.Seen.Height != f.Height ? null : ChangedTiles(v.Seen, f);
-                if (tiles == null) { v.Changes.Clear(); part = 1; } // a new size: no history to judge motion by
+                if (tiles == null) { v.Changes.Clear(); part = 1; v.ResizedAt = now; } // a new size: no history to judge motion by
                 else
                 {
                     int n = 0;
@@ -320,7 +330,12 @@ namespace TailRemote
             // the screen together (a fifth of it: a scroll, a drag, a video). One big change (Alt Tab, a
             // new page) is one exact picture; typing, menus and the mouse cover too little; all stay exact.
             if (!v.Moving && mayMove && halfFrames >= 4 && halfArea >= 0.2) { v.Moving = true; everything = true; }
-            if (v.Moving && (!mayMove || secondFrames < 3 || secondArea < 0.05))
+            // A new size (the line's step changed the picture's width) wipes the history motion is judged
+            // by, which is not things stopping: H.264 carries on for the second the history takes to come
+            // back (Encode starts an encoder of the new size with a key frame), rather than a whole still
+            // picture in the middle of a scroll.
+            bool justResized = now - v.ResizedAt < 1000;
+            if (v.Moving && (!mayMove || (!justResized && (secondFrames < 3 || secondArea < 0.05))))
             {
                 v.Moving = false;
                 v.NeedsWhole = true; // what H.264 left on the viewer's screen is replaced by an exact picture
@@ -354,14 +369,16 @@ namespace TailRemote
             }
             v.Encoder.SetBitrate(kbps);
             byte[]? data = v.Encoder.Encode(f, key, out bool isKey);
+            if (data != null && data.Length > 0 && v.Encoder.Hardware) H264Encoder.HardwareWorked();
             if (data == null)
             {
-                // The graphics chip's encoder failed: Windows' own from now on, straight away.
+                // The graphics chip's encoder failed: Windows' own for this viewer, straight away (the
+                // chip's is only left alone for a while after it fails three times in a row).
                 bool wasHardware = v.Encoder.Hardware;
                 v.Encoder.Dispose(); v.Encoder = null;
                 if (!wasHardware) return null;
                 H264Encoder.HardwareFailed();
-                v.Encoder = H264Encoder.Create(w, h, 60, kbps);
+                v.Encoder = H264Encoder.CreateSoftware(w, h, 60, kbps);
                 data = v.Encoder?.Encode(f, true, out isKey);
                 if (data == null) { v.Encoder?.Dispose(); v.Encoder = null; return null; }
             }
@@ -423,6 +440,17 @@ namespace TailRemote
             Viewer? v;
             lock (_viewers) { if (!_viewers.Remove(viewer, out v)) return; }
             v.Encoder?.Dispose();
+        }
+
+        /// <summary>
+        /// Every viewer gone at once: the agent's link to the service started again, and a service that
+        /// restarted numbers its viewers from 1 again, so nothing kept for the old ones may be reused.
+        /// </summary>
+        public void ForgetAll()
+        {
+            List<Viewer> all;
+            lock (_viewers) { all = _viewers.Values.ToList(); _viewers.Clear(); }
+            foreach (var v in all) v.Encoder?.Dispose();
         }
 
         /// <summary>Which tiles changed between two pictures of the same size.</summary>
@@ -496,7 +524,13 @@ namespace TailRemote
         // Decoding (the stream's thread) and closing (the window's) take turns: freeing the decoder in the
         // middle of a frame would crash the process.
         private readonly object _decoding = new();
-        private bool _disposed;
+        private volatile bool _disposed;
+
+        /// <summary>This PC has no H.264 decoder at all (Windows N): the host is asked for still pictures only.</summary>
+        public bool CannotDecode { get; private set; }
+
+        /// <summary>Test only: every H.264 frame fails to decode, as on a PC whose decoder is broken.</summary>
+        public static volatile bool TestFailVideo;
 
         /// <summary>
         /// Applies one update; returns how many pieces it held (0: an H.264 frame not out yet), or -1 when
@@ -531,6 +565,7 @@ namespace TailRemote
                 }
                 lock (Gate)
                 {
+                    if (_disposed) return 0; // the window closed meanwhile: a new bitmap now would never be freed
                     if (Picture == null || all || Picture.Width != width || Picture.Height != height)
                     {
                         if (!all) throw new InvalidDataException("a change to a picture this PC does not have");
@@ -556,8 +591,9 @@ namespace TailRemote
             lock (_decoding)
             {
                 if (_disposed) return 0;
+                if (TestFailVideo) return -1;
                 _decoder ??= H264Decoder.Create();
-                if (_decoder == null) return -1;
+                if (_decoder == null) { CannotDecode = true; return -1; }
                 if (_decoded == null || _decoded.Length != width * height * 4) _decoded = new byte[width * height * 4];
                 if (!_decoder.Decode(m, offset + 6, m.Length - offset - 6, width, height, _decoded, out got))
                 {
@@ -568,6 +604,7 @@ namespace TailRemote
             if (!got) return 0;
             lock (Gate)
             {
+                if (_disposed) return 0;
                 if (Picture == null || Picture.Width != width || Picture.Height != height)
                 {
                     Picture?.Dispose();
@@ -589,8 +626,8 @@ namespace TailRemote
 
         public void Dispose()
         {
-            lock (Gate) { Picture?.Dispose(); Picture = null; }
-            lock (_decoding) { _disposed = true; _decoder?.Dispose(); _decoder = null; }
+            lock (Gate) { _disposed = true; Picture?.Dispose(); Picture = null; }
+            lock (_decoding) { _decoder?.Dispose(); _decoder = null; }
         }
     }
 
@@ -635,6 +672,13 @@ namespace TailRemote
         }
         private volatile bool _paused;
 
+        // H.264 frames that failed to decode in a row, and whether the host was told to stop sending them.
+        private int _videoFailures;
+        private volatile bool _noH264;
+
+        /// <summary>Test only: the host was asked for still pictures only (H.264 cannot be shown here).</summary>
+        public bool NoH264 => _noH264;
+
         /// <summary>A whole new picture, rather than only what changes.</summary>
         public void Refresh() => Send(new[] { Protocol.VideoAgain });
 
@@ -661,6 +705,7 @@ namespace TailRemote
                     var stream = tcp.GetStream();
                     stream.ReadTimeout = 15_000; // the host says something at least every few seconds
                     if (_paused) Send(new[] { Protocol.VideoPause, (byte)1 });
+                    if (_noH264) Send(new[] { Protocol.VideoNoH264 }); // a new line: the host has to be told again
                     byte[]? buffer = null;
                     while (!_stop)
                     {
@@ -673,9 +718,27 @@ namespace TailRemote
                                     uint number = BitConverter.ToUInt32(buffer, 1);
                                     byte[] update = buffer.AsSpan(5, n - 5).ToArray();
                                     int pieces = Canvas.Apply(update, 0);
-                                    if (pieces < 0) { Send(new[] { Protocol.VideoAgain }); pieces = 0; } // the H.264 stream broke here: a key frame, please
+                                    bool isVideo = update.Length > 0 && update[0] == ScreenVideo.VideoFrame;
+                                    if (pieces < 0)
+                                    {
+                                        // The H.264 stream broke here: a key frame, please. But a PC that cannot
+                                        // decode H.264 at all (no decoder, or one that fails even key frames)
+                                        // would ask for key frames for ever with the picture frozen: after 3
+                                        // failures in a row the host is told to send still pictures only.
+                                        // Only key frames count: the frames still on their way after a break fail
+                                        // too, and used to switch H.264 off for good on a PC that decodes it fine.
+                                        bool key = isVideo && update.Length > 5 && update[5] == 1;
+                                        if (!_noH264 && (Canvas.CannotDecode || (key && ++_videoFailures >= 3)))
+                                        {
+                                            _noH264 = true;
+                                            Send(new[] { Protocol.VideoNoH264 });
+                                        }
+                                        Send(new[] { Protocol.VideoAgain });
+                                        pieces = 0;
+                                    }
+                                    else if (isVideo && pieces > 0) _videoFailures = 0;
                                     LastStrips = pieces;
-                                    if (update.Length > 0 && update[0] == ScreenVideo.VideoFrame) Interlocked.Increment(ref VideoFrames);
+                                    if (isVideo) Interlocked.Increment(ref VideoFrames);
                                     lock (_times) { long t = Environment.TickCount64; _times.Enqueue(t); while (_times.Count > 0 && t - _times.Peek() > 1000) _times.Dequeue(); }
                                     saw = true;
                                     Interlocked.Increment(ref Pictures);

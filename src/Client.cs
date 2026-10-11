@@ -33,7 +33,25 @@ namespace TailRemote
         public string LeavingDetail { get; private set; } = "";
 
         public event Action<string>? Status;
-        public event Action<string>? Disconnected;
+        // The connection can drop between Connect starting its threads and the window subscribing (a host
+        // stopping just as the login finished): a handler added after that hears it at once, rather than
+        // the window holding a dead connection it thinks is up.
+        private Action<string>? _disconnected;
+        private string? _closedWhy;
+        private readonly object _disconnectGate = new();
+        public event Action<string>? Disconnected
+        {
+            add
+            {
+                string? already;
+                lock (_disconnectGate) { _disconnected += value; already = _closedWhy; }
+                if (already != null) value?.Invoke(already);
+            }
+            remove { lock (_disconnectGate) _disconnected -= value; }
+        }
+
+        /// <summary>Raised (on the network thread) when the host says what it can do, which comes just after the login.</summary>
+        public event Action? FeaturesKnown;
         /// <summary>Clipboard text from the host. Raised on a network thread.</summary>
         public event Action<string>? ClipboardReceived;
         /// <summary>True when the host let us in with its listen-only password: audio only, no keys.</summary>
@@ -194,10 +212,13 @@ namespace TailRemote
                 c.Start();
                 return c;
             }
-            catch (System.IO.IOException)
+            catch (System.IO.IOException e)
             {
                 if (files != null) Keep(filesTo!, files);
-                udp?.Dispose(); tcp.Dispose(); throw new InvalidOperationException("The host closed the connection.");
+                udp?.Dispose(); tcp.Dispose();
+                if (e.InnerException is SocketException { SocketErrorCode: SocketError.TimedOut })
+                    throw new InvalidOperationException("No answer from " + address.Trim() + " in time: the line may be very slow, or Kova there is busy.");
+                throw new InvalidOperationException("The host closed the connection.");
             }
             catch
             {
@@ -469,7 +490,9 @@ namespace TailRemote
                 Keep(_filesFor!, _files);
             }
             _wifi?.Dispose();
-            if (why != null) Disconnected?.Invoke(why);
+            Action<string>? handlers;
+            lock (_disconnectGate) { _closedWhy = why; handlers = _disconnected; }
+            if (why != null) handlers?.Invoke(why);
         }
 
         // ---- Sending: one thread, keys first ----
@@ -523,6 +546,21 @@ namespace TailRemote
             BitConverter.TryWriteBytes(f[1..], vk);
             BitConverter.TryWriteBytes(f[3..], scan);
             f[5] = (byte)((up ? 1 : 0) | (extended ? 2 : 0));
+            Write(f);
+        }
+
+        /// <summary>The remote PC takes the mouse (moves, wheel; buttons go as keys with Native.VkLeftButton...).</summary>
+        public bool CanMouse => !ListenOnly && (_peerFeatures & Protocol.FeatureMouse) != 0;
+
+        /// <summary>A mouse move or wheel turn (Protocol.MouseMove...). Called from the mouse hook: only queues it.</summary>
+        public void SendMouse(byte kind, int a, int b)
+        {
+            if (_closed) return;
+            Span<byte> f = stackalloc byte[6];
+            f[0] = Protocol.Mouse;
+            f[1] = kind;
+            BitConverter.TryWriteBytes(f[2..], (short)Math.Clamp(a, short.MinValue, short.MaxValue));
+            BitConverter.TryWriteBytes(f[4..], (short)Math.Clamp(b, short.MinValue, short.MaxValue));
             Write(f);
         }
 
@@ -705,6 +743,7 @@ namespace TailRemote
                         _peerFeatures = BitConverter.ToUInt32(m, 1);
                         HostVersion = Protocol.FeaturesVersion(m);
                         DiagLog.Write("client: host features " + _peerFeatures + (ListenOnly ? ", listen only" : ", control"));
+                        FeaturesKnown?.Invoke();
                     }
                     // Anything else is from a newer version: ignore it.
                 }
@@ -783,8 +822,19 @@ namespace TailRemote
             while (!_closed)
             {
                 byte[] d;
-                try { d = _udp.Receive(ref any); }
-                catch { if (_closed) return; continue; }
+                try
+                {
+                    // Something waits behind a missing packet: look every 2 ms whether its wait is over.
+                    if (Volatile.Read(ref _waiting) && !_udp.Client.Poll(2000, SelectMode.SelectRead)) { FlushDue(); continue; }
+                    d = _udp.Receive(ref any);
+                    _udpErrors = 0;
+                }
+                catch
+                {
+                    if (_closed) return;
+                    if (++_udpErrors > 10) Thread.Sleep(5); // an error that keeps coming must not spin a core
+                    continue;
+                }
                 if (any.Port != _hostUdp.Port) continue; // only TailRemote's port (any of the host's addresses)
                 Interlocked.Increment(ref _rxPackets);
                 Interlocked.Add(ref _rxBytes, d.Length);
@@ -834,7 +884,17 @@ namespace TailRemote
         /// <summary>A bad packet or a player hiccup must never take the whole app down.</summary>
         private void SafeHandle(byte[] d)
         {
-            try { HandlePacket(d); }
+            try { lock (_queue) HandlePacket(d); }
+            catch (Exception e) { DiagLog.Write("client: audio packet failed: " + e.Message); }
+        }
+
+        private int _udpErrors;
+        private bool _waiting; // packets wait in _queue behind a gap
+
+        /// <summary>Plays what waited behind a missing packet once its wait is over, with no new packet needed to notice.</summary>
+        private void FlushDue()
+        {
+            try { lock (_queue) Drain(Player.Now); }
             catch (Exception e) { DiagLog.Write("client: audio packet failed: " + e.Message); }
         }
 
@@ -876,7 +936,7 @@ namespace TailRemote
             if (Muted)
             {
                 // In the background: nothing is played, and nothing old is kept for when it comes back.
-                if (_haveNext) { _queue.Clear(); _haveNext = false; }
+                if (_haveNext) { _queue.Clear(); _haveNext = false; Volatile.Write(ref _waiting, false); }
                 return;
             }
             Interlocked.Increment(ref _qPackets);
@@ -890,6 +950,12 @@ namespace TailRemote
             if (_haveNext && (int)(seq - _next) < 0) { _player.CountLate(ticks); return; } // its moment has passed
             if (_haveNext && (int)(seq - _next) > 400) { _queue.Clear(); _haveNext = false; } // after a pause: start again from here
             _queue.TryAdd(seq, (d, now));
+            Drain(now);
+        }
+
+        /// <summary>Decodes what is in order in the queue; what waits behind a gap waits up to ReorderWaitMs.</summary>
+        private void Drain(double now)
+        {
             while (_queue.Count > 0)
             {
                 // The earliest counting from _next, not the smallest number: where the host's packet
@@ -910,6 +976,7 @@ namespace TailRemote
                 _gapSince = 0;
                 Deliver(data, at);
             }
+            Volatile.Write(ref _waiting, _queue.Count > 0);
         }
 
         /// <summary>Decodes and plays one packet that has already been opened (decrypted).</summary>

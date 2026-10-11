@@ -57,8 +57,15 @@ namespace TailRemote
             return 0;
         }
 
+        /// <summary>A command-line word: true for yes (on, open), false for no (off, close), in any case; null for anything else.</summary>
+        private static bool? OnOff(string word, string yes, string no) =>
+            word.Equals(yes, StringComparison.OrdinalIgnoreCase) ? true : word.Equals(no, StringComparison.OrdinalIgnoreCase) ? false : null;
+
         private static int Main(string[] args)
         {
+            // The service counts its start before anything else can go wrong: a new version that failed
+            // before it got as far as the service itself was never counted, so it was never rolled back.
+            if (args.Length == 1 && args[0] == "--service") ServiceHost.CountStart();
             // Never a crash box: on a PC reached only through TailRemote, Windows' "has stopped working"
             // or System Error box grabbed the keyboard until someone closed it. A crash now just ends
             // the process, and the service or Windows starts it again.
@@ -71,8 +78,10 @@ namespace TailRemote
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (_, e) => Crash(e.Exception);
             AppDomain.CurrentDomain.UnhandledException += (_, e) => Crash(e.ExceptionObject as Exception);
+            // Anything but on or off (or open or close below) is refused: a mistyped word used to mean
+            // off, and quietly removed the sign-in task or closed the port.
             if (args.Length == 2 && args[0] == "--startup")
-                return Startup.Apply(args[1] == "on");
+                return OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn) : 2;
 
             if (args.Length == 1 && args[0] == "--setup-audio")
             {
@@ -87,7 +96,7 @@ namespace TailRemote
             }
 
             if (args.Length == 3 && args[0] == "--firewall" && int.TryParse(args[2], out int fwPort))
-                return Firewall.Apply(args[1] == "open", fwPort);
+                return OnOff(args[1], "open", "close") is bool fwOpen ? Firewall.Apply(fwOpen, fwPort) : 2;
 
             if ((args.Length == 2 || args.Length == 3) && args[0] == "--service" && args[1] is "install" or "remove")
             {
@@ -98,6 +107,7 @@ namespace TailRemote
             if (args.Length == 1 && args[0] == "--screentest-service") return ServiceScreenTest();
             if (args.Length == 1 && args[0] == "--service") return ServiceHost.RunService();
             if (args.Length == 1 && args[0] == "--agent") return Agent.Run();
+            if (args.Length == 2 && args[0] == "--agent" && int.TryParse(args[1], out int servicePid)) return Agent.Run(servicePid);
             if (args.Length == 2 && args[0] == "--capturetest") return CaptureTest(args[1]);
 
             if (args.Length == 1 && args[0] == "--remove-audio")
@@ -521,6 +531,45 @@ namespace TailRemote
         private static int SelfTest()
         {
             string lossless = "";
+            // The service's agent restarts: one failing at once, again and again, ends up retried once a
+            // minute (it used to stop at 16 seconds), and one that ran a while is retried in 2 seconds.
+            {
+                long w = 2000;
+                for (int i = 0; i < 10; i++) w = ServiceHost.NextWait(w, 0, true);
+                if (w != 60_000) return Fail("agent restart wait after 10 instant failures: " + w + " ms, not 60000");
+                if (ServiceHost.NextWait(60_000, 30_000, true) != 2000 || ServiceHost.NextWait(60_000, 0, false) != 2000)
+                    return Fail("agent restart wait did not go back to 2 seconds after a long run or a new session");
+            }
+            // Damaged settings: nulls load without a crash, and a file that cannot be read is kept as .bad.
+            {
+                string? before = Environment.GetEnvironmentVariable("KOVA_SETTINGS_DIR");
+                string settingsDir = Path.Combine(Path.GetTempPath(), "kova-selftest-settings");
+                try
+                {
+                    if (Directory.Exists(settingsDir)) Directory.Delete(settingsDir, true);
+                    Directory.CreateDirectory(settingsDir);
+                    Environment.SetEnvironmentVariable("KOVA_SETTINGS_DIR", settingsDir);
+                    File.WriteAllText(Settings.FilePath, "{\"PasswordEnc\":null,\"SavedPcs\":null}");
+                    try
+                    {
+                        var s = Settings.Load();
+                        if (s.Password != "" || s.SavedPcs == null || s.SavedPcs.Count != 0) return Fail("settings with nulls loaded wrongly");
+                    }
+                    catch (Exception e) { return Fail("settings with nulls: " + e.GetType().Name + " " + e.Message); }
+                    File.WriteAllText(Settings.FilePath, "{\"Port\":\"abc\"}");
+                    var fresh = Settings.Load();
+                    if (fresh.Port != Protocol.DefaultPort || !File.Exists(Settings.FilePath + ".bad") || File.ReadAllText(Settings.FilePath + ".bad") != "{\"Port\":\"abc\"}")
+                        return Fail("damaged settings were not kept as settings.json.bad");
+                    byte[] exported = new Settings().Export("selftest password");
+                    if (!Settings.LooksLikeBackup(exported) || Settings.LooksLikeBackup(new byte[60]) || Settings.LooksLikeBackup("TRBK1"u8.ToArray()))
+                        return Fail("a settings backup was not told apart from other files");
+                }
+                finally
+                {
+                    Environment.SetEnvironmentVariable("KOVA_SETTINGS_DIR", before);
+                    try { Directory.Delete(settingsDir, true); } catch { }
+                }
+            }
             // A 1 kHz tone through 48k -> 44.1k -> 48k must keep its level and pitch.
             foreach (var (from, to) in new[] { (48000, 44100), (44100, 48000) })
             {
@@ -950,6 +999,73 @@ namespace TailRemote
                         h264Note = "H.264 at " + peak + " frames a second while moving, exact once still";
                     }
                 }
+                // An odd-size screen (641 by 361; H.264 only takes even sizes): moving, then still, exact again.
+                {
+                    var odd = new TestScreen { Width = 641, Height = 361 };
+                    var oddVideo = new ScreenVideo(odd.Take);
+                    var oddSettings = new VideoSettings(0, VideoSettings.Lossless, 15, 4000);
+                    using var oddCanvas = new VideoCanvas();
+                    bool again = true, wasMoving = false;
+                    void OddStep()
+                    {
+                        byte[]? u = oddVideo.Update(1, again, oddSettings);
+                        again = false;
+                        if (u != null && u.Length > 0 && oddCanvas.Apply(u, 0) < 0) again = true;
+                        wasMoving |= oddVideo.IsMoving(1);
+                    }
+                    for (int i = 0; i < 60; i++) { odd.SquareX = 20 + i * 37 % 560; odd.SquareY = 30 + i * 23 % 280; OddStep(); System.Threading.Thread.Sleep(16); }
+                    bool OddExact() => oddCanvas.At(odd.SquareX + 5, odd.SquareY + 5) == odd.At(odd.SquareX + 5, odd.SquareY + 5)
+                        && oddCanvas.At(640, 360) == odd.At(640, 360) && oddCanvas.At(5, 5) == odd.At(5, 5);
+                    for (int i = 0; i < 200 && !OddExact(); i++) { OddStep(); System.Threading.Thread.Sleep(20); }
+                    if (!OddExact()) return Fail("a 641 by 361 screen was not exact once it stopped moving");
+                    if (hasH264 && !wasMoving) return Fail("a 641 by 361 screen moving never went as H.264");
+                }
+                // A key frame asked of an encoder already running is a fresh start: a new decoder shows it.
+                if (hasH264)
+                {
+                    var kf = new TestScreen();
+                    using var running = H264Encoder.Create(640, 360, 30, 4000)!;
+                    for (int i = 0; i < 6; i++) { kf.SquareX = 50 + i * 20; running.Encode(kf.Take(0)!, i == 0, out _); }
+                    kf.SquareX = 300; kf.SquareY = 150;
+                    byte[]? key = running.Encode(kf.Take(0)!, true, out bool isKey);
+                    if (key == null || key.Length == 0) return Fail("a key frame asked of a running encoder did not come");
+                    using var fresh = H264Decoder.Create();
+                    var px = new byte[640 * 360 * 4];
+                    bool kgot = false;
+                    if (fresh == null || !fresh.Decode(key, 0, key.Length, 640, 360, px, out kgot) || !kgot)
+                        return Fail("a fresh decoder could not show a key frame from a running encoder (marked key " + isKey + ", decoded " + kgot + ")");
+                    foreach (var (x, y) in new[] { (5, 5), (310, 160), (600, 300), (100, 300) })
+                    {
+                        int i = (y * 640 + x) * 4;
+                        if (!TestScreen.Near(System.Drawing.Color.FromArgb(px[i + 2], px[i + 1], px[i]), kf.At(x, y), 40)) return Fail("a key frame from a running encoder decoded wrong at " + x + "," + y);
+                    }
+                }
+                // Windows N (no Media Foundation): no encoder or decoder, no exception, and still pictures
+                // follow a moving square.
+                Mf.TestUnavailable = true;
+                try
+                {
+                    if (H264Encoder.Create(640, 360, 30, 2000) != null || H264Decoder.Create() != null) return Fail("without Media Foundation an H.264 encoder or decoder was made");
+                    var noMf = new TestScreen();
+                    var noMfVideo = new ScreenVideo(noMf.Take);
+                    var noMfSettings = new VideoSettings(0, 82, 15, 2000);
+                    using var noMfCanvas = new VideoCanvas();
+                    for (int i = 0; i < 40; i++)
+                    {
+                        noMf.SquareX = 20 + i * 13 % 560; noMf.SquareY = 30 + i * 7 % 280;
+                        byte[]? u = noMfVideo.Update(1, i == 0, noMfSettings);
+                        if (u is { Length: > 0 })
+                        {
+                            if (u[0] != ScreenVideo.StillPicture) return Fail("without Media Foundation something other than still pictures was sent");
+                            noMfCanvas.Apply(u, 0);
+                        }
+                        System.Threading.Thread.Sleep(16);
+                    }
+                    if (!TestScreen.Near(noMfCanvas.At(noMf.SquareX + 5, noMf.SquareY + 5), noMf.At(noMf.SquareX + 5, noMf.SquareY + 5), 40) || !TestScreen.Near(noMfCanvas.At(5, 5), noMf.At(5, 5), 40))
+                        return Fail("without Media Foundation the picture did not follow a moving square");
+                }
+                finally { Mf.TestUnavailable = false; }
+                h264Note += "; odd sizes exact once still" + (hasH264 ? ", a forced key frame shows on a fresh decoder" : "") + ", without Media Foundation still pictures follow";
                 var real = ScreenCapture.Capture(0);
                 lossless += " | remote screen: exact, follows changes, pauses, climbs to lossless, says why, listeners refused; " + h264Note + "; this screen " +
                     (real == null ? "cannot be taken here" : real.Width + " by " + real.Height);

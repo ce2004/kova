@@ -38,6 +38,10 @@ namespace TailRemote
         private List<Entry>? _pending;
         // The remote folder files are being sent into now (one at a time: a newer sending replaces it).
         private string? _sentInto;
+        // Which transfer is this window's: begun after it asked (a higher serial) and named as it asked. Any end
+        // used to count, so the host's own Send files ending marked a Get as "got" while it was still coming.
+        private int _askedAfter, _sentAfter;
+        private string? _sentWhat;
         private bool _picking;
 
         private sealed record Entry(bool Folder, string Path, string Name, long Bytes, long Ticks);
@@ -117,10 +121,30 @@ namespace TailRemote
         /// <summary>A transfer coming here ended (MainForm says what arrived): the ones asked for are marked.</summary>
         private void Arrived(FileChannel.Transfer t)
         {
-            if (IsDisposed || _pending == null) return;
+            if (IsDisposed || _pending == null || t.Outgoing || t.Clipboard || t.Serial <= _askedAfter || !Asked(_pending, t.What)) return;
             foreach (var e in _pending) _state[e.Path] = t.Failed ? "failed" : "got";
             _pending = null;
             Relabel();
+        }
+
+        /// <summary>
+        /// Is this what was asked for? The remote PC calls a batch by the name of the one thing in it, or
+        /// "3 items" (fewer if some were no longer there), and a name already taken here becomes "name (2)".
+        /// </summary>
+        private static bool Asked(List<Entry> asked, string what)
+        {
+            var names = asked.Select(e => FileChannel.TopName(e.Path)).ToList();
+            if (names.Any(n => SameName(n, what))) return true;
+            return names.Count > 1 && what.EndsWith(" items") && int.TryParse(what[..^6], out int k) && k >= 2 && k <= names.Count;
+        }
+
+        private static bool SameName(string asked, string what)
+        {
+            if (string.Equals(asked, what, StringComparison.OrdinalIgnoreCase)) return true;
+            string stem = System.IO.Path.GetFileNameWithoutExtension(asked), ext = System.IO.Path.GetExtension(asked);
+            if (!what.StartsWith(stem + " (", StringComparison.OrdinalIgnoreCase) || !what.EndsWith(")" + ext, StringComparison.OrdinalIgnoreCase)) return false;
+            int digits = what.Length - stem.Length - 3 - ext.Length;
+            return digits > 0 && what.Substring(stem.Length + 2, digits).All(char.IsAsciiDigit);
         }
 
         /// <summary>Send files here / Send a folder here: chosen on this PC, sent into the remote folder open now.</summary>
@@ -139,16 +163,18 @@ namespace TailRemote
             catch (Exception e) { if (!IsDisposed) _say("Could not choose what to send: " + e.Message); return; }
             finally { _picking = false; }
             if (IsDisposed || paths == null || paths.Length == 0) return;
+            string what = paths.Length == 1 ? FileChannel.TopName(paths[0]) : paths.Length + " items"; // as the transfer will be called
+            _sentAfter = FileChannel.Transfer.Latest;
+            _sentWhat = what;
             if (_client() is not Client now || !now.SendFilesTo(paths, into)) { _say("Not connected to the remote PC, so nothing was sent."); return; }
             _sentInto = into;
-            string what = paths.Length == 1 ? System.IO.Path.GetFileName(paths[0].TrimEnd('\\')) : paths.Length + " items";
             _say("Sending " + what + " into " + into + " on the remote PC. Kova says when it has gone.");
         }
 
         /// <summary>Files sent from here finished going: said, and the folder they went into shows them.</summary>
         private async void Sent(FileChannel.Transfer t)
         {
-            if (IsDisposed || _sentInto is not string into) return;
+            if (IsDisposed || _sentInto is not string into || t.Serial <= _sentAfter || !string.Equals(t.What, _sentWhat, StringComparison.OrdinalIgnoreCase)) return;
             _sentInto = null;
             if (t.Result != null) _say(t.Result);
             if (!t.Failed && string.Equals(_path, into, StringComparison.OrdinalIgnoreCase)) await LoadFolder(_path, Current?.Path);
@@ -226,6 +252,7 @@ namespace TailRemote
             if (chosen.Count == 0) { _say("Nothing is checked. Check files and folders with Space, or Enter on a file, then Get."); return; }
             // Whole drives are too much to mean: a folder on one is fine.
             if (chosen.Any(c => c.Path.TrimEnd('\\').Length <= 2)) { _say("A whole drive is too much: open it and check folders or files in it."); return; }
+            _askedAfter = FileChannel.Transfer.Latest; // only a transfer begun after this can be the answer
             if (_client() is not Client client || !client.Fetch(chosen.Select(c => c.Path))) { _say("Not connected to the remote PC, so nothing was asked for."); return; }
             _pending = chosen;
             foreach (var c in chosen) _state[c.Path] = "getting";

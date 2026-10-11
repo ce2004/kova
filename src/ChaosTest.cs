@@ -119,14 +119,18 @@ namespace TailRemote
                 Exception? extra = null;
                 for (int i = 0; i < 100; i++) listeners.Add(Connect(ListenPassword));
                 Client? hundredFirst = null;
-                try { hundredFirst = Connect(ListenPassword); } catch (Exception e) { extra = e; }
+                var told = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                try { hundredFirst = Client.Connect("127.0.0.1", Port, ListenPassword, new Player(Player.NoDevice, _ => { }), told.Enqueue); } catch (Exception e) { extra = e; }
                 Thread.Sleep(500);
                 bool refused = extra != null || (hundredFirst != null && WaitClosed(hundredFirst, 3000));
+                // It must hear why, not just "the remote PC closed the connection" (the goodbye used to be cut off).
+                bool saidWhy = WaitFor(() => told.Any(t => t.Contains("already 100 people listening")), 3000) || (extra?.Message.Contains("already 100") ?? false);
                 hundredFirst?.Dispose();
                 int sessions = host.TestSessions;
                 foreach (var l in listeners) l.Dispose();
                 Thread.Sleep(1500);
-                return (refused ? "the 101st was turned away" : "FAIL: a 101st listener got in") + "; sessions at the peak " + sessions + ", after " + host.TestSessions;
+                return (refused ? "the 101st was turned away" : "FAIL: a 101st listener got in") + (saidWhy ? " and told why" : "; FAIL: it was never told why (" + string.Join(" | ", told) + ")") +
+                    "; sessions at the peak " + sessions + ", after " + host.TestSessions;
             });
 
             Scenario("nonsense messages after login", 30, () =>
@@ -330,7 +334,7 @@ namespace TailRemote
                     Thread.Sleep(300);
                     // The receiver either said the old one stopped, or never started it (its stop came first): never that it arrived.
                     bool hostAgrees = hostResults.All(r => r.What != "replaced.bin" || r.Cancelled) && results.Any(r => r.Cancelled && r.What == "replaced.bin");
-                    return replaced && stopped && hostAgrees ? "the old one stopped (both sides said so), the new one arrived" : "FAIL: replaced " + replaced + ", sender said stopped " + stopped + ", receiver said stopped " + hostAgrees;
+                    return replaced && stopped && hostAgrees ? "the old one stopped (both sides said so), the new one arrived" : "FAIL: replaced " + replaced + " (landed: " + (landed == null ? "nothing" : string.Join(", ", landed)) + "), sender said stopped " + stopped + ", receiver said stopped " + hostAgrees;
                 });
 
                 Scenario("a file another program has locked", 30, () =>
@@ -403,6 +407,135 @@ namespace TailRemote
                     ctrl.Files!.SendFiles(new[] { next });
                     for (int i = 0; i < 300 && landed == null; i++) Thread.Sleep(20);
                     return !escaped && acceptedEvil == null && landed != null ? "every escape was refused, and normal copies still work" : "FAIL: escaped " + escaped + ", accepted " + acceptedEvil;
+                });
+
+                Scenario("a hostile PC sending names Windows keeps for itself (CON, NUL.txt, COM1, names ending in a dot or a space): refused, saying why", 30, () =>
+                {
+                    string? arrived = null;
+                    Action<string[]> gotFiles = p => arrived = string.Join(",", p);
+                    var said = new List<string>();
+                    Action<FileChannel.Transfer> note = t => { if (t.Finished && t.Outgoing && t.What == "reserved") lock (said) said.Add(t.Result ?? ""); };
+                    host.ClipboardFilesReceived += gotFiles;
+                    ctrl.TransferProgress += note;
+                    var names = new[] { "CON", "nul.txt", "sub\\AUX", "sub\\com1.log", "LPT9.dat", "trailing dot.", "trailing space ", "folder.\\x.txt" };
+                    try
+                    {
+                        foreach (string bad in names) ctrl.Files!.TestSendEntries(new List<(string, byte[]?)> { (bad, Encoding.UTF8.GetBytes("x")) }, "reserved");
+                        WaitFor(() => { lock (said) return said.Count >= names.Length; }, 3000);
+                    }
+                    finally { host.ClipboardFilesReceived -= gotFiles; ctrl.TransferProgress -= note; }
+                    List<string> results;
+                    lock (said) results = said.ToList();
+                    bool clear = results.Count == names.Length && results.All(r => r.Contains("Windows"));
+                    return arrived == null && clear ? "all " + names.Length + " refused, each saying why (" + results[0] + ")"
+                        : "FAIL: arrived " + arrived + "; " + results.Count + " of " + names.Length + " said why: " + string.Join(" | ", results);
+                });
+
+                Scenario("over a million files and folders in one go: refused cleanly by both PCs, never left waiting", 120, () =>
+                {
+                    var sent = new System.Collections.Concurrent.ConcurrentQueue<FileChannel.Transfer>();
+                    var there = new System.Collections.Concurrent.ConcurrentQueue<FileChannel.Transfer>();
+                    Action<FileChannel.Transfer> onCtrl = t => { if (t.Finished && t.What == "million") sent.Enqueue(t); };
+                    Action<FileChannel.Transfer> onHost = t => { if (t.Finished && t.What == "million") there.Enqueue(t); };
+                    ctrl.TransferProgress += onCtrl;
+                    host.TransferProgress += onHost;
+                    try
+                    {
+                        var entries = new List<(string, byte[]?)>(FileChannel.MaxEntries + 1);
+                        for (int i = 0; i <= FileChannel.MaxEntries; i++) entries.Add(("million\\d" + i, null));
+                        // The receiver's own check: offered anyway, as an old or hostile PC could (this blocks until it ends).
+                        ctrl.Files!.TestSendEntries(entries, "million", checkCount: false);
+                        if (!WaitFor(() => sent.Count >= 1, 3000)) return "FAIL: the receiver never answered an offer of over a million";
+                        // This side's own check: refused before anything is offered, and the other PC told.
+                        ctrl.Files!.TestSendEntries(entries, "million");
+                        WaitFor(() => sent.Count >= 2 && there.Count >= 1, 5000);
+                    }
+                    finally { ctrl.TransferProgress -= onCtrl; host.TransferProgress -= onHost; }
+                    var s = sent.ToArray();
+                    var h = there.ToArray();
+                    bool ok = s.Length == 2 && s.All(t => t.Failed && !t.Cancelled && t.Result!.Contains("million")) && h.Length == 1 && h[0].Failed && h[0].Result!.Contains("million");
+                    return ok ? "refused by the receiver (" + s[0].Result + "), and by the sender before offering, with the other PC told (" + h[0].Result + ")"
+                        : "FAIL: sender said " + string.Join(" | ", s.Select(t => t.Result)) + "; receiver said " + string.Join(" | ", h.Select(t => t.Result));
+                });
+
+                Scenario("a folder with one file another program has locked: both PCs say it failed, and why", 60, () =>
+                {
+                    string src = Path.Combine(Root, "src", "Locked folder");
+                    Directory.CreateDirectory(src);
+                    for (int i = 0; i < 3; i++) File.Move(Big("locked-folder" + i + ".bin", 1), Path.Combine(src, "file" + i + ".bin"), true);
+                    FileChannel.Transfer? h, c;
+                    using (new FileStream(Path.Combine(src, "file1.bin"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                        (h, c) = BothSay(host, ctrl, "Locked folder", () => ctrl.Files!.SendFiles(new[] { src }, toClipboard: false));
+                    bool ok = h != null && c != null && h.Failed && c.Failed && !h.Cancelled && !c.Cancelled
+                        && h.Result!.Contains("could not send", StringComparison.OrdinalIgnoreCase) && c.Result!.Contains("could not send", StringComparison.OrdinalIgnoreCase);
+                    return ok ? "both said it failed; sender: " + c!.Result + "; receiver: " + h!.Result
+                        : "FAIL: sender said " + c?.Result + " (cancelled " + c?.Cancelled + "); receiver said " + h?.Result + " (cancelled " + h?.Cancelled + ")";
+                });
+
+                Scenario("getting something that is not there any more: both PCs see it end within 3 seconds", 20, () =>
+                {
+                    string name = "not-there-" + Guid.NewGuid().ToString("N") + ".bin";
+                    string missing = Path.Combine(Root, "src", name);
+                    FileChannel.Transfer? got = null, hostSaid = null;
+                    Action<FileChannel.Transfer> onCtrl = t => { if (t.Finished && !t.Outgoing && t.What == name) got = t; };
+                    Action<FileChannel.Transfer> onHost = t => { if (t.Finished && t.Outgoing && t.What == name) hostSaid = t; };
+                    ctrl.TransferProgress += onCtrl;
+                    host.TransferProgress += onHost;
+                    var clock = Stopwatch.StartNew();
+                    try
+                    {
+                        if (!ctrl.Fetch(new[] { missing })) return "FAIL: could not ask";
+                        WaitFor(() => got != null && hostSaid != null, 3000);
+                    }
+                    finally { ctrl.TransferProgress -= onCtrl; host.TransferProgress -= onHost; }
+                    long ms = clock.ElapsedMilliseconds;
+                    return got?.Failed == true && hostSaid?.Failed == true && ms <= 3100 ? "ended on both PCs in " + ms + " ms; the controlling PC said: " + got.Result
+                        : "FAIL: after " + ms + " ms the controlling PC said " + (got?.Result ?? "nothing") + ", the host said " + (hostSaid?.Result ?? "nothing");
+                });
+
+                Scenario("pressing Stop during 2,000 small files: every file not marked incomplete is exactly its source", 120, () =>
+                {
+                    string src = Path.Combine(Root, "src", "Small stop");
+                    var rnd = new Random(7);
+                    for (int d = 0; d < 20; d++)
+                    {
+                        string dir = Path.Combine(src, "d" + d);
+                        Directory.CreateDirectory(dir);
+                        for (int f = 0; f < 100; f++)
+                        {
+                            var data = new byte[rnd.Next(1, 96 << 10)];
+                            rnd.NextBytes(data);
+                            File.WriteAllBytes(Path.Combine(dir, "f" + f + ".bin"), data);
+                        }
+                    }
+                    FileChannel.Transfer? hostEnd = null;
+                    bool moving = false;
+                    Action<FileChannel.Transfer> note = t => { if (!t.Outgoing && t.What.StartsWith("Small stop")) { if (t.Finished) hostEnd = t; else if (t.Done > 0) moving = true; } };
+                    host.TransferProgress += note;
+                    try
+                    {
+                        var send = Task.Run(() => ctrl.Files!.SendFiles(new[] { src }, toClipboard: false));
+                        WaitFor(() => moving || hostEnd != null, 20_000);
+                        ctrl.CancelTransfer();
+                        send.Wait(20_000);
+                        WaitFor(() => hostEnd != null, 5000);
+                    }
+                    finally { host.TransferProgress -= note; }
+                    if (hostEnd == null) return "FAIL: the receiver never said how it ended";
+                    string landed = Path.Combine(FileChannel.Downloads, hostEnd.What);
+                    if (!Directory.Exists(landed)) return "FAIL: nothing kept (" + hostEnd.Result + ")";
+                    int whole = 0, incomplete = 0;
+                    var wrong = new List<string>();
+                    foreach (string f in Directory.EnumerateFiles(landed, "*", SearchOption.AllDirectories))
+                    {
+                        string rel = Path.GetRelativePath(landed, f);
+                        if (Path.GetFileName(f).Contains("(incomplete")) { incomplete++; continue; }
+                        string source = Path.Combine(src, rel);
+                        if (File.Exists(source) && Same(source, f)) whole++; else wrong.Add(rel);
+                    }
+                    return wrong.Count == 0 && whole + incomplete > 0
+                        ? whole + " whole files all exactly their sources, " + incomplete + " kept marked incomplete (" + (hostEnd.Cancelled ? "stopped part-way" : "it finished before Stop") + ")"
+                        : "FAIL: " + wrong.Count + " files look whole but are not their sources (" + string.Join(", ", wrong.Take(5)) + "); " + whole + " right, " + incomplete + " incomplete";
                 });
 
                 Scenario("Send files: into Downloads, never over what is there, and the right kind of transfer", 60, () =>
@@ -564,6 +697,45 @@ namespace TailRemote
                     finally { if (CurrentGeneration == gen) Native.KeySink = null; c5.Dispose(); }
                 });
 
+                Scenario("the mouse: a held button let go when the line goes quiet, a listener can't touch the mouse, nonsense mouse messages ignored (recorded, never moved)", 30, () =>
+                {
+                    long gen = CurrentGeneration;
+                    var buttons = new System.Collections.Concurrent.ConcurrentQueue<(ushort Vk, bool Up)>();
+                    var mice = new System.Collections.Concurrent.ConcurrentQueue<(byte Kind, int A, int B)>();
+                    Native.KeySink = (vk, scan, up, ext) => { buttons.Enqueue((vk, up)); return true; };
+                    Native.MouseSink = (kind, a, b) => { mice.Enqueue((kind, a, b)); return true; };
+                    var listener = Connect(ListenPassword);
+                    var c6 = Connect(Password);
+                    try
+                    {
+                        if (!c6.CanMouse) return "FAIL: the host did not offer the mouse";
+                        if (listener.CanMouse) return "FAIL: a listener was offered the mouse";
+                        Thread.Sleep(300);
+                        // A listener tries everything: nothing may happen.
+                        listener.SendMouse(Protocol.MouseMove, 500, 500);
+                        listener.SendKey(Native.VkLeftButton, 0, false, false);
+                        // Nonsense: an unknown kind, a too-short and a too-long message.
+                        c6.TestWrite(new byte[] { Protocol.Mouse, 77, 1, 0, 1, 0 });
+                        c6.TestWrite(new byte[] { Protocol.Mouse, 0 });
+                        c6.TestWrite(new byte[] { Protocol.Mouse, 0, 1, 0, 1, 0, 9, 9 });
+                        // Huge moves are clamped, not wrapped round.
+                        c6.SendMouse(Protocol.MouseMove, 100_000, -100_000);
+                        c6.SendKey(Native.VkLeftButton, 0, false, false); // a drag starts...
+                        Thread.Sleep(800);
+                        bool listenerIgnored = !buttons.Any(b => b.Vk == Native.VkLeftButton && b.Up) && buttons.Count(b => b.Vk == Native.VkLeftButton) == 1;
+                        var moves = mice.ToArray();
+                        bool clamped = moves.Any(x => x == (Protocol.MouseMove, short.MaxValue, short.MinValue));
+                        bool onlyGood = moves.All(x => x.Kind != 77) && !moves.Any(x => x == (Protocol.MouseMove, 500, 500));
+                        c6.TestSilent = true; // ...and the line goes quiet in the middle of it
+                        for (int i = 0; i < 200 && !buttons.Any(b => b.Up); i++) Thread.Sleep(20);
+                        bool letGo = buttons.Any(b => b.Vk == Native.VkLeftButton && b.Up);
+                        return listenerIgnored && clamped && onlyGood && letGo
+                            ? "the held button was let go when the line went quiet; the listener and the nonsense did nothing; huge moves were clamped"
+                            : "FAIL: listener ignored " + listenerIgnored + ", clamped " + clamped + ", only good moves " + onlyGood + ", let go " + letGo + " (" + moves.Length + " moves)";
+                    }
+                    finally { if (CurrentGeneration == gen) { Native.KeySink = null; Native.MouseSink = null; } c6.Dispose(); listener.Dispose(); }
+                });
+
                 Scenario("hosting as the service: keys go from the host to the agent in the session (F24 only, recorded, never typed)", 30, () =>
                 {
                     long gen = CurrentGeneration; // so a late finally (this scenario timed out but keeps running) does not clobber a later one
@@ -572,19 +744,30 @@ namespace TailRemote
                     var got = new System.Collections.Concurrent.ConcurrentQueue<(ushort Vk, bool Up)>();
                     string? text = null;
                     var agentScreen = new TestScreen();
-                    new Thread(() => AgentLink.Run((vk, scan, up, ext) => got.Enqueue((vk, up)), t => text = t, _ => { }, null, new ScreenVideo(agentScreen.Take))) { IsBackground = true }.Start();
+                    var mice = new System.Collections.Concurrent.ConcurrentQueue<(byte Kind, int A, int B)>();
+                    new Thread(() => AgentLink.Run((vk, scan, up, ext) => got.Enqueue((vk, up)), (kind, a, b) => mice.Enqueue((kind, a, b)), t => text = t, _ => { }, null, new ScreenVideo(agentScreen.Take))) { IsBackground = true }.Start();
                     Thread.Sleep(1500); // the agent connects
                     Native.KeySink = server.Key; // every key the host types goes to the agent from here
+                    Native.MouseSink = server.Mouse; // and every mouse move
                     try
                     {
                         const ushort F24 = 0x87; // does nothing on any PC
                         for (int i = 0; i < 20; i++) { ctrl.SendKey(F24, 0, false, false); ctrl.SendKey(F24, 0, true, false); }
+                        // The mouse: a right click (as keys, recorded), a move each way and a wheel notch each way.
+                        ctrl.SendKey(Native.VkRightButton, 0, false, false);
+                        ctrl.SendKey(Native.VkRightButton, 0, true, false);
+                        ctrl.SendMouse(Protocol.MouseMove, -300, 25);
+                        ctrl.SendMouse(Protocol.MouseWheel, -120, 0);
+                        ctrl.SendMouse(Protocol.MouseSideWheel, 120, 0);
                         server.Text("for the clipboard, with no window open");
-                        for (int i = 0; i < 150 && (got.Count < 40 || text == null); i++) Thread.Sleep(20);
+                        for (int i = 0; i < 150 && (got.Count < 42 || mice.Count < 3 || text == null); i++) Thread.Sleep(20);
                     }
-                    finally { if (CurrentGeneration == gen) Native.KeySink = null; }
-                    bool ok = got.Count == 40 && got.All(k => k.Vk == 0x87) && text == "for the clipboard, with no window open";
-                    if (!ok) return "FAIL: " + got.Count + " of 40 keys, text " + (text ?? "none");
+                    finally { if (CurrentGeneration == gen) { Native.KeySink = null; Native.MouseSink = null; } }
+                    bool ok = got.Count == 42 && got.Take(40).All(k => k.Vk == 0x87) && got.Skip(40).All(k => k.Vk == Native.VkRightButton) && text == "for the clipboard, with no window open";
+                    if (!ok) return "FAIL: " + got.Count + " of 42 keys and buttons, text " + (text ?? "none");
+                    var m = mice.ToArray();
+                    if (m.Length != 3 || m[0] != (Protocol.MouseMove, -300, 25) || m[1] != (Protocol.MouseWheel, -120, 0) || m[2] != (Protocol.MouseSideWheel, 120, 0))
+                        return "FAIL: the mouse reached the agent as " + string.Join(", ", m.Select(x => x.Kind + " " + x.A + " " + x.B));
                     // The remote screen, which only the agent can see: pictures come from it, through the service.
                     host.VideoUpdate = server.Video;
                     host.VideoForget = server.ForgetVideo;
@@ -594,7 +777,7 @@ namespace TailRemote
                         agentScreen.SquareX = 420;
                         if (!WaitFor(() => TestScreen.Near(watch.Canvas.At(430, 110), agentScreen.At(430, 110), 40), 10_000)) return "FAIL: a change at the agent's screen did not show";
                     }
-                    return "all 40 key presses and releases reached the agent, in order, the clipboard text too, and the agent's screen was seen and followed";
+                    return "all 40 key presses and releases reached the agent, in order, a right click, mouse moves and wheel turns too, the clipboard text too, and the agent's screen was seen and followed";
                 });
 
                 Scenario("hosting as the service: the window sends and receives through the agent", 60, () =>
@@ -643,6 +826,39 @@ namespace TailRemote
                         && sameFile && windowFiles != null && windowSaw != null;
                     return ok ? "text both ways, a file each way, the window saw the transfer finish, and a pipe not owned by SYSTEM was refused"
                         : "FAIL: controller got " + toController + ", window got " + toWindow + ", files to controller " + (controllerFiles != null) + ", files to window " + (windowFiles != null) + ", window saw the end " + (windowSaw != null);
+                });
+
+                Scenario("hosting as the service: after switching user, the old session's window gets nothing more and its folder is forgotten", 30, () =>
+                {
+                    // A pipe name of its own: the scenario above leaves its link listening on the usual test name.
+                    string pipes = Names.TestPipes;
+                    Names.TestPipes = pipes + "Switch";
+                    ServiceLink.TestAnyOwner = true;
+                    try
+                    {
+                        uint mine = (uint)Process.GetCurrentProcess().SessionId;
+                        uint atScreen = mine;
+                        var folders = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                        var server = new ServiceLink.Server(host, () => atScreen) { FolderChosen = f => folders.Enqueue(f ?? "(usual)") };
+                        string? got = null;
+                        using (var window = new ServiceLink.Client())
+                        {
+                            window.TextArrived += t => got = t;
+                            // The window says where files go on linking up even when it is the usual place.
+                            if (!WaitFor(() => window.Connected && folders.Contains("(usual)"), 10_000))
+                                return "FAIL: the window did not link up and say where files go (connected " + window.Connected + ", told " + string.Join(", ", folders) + ")";
+                            if (!server.Text("before switching") || !WaitFor(() => got == "before switching", 5000)) return "FAIL: the window did not get text before switching (got " + got + ")";
+                            int toldBefore = folders.Count;
+                            atScreen = mine + 1000; // someone else is at the screen now
+                            bool handed = server.Text("after switching");
+                            bool forgot = WaitFor(() => folders.Skip(toldBefore).Contains("(usual)"), 5000);
+                            if (handed || got == "after switching") return "FAIL: the old session's window was still handed text after switching (handed " + handed + ", got " + got + ")";
+                            if (!forgot) return "FAIL: the folder was not forgotten when the old session's window went";
+                        }
+                        Thread.Sleep(2500); // the window's last try to link up again is over before the name goes back
+                        return "the window said where files go on linking up; after switching user it was handed nothing, was closed, and received files went back to the usual place";
+                    }
+                    finally { Names.TestPipes = pipes; }
                 });
 
                 Scenario("the remote screen: its line cut 3 times, it comes back each time with the picture right", 60, () =>
@@ -722,6 +938,36 @@ namespace TailRemote
                         return "H.264 at up to " + peak + " frames a second, back after the cut with a key frame, exact once still";
                     }
                     finally { go = false; }
+                });
+
+                Scenario("the remote screen on a viewer that cannot decode H.264: it asks for still pictures only, and they follow the moving picture", 60, () =>
+                {
+                    using (var probe = H264Encoder.Create(64, 64, 30, 500)) if (probe == null) return "no H.264 encoder on this PC: still pictures only (nothing to test)";
+                    var test = new TestScreen();
+                    var screen = new ScreenVideo(test.Take);
+                    host.VideoUpdate = screen.Update;
+                    host.VideoForget = screen.Forget;
+                    bool go = true;
+                    var mover = new Thread(() => { int i = 0; while (go) { i++; test.SquareX = 20 + i * 11 % 560; test.SquareY = 30 + i * 7 % 280; Thread.Sleep(16); } }) { IsBackground = true };
+                    VideoCanvas.TestFailVideo = true;
+                    try
+                    {
+                        using var watch = ctrl.WatchScreen()!;
+                        mover.Start();
+                        if (!WaitFor(() => watch.NoH264, 10_000)) return "FAIL: the viewer never gave up on H.264 (" + watch.VideoFrames + " frames failed)";
+                        Thread.Sleep(1000); // any frames already on their way arrive
+                        int frames = watch.VideoFrames, pictures = watch.Pictures;
+                        Thread.Sleep(2000);
+                        int moreFrames = watch.VideoFrames - frames, morePictures = watch.Pictures - pictures;
+                        if (moreFrames > 0) return "FAIL: the host kept sending H.264 (" + moreFrames + " frames in 2 s) after the viewer said it cannot show it";
+                        if (morePictures < 5) return "FAIL: only " + morePictures + " still pictures in 2 s while things moved";
+                        go = false;
+                        mover.Join();
+                        bool exact = WaitFor(() => watch.Canvas.At(test.SquareX + 5, test.SquareY + 5) == test.At(test.SquareX + 5, test.SquareY + 5) && watch.Canvas.At(5, 5) == test.At(5, 5), 10_000);
+                        if (!exact) return "FAIL: once still, the picture did not become exact";
+                        return "after " + frames + " frames it could not show, the viewer asked for still pictures: " + morePictures + " in 2 s while moving, none as H.264, exact once still";
+                    }
+                    finally { go = false; VideoCanvas.TestFailVideo = false; }
                 });
 
                 Scenario("9 PCs watch the screen at once: 8 see it, the 9th is told why", 60, () =>
@@ -874,6 +1120,43 @@ namespace TailRemote
                 return allNoticed ? "every PC noticed, the port was freed, and hosting again worked" : "FAIL: not every PC noticed the host stopping";
             });
 
+            Scenario("a login trickled in one byte a second: cut off at the login deadline, not minutes later", 30, () =>
+            {
+                using var t = new TcpClient("127.0.0.1", Port);
+                var st = t.GetStream();
+                var hello = new byte[Protocol.HelloBytes];
+                Protocol.ReadExactly(st, hello);
+                var clock = Stopwatch.StartNew();
+                try
+                {
+                    // Each byte comes well inside the 3 second read timeout, so only an overall deadline ends it.
+                    for (int i = 0; i < Protocol.AnswerBytes - 1 && clock.ElapsedMilliseconds < 25_000; i++)
+                    {
+                        st.WriteByte(0x55);
+                        Thread.Sleep(1000);
+                    }
+                }
+                catch { }
+                long at = clock.ElapsedMilliseconds;
+                return at < Host.LoginDeadlineMs + 3000 ? "cut off after " + at / 1000 + " s; " + Healthy(host, "afterwards") : "FAIL: still connected after " + at / 1000 + " s";
+            });
+
+            Scenario("the connection drops before the window is listening: it still hears about it", 30, () =>
+            {
+                // A second host of its own, so stopping it disturbs nothing else.
+                var brief = new Host(Port + 7, Password, null, _ => { });
+                try
+                {
+                    using var c = Client.Connect("127.0.0.1", Port + 7, Password, new Player(Player.NoDevice, _ => { }), _ => { });
+                    brief.Dispose(); // gone before anyone subscribed, like a host stopping just as the login finished
+                    if (!WaitClosed(c, 10_000)) return "FAIL: the client never noticed the host stopping";
+                    string? heard = null;
+                    c.Disconnected += why => heard = why; // subscribed late
+                    return heard != null ? "a late listener heard it at once: " + heard : "FAIL: a handler added after the drop never heard about it";
+                }
+                finally { brief.Dispose(); }
+            });
+
             Scenario("six wrong passwords, then the right one", 30, () =>
             {
                 int refused = 0;
@@ -882,6 +1165,22 @@ namespace TailRemote
                 try { using var c = Connect(Password); right = "the right one got in (it should have been blocked for a minute)"; }
                 catch (Exception e) { right = "the right one was blocked for now: " + e.Message; }
                 return refused == 6 ? "all 6 refused; " + right : "FAIL: only " + refused + " refused";
+            });
+
+            Scenario("20 wrong passwords sent at the same moment: no more than 5 are even checked", 60, () =>
+            {
+                // After "six wrong passwords" this address is blocked anyway; wait the block out first.
+                host.Dispose();
+                host = NewHost();
+                Thread.Sleep(500);
+                int wrong = 0, cut = 0;
+                Parallel.For(0, 20, new ParallelOptions { MaxDegreeOfParallelism = 20 }, i =>
+                {
+                    try { using var c = Connect("parallel-wrong-" + i); }
+                    catch (Exception e) when (e.Message.StartsWith("Wrong password")) { Interlocked.Increment(ref wrong); }
+                    catch { Interlocked.Increment(ref cut); }
+                });
+                return wrong <= 5 ? wrong + " were checked and refused, " + cut + " were hung up on unchecked" : "FAIL: " + wrong + " wrong passwords were checked (at most 5 a minute are allowed)";
             });
 
             // Leaks: memory and threads back where they started.

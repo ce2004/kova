@@ -16,13 +16,31 @@ namespace TailRemote
     /// The hook runs on its own thread with its own message loop, so a busy UI
     /// can never make Windows time the hook out. It is reinstalled each time
     /// remote control starts, which puts it ahead of NVDA's own hook.
+    ///
+    /// The mouse goes too while controlling a remote PC that takes it: a mouse hook on the same
+    /// thread, only while controlling, swallows this PC's moves, buttons and wheel and sends them.
+    /// This PC's pointer is parked in the middle of its screen meanwhile (so it never stops at an
+    /// edge) and put back where it was afterwards.
     /// </summary>
     internal sealed class KeyCapture : IDisposable
     {
         private const int VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_LWIN = 0x5B, VK_RWIN = 0x5C;
-        private const uint WM_APP_REHOOK = 0x8001, WM_QUIT = 0x0012, WM_TIMER = 0x0113;
+        private const uint WM_APP_REHOOK = 0x8001, WM_APP_MOUSE_OFF = 0x8002, WM_QUIT = 0x0012, WM_TIMER = 0x0113;
+        private const int WH_MOUSE_LL = 14, LLMHF_INJECTED = 1;
+        private const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205,
+            WM_MBUTTONDOWN = 0x207, WM_MBUTTONUP = 0x208, WM_MOUSEWHEEL = 0x20A, WM_XBUTTONDOWN = 0x20B, WM_XBUTTONUP = 0x20C, WM_MOUSEHWHEEL = 0x20E;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT { public Native.POINT pt; public uint mouseData, flags, time; public IntPtr extra; }
 
         [DllImport("user32.dll")] private static extern IntPtr SetTimer(IntPtr hwnd, IntPtr id, uint ms, IntPtr proc);
+        [DllImport("user32.dll")] private static extern bool KillTimer(IntPtr hwnd, IntPtr id);
+
+        private readonly Native.HookProc _mouseProc;
+        private IntPtr _mouseHook, _flushTimer;
+        private Native.POINT _savedCursor, _center;
+        private int _moveX, _moveY;
+        private long _lastMove;
         private bool _away;
 
         private readonly Func<IntPtr> _ourWindow;
@@ -49,6 +67,7 @@ namespace TailRemote
         {
             _ourWindow = ourWindow;
             _proc = Callback;
+            _mouseProc = MouseCallback;
             _thread = new Thread(Loop) { IsBackground = true, Name = "Kova keyboard", Priority = ThreadPriority.Highest };
             _thread.Start();
             _ready.Wait();
@@ -56,8 +75,12 @@ namespace TailRemote
 
         public void SetClient(Client? c)
         {
+            var old = _client;
             _client = c;
-            if (c == null && _remote) Leave(announce: true);
+            if (c == null && _remote) Leave(announce: true, old);
+            // Whether the remote PC takes the mouse is only known once it says what it can do, which can
+            // come just after remote control resumed by itself on reconnecting: look again then.
+            if (c != null) c.FeaturesKnown += () => { if (_remote && _client == c && _mouseHook == IntPtr.Zero) Native.PostThreadMessageW(_threadId, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero); };
         }
 
         private void Loop()
@@ -68,14 +91,95 @@ namespace TailRemote
             _ready.Set();
             while (Native.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
             {
-                if (msg.message == WM_APP_REHOOK) { Unhook(); Hook(); }
+                if (msg.message == WM_APP_REHOOK) { Unhook(); Hook(); if (_remote) HookMouse(); else UnhookMouse(); }
+                else if (msg.message == WM_APP_MOUSE_OFF) UnhookMouse();
+                else if (msg.message == WM_TIMER && _flushTimer != IntPtr.Zero && msg.wParam == _flushTimer) FlushMove();
                 else if (msg.message == WM_TIMER && _remote) CheckDesktop();
             }
+            UnhookMouse();
             Unhook();
         }
 
         private void Hook() => _hook = Native.SetWindowsHookExW(Native.WH_KEYBOARD_LL, _proc, Native.GetModuleHandleW(null), 0);
         private void Unhook() { if (_hook != IntPtr.Zero) Native.UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+
+        /// <summary>On the hook thread: takes the mouse, if the remote PC takes it.</summary>
+        private void HookMouse()
+        {
+            if (_mouseHook != IntPtr.Zero || _client is not { CanMouse: true }) return;
+            Native.GetCursorPos(out _savedCursor);
+            _center = new Native.POINT { X = Native.GetSystemMetrics(0) / 2, Y = Native.GetSystemMetrics(1) / 2 };
+            Native.SetCursorPos(_center.X, _center.Y);
+            _moveX = _moveY = 0;
+            _mouseHook = Native.SetWindowsHookExW(WH_MOUSE_LL, _mouseProc, Native.GetModuleHandleW(null), 0);
+            _flushTimer = SetTimer(IntPtr.Zero, IntPtr.Zero, 15, IntPtr.Zero); // sends what is left of a move once the mouse stops
+        }
+
+        /// <summary>On the hook thread: gives the mouse back to this PC, the pointer where it was.</summary>
+        private void UnhookMouse()
+        {
+            if (_mouseHook == IntPtr.Zero) return;
+            Native.UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = IntPtr.Zero;
+            if (_flushTimer != IntPtr.Zero) KillTimer(IntPtr.Zero, _flushTimer);
+            _flushTimer = IntPtr.Zero;
+            _moveX = _moveY = 0;
+            Native.SetCursorPos(_savedCursor.X, _savedCursor.Y);
+        }
+
+        /// <summary>Sends the distance moved so far as one move: a gaming mouse reports 1000 times a second, the line needs no more than about 125.</summary>
+        private void FlushMove()
+        {
+            if (_moveX == 0 && _moveY == 0) return;
+            if (_remote) _client?.SendMouse(Protocol.MouseMove, _moveX, _moveY);
+            _moveX = _moveY = 0;
+            _lastMove = Environment.TickCount64;
+        }
+
+        private unsafe IntPtr MouseCallback(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code < 0) return Native.CallNextHookEx(_mouseHook, code, wParam, lParam);
+            var m = *(MSLLHOOKSTRUCT*)lParam;
+            var c = _client;
+            // Software on this PC moving the pointer (NVDA's mouse tracking, for one) stays here.
+            if (!_remote || c == null || (m.flags & LLMHF_INJECTED) != 0) return Native.CallNextHookEx(_mouseHook, code, wParam, lParam);
+            int msg = (int)wParam;
+            if (msg == WM_MOUSEMOVE)
+            {
+                // Where the pointer would go, less where it is: the move, after this PC's own pointer speed.
+                Native.GetCursorPos(out var now);
+                _moveX += m.pt.X - now.X;
+                _moveY += m.pt.Y - now.Y;
+                if (now.X != _center.X || now.Y != _center.Y) Native.SetCursorPos(_center.X, _center.Y); // something else moved it: back to the middle
+                if (Environment.TickCount64 - _lastMove >= 8) FlushMove();
+                return 1;
+            }
+            FlushMove(); // a click lands where the pointer has got to
+            short wheel = (short)(m.mouseData >> 16);
+            switch (msg)
+            {
+                case WM_MOUSEWHEEL: c.SendMouse(Protocol.MouseWheel, wheel, 0); return 1;
+                case WM_MOUSEHWHEEL: c.SendMouse(Protocol.MouseSideWheel, wheel, 0); return 1;
+            }
+            ushort vk = msg switch
+            {
+                WM_LBUTTONDOWN or WM_LBUTTONUP => Native.VkLeftButton,
+                WM_RBUTTONDOWN or WM_RBUTTONUP => Native.VkRightButton,
+                WM_MBUTTONDOWN or WM_MBUTTONUP => Native.VkMiddleButton,
+                WM_XBUTTONDOWN or WM_XBUTTONUP => wheel == 1 ? Native.VkBackButton : Native.VkForwardButton,
+                _ => 0,
+            };
+            if (vk == 0) return 1;
+            bool up = msg is WM_LBUTTONUP or WM_RBUTTONUP or WM_MBUTTONUP or WM_XBUTTONUP;
+            lock (_held)
+            {
+                // Pressed before remote control started: let go here, where it went down.
+                if (up) { if (!_held.Remove((vk, false))) return Native.CallNextHookEx(_mouseHook, code, wParam, lParam); }
+                else _held.Add((vk, false));
+            }
+            c.SendKey(vk, 0, up, false);
+            return 1;
+        }
 
         public void Dispose() => Native.PostThreadMessageW(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
 
@@ -94,10 +198,11 @@ namespace TailRemote
             ModeChanged?.Invoke(true);
         }
 
-        private void Leave(bool announce)
+        private void Leave(bool announce, Client? from = null)
         {
             _remote = false;
-            var c = _client;
+            Native.PostThreadMessageW(_threadId, WM_APP_MOUSE_OFF, IntPtr.Zero, IntPtr.Zero);
+            var c = from ?? _client;
             lock (_held)
             {
                 // Let go of everything the remote PC still thinks is held down.

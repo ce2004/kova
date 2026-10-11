@@ -55,6 +55,21 @@ namespace TailRemote
 
         private int _failures;
 
+        private int _resets;
+        private long _resetAt;
+
+        /// <summary>
+        /// A device reset is reopened quietly, but not for ever: ten in a row within seconds of each other (a
+        /// Bluetooth device half there) go the normal way, with a message and the usual wait.
+        /// </summary>
+        private bool QuickReset()
+        {
+            long now = Environment.TickCount64;
+            if (now - _resetAt > 5000) _resets = 0;
+            _resetAt = now;
+            return ++_resets <= 10;
+        }
+
         private void Run()
         {
             Native.ProAudioThread();
@@ -65,6 +80,13 @@ namespace TailRemote
                 {
                     CaptureUntilDeviceChanges();
                     lastError = null;
+                }
+                catch (Exception e) when (Wasapi.DeviceReset(e) && !_stop && QuickReset())
+                {
+                    // Unplugged or changed: open whatever is the output now, quietly (the controlling PCs
+                    // used to hear "Host audio is not available" for a pair of headphones).
+                    DiagLog.Write("host capture: the device changed under us; reopening");
+                    Thread.Sleep(100);
                 }
                 catch (Exception e)
                 {
@@ -174,6 +196,7 @@ namespace TailRemote
                         // the chosen output that was missing comes back.
                         var want = Wasapi.OutputDevice(_deviceId);
                         want.GetId(out string curId);
+                        Wasapi.Release(want);
                         if (curId != devId && (followDefault || curId == _deviceId)) return;
                     }
                 }
@@ -181,6 +204,10 @@ namespace TailRemote
             finally
             {
                 try { client.Stop(); } catch { }
+                // Let go now, before the event it signals is closed: a closed handle's number can be reused.
+                Wasapi.Release(cap);
+                Wasapi.Release(client);
+                Wasapi.Release(dev);
             }
         }
 

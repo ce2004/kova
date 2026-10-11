@@ -21,7 +21,7 @@ namespace TailRemote
     {
         private static string PipeName => Names.AgentPipe;
         // Service to agent: type a key, set the clipboard (text / files), and ask the agent to read its clipboard.
-        private const byte KeyMessage = (byte)'K', TextMessage = (byte)'T', FilesMessage = (byte)'F', GetMessage = (byte)'G';
+        private const byte KeyMessage = (byte)'K', MouseMessage = (byte)'M', TextMessage = (byte)'T', FilesMessage = (byte)'F', GetMessage = (byte)'G';
         // Agent to service: the clipboard it read, in answer to a GetMessage (text, or file paths).
         private const byte ClipTextMessage = (byte)'t', ClipFilesMessage = (byte)'f';
         // The remote screen, which only the agent can see: the service asks for a viewer's next picture
@@ -69,6 +69,20 @@ namespace TailRemote
                 BitConverter.TryWriteBytes(k.AsSpan(2), scan);
                 k[4] = (byte)((up ? 1 : 0) | (extended ? 2 : 0));
                 return _out.TryAdd((KeyMessage, k));
+            }
+
+            /// <summary>Hands a mouse move or wheel turn to the agent (Native.SendMouse); false if no agent is there.</summary>
+            public bool Mouse(byte kind, int a, int b)
+            {
+                if (_pipe == null) return false;
+                // The agent is behind (switching desktops): moves are dropped while the queue is half full, so
+                // a key let go after them always has room. The next move puts the pointer right again.
+                if (kind == Protocol.MouseMove && _out.Count > 2048) return false;
+                byte[] m = new byte[9];
+                m[0] = kind;
+                BitConverter.TryWriteBytes(m.AsSpan(1), a);
+                BitConverter.TryWriteBytes(m.AsSpan(5), b);
+                return _out.TryAdd((MouseMessage, m));
             }
 
             public void Text(string text) { if (_pipe != null) _out.TryAdd((TextMessage, Encoding.UTF8.GetBytes(text))); }
@@ -148,9 +162,14 @@ namespace TailRemote
                 var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
                 var sec = new PipeSecurity();
                 sec.AddAccessRule(new PipeAccessRule(system, PipeAccessRights.FullControl, AccessControlType.Allow));
-                using (var me = WindowsIdentity.GetCurrent()) if (me.IsSystem) sec.SetOwner(system); // the agent checks this before typing anything
-                else sec.AddAccessRule(new PipeAccessRule(me.User!, PipeAccessRights.FullControl, AccessControlType.Allow)); // the chaos test plays both halves
-                bool first = true, warned = false;
+                bool asSystem;
+                using (var me = WindowsIdentity.GetCurrent())
+                {
+                    asSystem = me.IsSystem;
+                    if (asSystem) sec.SetOwner(system); // the agent checks this before typing anything
+                    else sec.AddAccessRule(new PipeAccessRule(me.User!, PipeAccessRights.FullControl, AccessControlType.Allow)); // the chaos test plays both halves
+                }
+                bool first = true, warned = false, warnedOwner = false;
                 while (true)
                 {
                     // Claimed before the attempt, win or lose: if Create throws (something else is
@@ -166,6 +185,19 @@ namespace TailRemote
                         // read holds up every write (as the service link found), so nothing would reach the agent.
                         var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 2, PipeTransmissionMode.Byte,
                             PipeOptions.Asynchronous | (useFirst ? PipeOptions.FirstPipeInstance : PipeOptions.None), 0, 0, sec);
+                        // A later instance takes the rules of the name's first one, whoever made it. Not ours
+                        // (a program squatted on the name first): its maker could connect here posing as the
+                        // agent and read every key typed. Let it go and only take a pipe that really is the
+                        // first of its name again.
+                        if (asSystem && !ServiceLink.Server.OwnedBySystem(pipe))
+                        {
+                            pipe.Dispose();
+                            if (!warnedOwner) ServiceHost.Log("Agent link: another program holds the pipe " + PipeName + "; waiting for it to go.");
+                            warnedOwner = true;
+                            first = true;
+                            Thread.Sleep(1000);
+                            continue;
+                        }
                         pipe.WaitForConnection();
                         // The newest agent (the session now at the screen) takes over; anything queued for the old one goes.
                         var old = Interlocked.Exchange(ref _pipe, pipe);
@@ -207,7 +239,7 @@ namespace TailRemote
         /// given, reads this session's clipboard and hands back text or file paths (on its own thread),
         /// which are written straight back to the service: the answer to a GetMessage.
         /// </summary>
-        public static void Run(Action<ushort, ushort, bool, bool> key, Action<string> text, Action<string[]> files,
+        public static void Run(Action<ushort, ushort, bool, bool> key, Action<byte, int, int> mouse, Action<string> text, Action<string[]> files,
             Action<Action<string>, Action<string[]>>? getClipboard = null, ScreenVideo? screen = null)
         {
             byte[] head = new byte[5];
@@ -225,7 +257,9 @@ namespace TailRemote
                 try
                 {
                     // Two-way and asynchronous, to match the service: reads come in while a clipboard answer goes back.
-                    using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                    // Identification only: the service never needs to act as this agent, and a pipe made by
+                    // someone else must not be able to act as SYSTEM through it.
+                    using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification);
                     pipe.Connect(2000);
                     // Really the service: a pipe of this name made by anyone else (an ordinary user's
                     // program, before the service made its own) would be typing as SYSTEM.
@@ -240,6 +274,10 @@ namespace TailRemote
                     // never while the read loop below is also writing, so one lock keeps writes whole.
                     var writeGate = new object();
                     void Reply(byte type, byte[] payload) { try { lock (writeGate) Write(pipe, type, payload); } catch { } }
+                    // A new link (the service may have restarted, numbering its viewers from 1 again): what
+                    // was kept for the old viewers goes, on the picture thread so it never races a picture.
+                    newest.Clear();
+                    if (screen != null) pictures.TryAdd(screen.ForgetAll, 1000);
                     while (true)
                     {
                         Protocol.ReadExactly(pipe, head);
@@ -250,6 +288,7 @@ namespace TailRemote
                         switch (head[0])
                         {
                             case KeyMessage when n == 5: key(BitConverter.ToUInt16(p, 0), BitConverter.ToUInt16(p, 2), (p[4] & 1) != 0, (p[4] & 2) != 0); break;
+                            case MouseMessage when n == 9: mouse(p[0], BitConverter.ToInt32(p, 1), BitConverter.ToInt32(p, 5)); break;
                             case TextMessage: text(Encoding.UTF8.GetString(p)); break;
                             case FilesMessage: files(Encoding.UTF8.GetString(p).Split('\n', StringSplitOptions.RemoveEmptyEntries)); break;
                             case GetMessage:

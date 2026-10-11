@@ -8,7 +8,7 @@ namespace TailRemote
     /// <summary>
     /// H.264 through Media Foundation (in Windows, no packages): the graphics chip's encoder when the
     /// PC has one, Windows' own software encoder when it does not, or when the chip's will not work
-    /// (tried once, then left alone). Low latency: every picture in gives a picture out, no reordering.
+    /// (three failures in a row, then left alone for 10 minutes). Low latency: every picture in gives a picture out, no reordering.
     /// The bitrate can change while it runs, and a whole picture (a key frame) can be asked for.
     /// Pictures go in as BGRA (Frame) and come out as an Annex B byte stream.
     /// </summary>
@@ -23,7 +23,9 @@ namespace TailRemote
         private volatile bool _closing;
         private readonly long _t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         private byte[]? _nv12;
-        private static volatile bool _hardwareBroken;
+        private static int _hardwareFailures;
+        private static long _hardwareOffUntil;
+        private static bool HardwareOff => Environment.TickCount64 < Interlocked.Read(ref _hardwareOffUntil);
 
         public bool Hardware { get; private set; }
         public int Width => _w;
@@ -33,12 +35,18 @@ namespace TailRemote
         private H264Encoder(int w, int h, int fps, int kbps) { _w = w; _h = h; _fps = fps; _kbps = kbps; }
 
         /// <summary>An encoder for pictures of this size (rounded down to even), or null if this PC has none that works.</summary>
-        public static H264Encoder? Create(int width, int height, int fps, int kbps)
+        public static H264Encoder? Create(int width, int height, int fps, int kbps) => Create(width, height, fps, kbps, hardware: true);
+
+        /// <summary>Windows' own software encoder only: the graphics chip's has just failed.</summary>
+        public static H264Encoder? CreateSoftware(int width, int height, int fps, int kbps) => Create(width, height, fps, kbps, hardware: false);
+
+        private static H264Encoder? Create(int width, int height, int fps, int kbps, bool hardware)
         {
-            Mf.Start();
+            // Windows N and KN come without Media Foundation: no encoder, so still pictures carry everything.
+            if (!Mf.Start()) return null;
             int w = width & ~1, h = height & ~1;
             if (w < 16 || h < 16) return null;
-            if (!_hardwareBroken)
+            if (hardware && !HardwareOff)
             {
                 var hw = new H264Encoder(w, h, fps, kbps);
                 if (hw.Open(hardware: true)) return hw;
@@ -152,11 +160,22 @@ namespace TailRemote
                 {
                     if (_async)
                     {
+                        // Pictures that came out after the last call stopped waiting for them are taken first:
+                        // left there, a chip's encoder asks for no more input until they are, which looked
+                        // like a broken encoder.
+                        byte[]? got = null;
+                        bool any = false;
+                        while (_haveOutput.Wait(0))
+                        {
+                            byte[]? o = Output(out bool k);
+                            if (o == null) return null;
+                            if (k) isKey = true;
+                            got = got == null ? o : Concat(got, o);
+                            any = true;
+                        }
                         if (!_needInput.Wait(500)) return null; // it never asked for a picture: not working
                         if (Mf.Call(_mft, 24, 0, sample, 0) < 0) return null; // ProcessInput
                         // Whatever it has ready: the first a moment after the picture went in, the rest at once.
-                        byte[]? got = null;
-                        bool any = false;
                         for (int wait = 30; _haveOutput.Wait(wait); wait = 0)
                         {
                             byte[]? o = Output(out bool k);
@@ -170,7 +189,7 @@ namespace TailRemote
                     int hr = Mf.Call(_mft, 24, 0, sample, 0); // ProcessInput
                     if (hr == unchecked((int)0xC00D36B5)) { Output(out _); hr = Mf.Call(_mft, 24, 0, sample, 0); } // not accepting: take what it has first
                     if (hr < 0) return null;
-                    return Output(out isKey) ?? Array.Empty<byte>();
+                    return Output(out isKey); // null: it failed (still pictures from here), not "still filling up"
                 }
                 finally { Marshal.Release(sample); }
             }
@@ -209,16 +228,18 @@ namespace TailRemote
                 if (ob.pEvents != IntPtr.Zero) Marshal.Release(ob.pEvents);
                 try
                 {
-                    if (hr == unchecked((int)0xC00D6D72)) return result; // MF_E_TRANSFORM_NEED_MORE_INPUT
+                    // Only "wants more input" means still filling up (empty, not null); any other failure is a
+                    // broken encoder (null), so the caller goes to still pictures instead of waiting for ever.
+                    if (hr == unchecked((int)0xC00D6D72)) return result ?? Array.Empty<byte>(); // MF_E_TRANSFORM_NEED_MORE_INPUT
                     if (hr == unchecked((int)0xC00D6D61)) // MF_E_TRANSFORM_STREAM_CHANGE: chip encoders often say so at first
                     {
                         IntPtr t;
-                        if (Mf.Call(_mft, 14, 0, 0u, (IntPtr)(&t)) < 0) return result; // GetOutputAvailableType
-                        try { if (Mf.Call(_mft, 16, 0, t, 0) < 0) return result; } finally { Marshal.Release(t); } // SetOutputType
+                        if (Mf.Call(_mft, 14, 0, 0u, (IntPtr)(&t)) < 0) return null; // GetOutputAvailableType
+                        try { if (Mf.Call(_mft, 16, 0, t, 0) < 0) return null; } finally { Marshal.Release(t); } // SetOutputType
                         provides = (Info().dwFlags & 0x300) != 0;
                         continue;
                     }
-                    if (hr < 0) return result;
+                    if (hr < 0) return null;
                     if (ob.pSample == IntPtr.Zero) { if (_async) return result ?? Array.Empty<byte>(); continue; }
                     byte[] bytes = Mf.SampleBytes(ob.pSample);
                     uint clean = 0;
@@ -229,7 +250,7 @@ namespace TailRemote
                 }
                 finally { if (ob.pSample != IntPtr.Zero) Marshal.Release(ob.pSample); }
             }
-            return result;
+            return result ?? Array.Empty<byte>();
         }
 
         private MFT_OUTPUT_STREAM_INFO Info()
@@ -246,8 +267,19 @@ namespace TailRemote
             return c;
         }
 
-        /// <summary>The chip's encoder misbehaved: from now on this process uses the software one.</summary>
-        public static void HardwareFailed() => _hardwareBroken = true;
+        /// <summary>
+        /// The chip's encoder misbehaved. One hiccup (a driver busy for a moment) is forgiven; three in a
+        /// row and the software one is used for the next 10 minutes, then the chip's is tried again.
+        /// </summary>
+        public static void HardwareFailed()
+        {
+            if (Interlocked.Increment(ref _hardwareFailures) < 3) return;
+            Interlocked.Exchange(ref _hardwareFailures, 0);
+            Interlocked.Exchange(ref _hardwareOffUntil, Environment.TickCount64 + 10 * 60_000);
+        }
+
+        /// <summary>The chip's encoder gave a picture: earlier hiccups no longer count against it.</summary>
+        public static void HardwareWorked() { if (Volatile.Read(ref _hardwareFailures) != 0) Interlocked.Exchange(ref _hardwareFailures, 0); }
 
         public void Dispose()
         {
@@ -260,8 +292,10 @@ namespace TailRemote
                 Guid iid = Mf.IID_IMFShutdown;
                 if (Marshal.QueryInterface(_mft, ref iid, out IntPtr shut) >= 0) { try { Mf.Call(shut, 3); } catch { } Marshal.Release(shut); } // Shutdown
             }
-            _pump?.Join(1000);
-            if (_events != IntPtr.Zero) { Marshal.Release(_events); _events = IntPtr.Zero; }
+            // The pump may still be inside GetEvent if it did not end: freeing the queue under it would
+            // crash the process, so it is left (a small leak) rather than released.
+            bool pumpEnded = _pump == null || _pump.Join(1000);
+            if (_events != IntPtr.Zero && pumpEnded) { Marshal.Release(_events); _events = IntPtr.Zero; }
             if (_codec != IntPtr.Zero) { Marshal.Release(_codec); _codec = IntPtr.Zero; }
             if (_mft != IntPtr.Zero) { Marshal.Release(_mft); _mft = IntPtr.Zero; }
             _started = false;
@@ -283,7 +317,7 @@ namespace TailRemote
 
         public static H264Decoder? Create()
         {
-            Mf.Start();
+            if (!Mf.Start()) return null; // no Media Foundation (Windows N): the host is told to send still pictures
             var d = new H264Decoder();
             try
             {
@@ -487,11 +521,29 @@ namespace TailRemote
         public const uint EnumSync = 0x1 | 0x40, EnumHardware = 0x4 | 0x40; // SYNCMFT / HARDWARE, each sorted and filtered
 
         private static int _started;
+        private static volatile bool _unavailable;
 
-        public static void Start()
+        /// <summary>Test only: behave as on Windows N, where Media Foundation is missing.</summary>
+        public static volatile bool TestUnavailable;
+
+        /// <summary>
+        /// Media Foundation ready on this thread; false where Windows has none (the N editions have no
+        /// mfplat.dll), remembered so it is not looked for again and again.
+        /// </summary>
+        public static bool Start()
         {
-            if (Interlocked.Exchange(ref _started, 1) == 0) MFStartup(0x20070, 0);
-            CoInitializeEx(IntPtr.Zero, 0); // this thread, for COM (harmless if done already)
+            if (TestUnavailable || _unavailable) return false;
+            try
+            {
+                if (Interlocked.Exchange(ref _started, 1) == 0 && MFStartup(0x20070, 0) < 0) { _unavailable = true; return false; }
+                CoInitializeEx(IntPtr.Zero, 0); // this thread, for COM (harmless if done already)
+                return true;
+            }
+            catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+            {
+                _unavailable = true;
+                return false;
+            }
         }
 
         /// <summary>The first transform of this kind Windows lists (best first), made ready; or zero.</summary>
