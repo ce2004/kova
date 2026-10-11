@@ -56,9 +56,11 @@ namespace TailRemote
                 if (parts.Length > 1 && parts[1].Split('/') is [string ip, string bits] && IPAddress.TryParse(ip, out var addr)
                     && int.TryParse(bits, out int prefix) && prefix is >= 8 and <= 30 && addr.AddressFamily == AddressFamily.InterNetwork)
                 {
-                    uint a = BitConverter.ToUInt32(addr.GetAddressBytes().Reverse().ToArray(), 0);
-                    uint hostBits = prefix == 32 ? 0 : uint.MaxValue >> prefix;
-                    broadcast = new IPAddress(BitConverter.GetBytes(a | hostBits).Reverse().ToArray());
+                    // Network byte order both ways (Array.Reverse-style LINQ binds to a different, in-place Reverse on newer C#).
+                    uint a = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(addr.GetAddressBytes());
+                    byte[] b = new byte[4];
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(b, a | (uint.MaxValue >> prefix));
+                    broadcast = new IPAddress(b);
                 }
                 list.Add((mac, broadcast));
             }
