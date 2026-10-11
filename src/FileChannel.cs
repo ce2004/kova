@@ -50,6 +50,9 @@ namespace TailRemote
         private const byte KindFiles = 1, KindText = 2, KindDownloads = 3; // clipboard files, clipboard text, Send files
         private const byte KindTo = 4; // Send files into a folder the controller chose in Get files (the offer carries it)
         private const byte EndedWell = 0, EndedBadly = 1, EndedStopped = 2;
+        // Only ever on a Stop: stopped because something newer was sent. The receiver ends it as stopped, and
+        // puts none of what arrived on the clipboard (the newer copy goes there).
+        private const byte EndedReplaced = 3;
 
         /// <summary>The most lanes at once.</summary>
         public const int MaxLanes = 16;
@@ -811,7 +814,8 @@ namespace TailRemote
                 if (!replaced) _latest = o;
             }
             if (replaced) { Dropped(kind, what, ticket); return; }
-            if (_out is Out old) EndOut(old, EndedStopped, "Stopped sending " + old.What + ": something newer was sent.", tell: true);
+            if (_out is Out old) EndOut(old, EndedStopped, "Stopped sending " + old.What + ": something newer was sent.", tell: true,
+                "The other PC sent something newer, so " + old.What + " was stopped.", replaced: true);
             lock (_sendGate)
             {
                 lock (_latestGate) replaced = _latest != o; // replaced before it even started (said below, outside this lock)
@@ -907,7 +911,7 @@ namespace TailRemote
         }
 
         /// <summary>whyThere: what the receiver shows (null: that this PC stopped sending), so both PCs agree how it ended and why.</summary>
-        private void EndOut(Out o, byte outcome, string why, bool tell, string? whyThere = null)
+        private void EndOut(Out o, byte outcome, string why, bool tell, string? whyThere = null, bool replaced = false)
         {
             lock (o.Gate)
             {
@@ -919,7 +923,7 @@ namespace TailRemote
             o.CloseAll();
             if (tell)
             {
-                var stop = OutcomeMessage(Stop, o.Id, outcome, whyThere ?? "");
+                var stop = OutcomeMessage(Stop, o.Id, replaced ? EndedReplaced : outcome, whyThere ?? "");
                 lock (_stops)
                 {
                     _stops.Add((Now, stop));
@@ -1843,9 +1847,10 @@ namespace TailRemote
         /// <summary>The sender ended it: stopped, or it could not go on (a file locked or gone), and then why, so both PCs say the same.</summary>
         private void OnStop(uint id, byte outcome, string why)
         {
+            bool replaced = outcome == EndedReplaced;
             if (outcome != EndedBadly) outcome = EndedStopped; // a stop never means it arrived
             if (_in is In b && b.Id == id)
-                EndIn(b, outcome, why.Length > 0 ? why : "The other PC stopped sending " + b.T.What + ".", outcome == EndedStopped ? "Stopped." : why, null, tell: false);
+                EndIn(b, outcome, why.Length > 0 ? why : "The other PC stopped sending " + b.T.What + ".", outcome == EndedStopped ? "Stopped." : why, null, tell: false, replaced: replaced);
             else lock (_inGate) Remember(id, outcome, outcome == EndedStopped || why.Length == 0 ? "Stopped." : why);
         }
 

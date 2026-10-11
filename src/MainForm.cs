@@ -80,6 +80,7 @@ namespace TailRemote
         private readonly MenuItem _copyAddress = new();
         private string? _bestAddress;
         private readonly System.Collections.Generic.List<(string Id, string Name)> _devices = new();
+        private static string NotConnected(string role) => "The " + role + " device chosen before (not connected now: Windows default until it is back)";
 
         private readonly NotifyIcon _tray = new() { Text = "Kova, hosting", Icon = SystemIcons.Application };
         private bool _reallyExit; // Stop hosting and exit, from the tray: close for real
@@ -193,6 +194,14 @@ namespace TailRemote
             _device.Add("Windows default");
             _devices.Add(("", "Windows default"));
             foreach (var d in Wasapi.OutputDevices()) { _devices.Add(d); _device.Add(d.Name); }
+            // A chosen device that is unplugged right now keeps its place: it showed as Windows default, and
+            // the next setting saved wrote that back, so the headset was forgotten for good.
+            foreach (var (id, role) in new[] { (_settings.OutputDevice, "output"), (_settings.CaptureDevice, "capture") })
+                if (!string.IsNullOrEmpty(id) && !_devices.Exists(d => d.Id == id))
+                {
+                    _devices.Add((id, NotConnected(role)));
+                    _device.Add(NotConnected(role));
+                }
             int sel = _devices.FindIndex(d => d.Id == _settings.OutputDevice);
             _device.SelectedIndex = sel < 0 ? 0 : sel;
             // Wired after the initial SelectedIndex so it fires only on the person's choice:
@@ -439,12 +448,9 @@ namespace TailRemote
             {
                 if (!link.Connected)
                 {
-                    // An older service has no link to this window yet: it updates itself to this version.
-                    if (ServiceHost.InstalledVersion() is Version v && v < Updater.Current)
-                    {
-                        OfferServiceUpdate();
-                        Say("The Kova service is still on version " + v + " and is updating itself to " + Updater.Current + ". Try again in a minute.");
-                    }
+                    // An older service has no link to this window yet: it is asked to update itself
+                    // (at most once a minute), and what happened is said once that is known.
+                    if (ServiceHost.InstalledVersion() is Version v && v < Updater.Current) OfferServiceUpdate(fromSend: true);
                     else Say("The Kova service is not answering. Check that it is running, or press Apply settings to the service.");
                     return false;
                 }
@@ -726,13 +732,28 @@ namespace TailRemote
             return true;
         }
 
+        // The connection whose Update the remote PC is asking GitHub now: a second press meanwhile is
+        // told so, rather than asking twice.
+        private Client? _remoteUpdateAsking;
+
         private async void UpdateRemote()
         {
             if (!CanUseRemote(out var c)) return;
+            if (_remoteUpdateAsking == c) { Say("Still checking GitHub for the newest Kova."); return; }
+            // Said first: asking GitHub can take a while, and silence sounded like nothing happened.
+            Say("Checking GitHub for the newest Kova.");
             // The newest on GitHub, not just this PC's own version: a release that changes how the PCs
             // connect means the remote PC must be updated first, while this one can still reach it.
             Version want = Updater.Current;
-            try { var latest = await Updater.LatestAsync(); if (latest > want) want = latest; } catch { } // offline: this PC's own version, as before
+            _remoteUpdateAsking = c;
+            try
+            {
+                // At most 15 seconds: GitHub not answering must not leave the request hanging.
+                var latest = await Updater.LatestAsync().WaitAsync(TimeSpan.FromSeconds(15));
+                if (latest > want) want = latest;
+            }
+            catch { } // offline: this PC's own version, as before
+            finally { if (_remoteUpdateAsking == c) _remoteUpdateAsking = null; }
             if (_client != c) return;
             if (c.HostVersion is Version v && v >= want)
             {
@@ -1139,6 +1160,13 @@ namespace TailRemote
                 _muteLocal.Checked = _settings.MuteWhenNotControlling;
                 _rideOut.Checked = _settings.RideOutStalls;
                 _quality.SelectedIndex = Math.Clamp(_settings.SoundQuality + 1, 0, _quality.Count - 1);
+                foreach (var (id, role) in new[] { (_settings.OutputDevice, "output"), (_settings.CaptureDevice, "capture") })
+                    if (!string.IsNullOrEmpty(id) && !_devices.Exists(d => d.Id == id))
+                    {
+                        _devices.Add((id, NotConnected(role)));
+                        _device.Add(NotConnected(role));
+                        _captureFrom.Add(NotConnected(role));
+                    }
                 int sel = _devices.FindIndex(d => d.Id == _settings.OutputDevice);
                 _device.SelectedIndex = sel < 0 ? 0 : sel;
                 _fillingCapture = true;
@@ -1605,7 +1633,12 @@ namespace TailRemote
             var answer = MessageBox.Show(this, "Port " + port + " is not open in Windows Firewall, so other PCs may not be able to connect. Open it now? Windows asks for administrator permission. You can close it later in Port editor.",
                 "Open port " + port, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return;
-            Say(await Firewall.SetAsync(port, true) ? "Port " + port + " is open." : "Port " + port + " was not opened: administrator permission was not given.");
+            Say(await Firewall.ChangeAsync(port, true) switch
+            {
+                ChangeResult.Done => "Port " + port + " is open.",
+                ChangeResult.Declined => "Port " + port + " was not opened: administrator permission was not given.",
+                _ => "Port " + port + " was not opened: Windows did not accept the change.",
+            });
         }
 
         public const int MinPasswordLength = 6;
@@ -1903,11 +1936,20 @@ namespace TailRemote
             _updating = true; // from the start: a remote request during the question box must not start a second download
             _update.Enabled = false;
             Say("Checking for updates.");
+            bool checkedOk = false;
             try
             {
                 var r = await Updater.CheckAsync();
+                checkedOk = true;
                 if (r == null) { Say("Kova " + Updater.Current + " is the latest version."); return; }
-                string notes = r.Notes.Trim().Length > 0 ? r.Notes.Trim() : "No notes.";
+                // A big release's notes made a box taller than the screen, its buttons out of reach, and
+                // NVDA read all of it before the question. The first lines are enough to decide; the
+                // changelog has the rest once the new version is running.
+                var noteLines = r.Notes.Replace("\r", "").Split('\n').Select(l => l.TrimEnd()).Where(l => l.Trim().Length > 0).ToList();
+                const int shown = 12;
+                string notes = noteLines.Count == 0 ? "No notes."
+                    : string.Join(Environment.NewLine, noteLines.Take(shown)) +
+                      (noteLines.Count > shown ? Environment.NewLine + "and " + (noteLines.Count - shown) + " more lines; About, View the changelog shows them all after updating." : "");
                 var answer = MessageBox.Show(this, "Version " + r.Version + " is available. You have " + Updater.Current + "." +
                     Environment.NewLine + Environment.NewLine + notes + Environment.NewLine + Environment.NewLine + "Update now? Kova restarts and carries on where it was.",
                     "Kova update", MessageBoxButtons.YesNo, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2); // default No: a stray Enter must not kick off an update + restart
@@ -1915,7 +1957,7 @@ namespace TailRemote
                 Say("Downloading version " + r.Version + ". Everything carries on until it is ready.");
                 await InstallUpdate(r);
             }
-            catch (Exception e) { Say("Update failed: " + e.Message); }
+            catch (Exception e) { Say((checkedOk ? "Update failed: " : "Could not check for updates: ") + e.Message); }
             finally
             {
                 if (!_reallyExit) _updating = false;
@@ -2076,7 +2118,16 @@ namespace TailRemote
         /// The service never updates on its own. After this copy was updated with
         /// Check for updates, nudge it to follow, to the same version. No questions.
         /// </summary>
-        private void OfferServiceUpdate()
+        // When the service was last nudged: every Send pressed while it is on an older version used to
+        // nudge it again, each time it was still busy downloading.
+        private long _serviceNudgedMs = -60_000;
+
+        /// <summary>
+        /// fromSend: a Send found the service on an older version (CanSend). Then exactly one sentence
+        /// is said, once the nudge's outcome is known, instead of "updating itself" said at once and
+        /// "could not ask it" contradicting it a moment later.
+        /// </summary>
+        private void OfferServiceUpdate(bool fromSend = false)
         {
             var v = ServiceHost.InstalledVersion();
             if (v == null || !_service.Checked) return;
@@ -2085,13 +2136,30 @@ namespace TailRemote
             // still runs the old one in memory, so it was never told. Right after an update, always
             // tell it: the service compares GitHub with what it really runs, so if it is already
             // current, nothing happens.
-            if (!_updated && v >= Updater.Current) return;
+            if (!fromSend && !_updated && v >= Updater.Current) return;
+            long now = Environment.TickCount64;
+            if (now - _serviceNudgedMs < 60_000)
+            {
+                if (fromSend) Say("The Kova service is still on version " + v + " and is updating itself. Try again in a minute.");
+                return;
+            }
+            _serviceNudgedMs = now;
             // Off the window's thread: the pipe waits up to 2 seconds for a service that is not
-            // there. The problem is spoken after "Updated to version", never over it.
+            // there. The problem is spoken after "Updated to version", never over it. No version is
+            // promised: the service goes to GitHub's newest only if it matches this window's.
             System.Threading.Tasks.Task.Run(() =>
             {
-                if (ServiceHost.NudgeUpdate()) Later(() => Log("The Kova service is updating itself to version " + Updater.Current + "."));
-                else Later(() => Speak("Could not ask the Kova service to update itself. If it is still on an older version, press Apply settings to the service."));
+                bool asked = ServiceHost.NudgeUpdate();
+                Later(() =>
+                {
+                    if (!asked)
+                    {
+                        string problem = "Could not ask the Kova service to update itself. If it is still on an older version, press Apply settings to the service.";
+                        if (fromSend) Say(problem); else Speak(problem);
+                    }
+                    else if (fromSend) Say("The Kova service is still on version " + v + " and has been asked to update itself. Try again in a minute.");
+                    else Log("The Kova service was asked to update itself.");
+                });
             });
         }
 
@@ -2101,10 +2169,11 @@ namespace TailRemote
             if (want == Startup.IsEnabled()) return;
             SaveSettings();
             Say("Windows asks for administrator permission.");
-            if (await Startup.SetAsync(want)) Say(want ? "Kova will start hosting, as administrator, when you sign in." : "Kova will no longer start with Windows.");
+            var result = await Startup.ChangeAsync(want);
+            if (result == ChangeResult.Done) Say(want ? "Kova will start hosting when you sign in." : "Kova will no longer start with Windows.");
             else
             {
-                Say("That needs administrator permission, and it was not given.");
+                Say(result == ChangeResult.Declined ? "That needs administrator permission, and it was not given." : "Windows did not accept the change.");
                 _startup.Checked = Startup.IsEnabled();
             }
         }

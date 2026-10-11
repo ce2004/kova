@@ -60,7 +60,7 @@ Running the host as a Windows service
 - Turn off Settings, Run as a Windows service to remove it completely.
 
 More settings
-- Enable logging: writes Kova-log.txt next to Kova, with a line every second about the sound on that PC. Turn it on on both PCs and send both files when something sounds wrong. What you type is never logged.
+- Enable logging: writes Kova-log.txt next to Kova (the service writes Kova-service-log.txt; if the folder cannot be written, both go to AppData, Local, Kova), with a line every second about the sound on that PC. Turn it on on both PCs and send both files when something sounds wrong. What you type is never logged.
 - Capture sound from (Host mode): which output's sound the other PCs hear. Windows default follows whatever the default output is.
 - Output device: where the remote PC's sound plays here.
 

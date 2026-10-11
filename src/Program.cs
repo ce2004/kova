@@ -80,8 +80,10 @@ namespace TailRemote
             AppDomain.CurrentDomain.UnhandledException += (_, e) => Crash(e.ExceptionObject as Exception);
             // Anything but on or off (or open or close below) is refused: a mistyped word used to mean
             // off, and quietly removed the sign-in task or closed the port.
-            if (args.Length == 2 && args[0] == "--startup")
-                return OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn) : 2;
+            // --startup on DOMAIN\user: the account signed in where it was asked, which may not be the
+            // administrator whose password was typed.
+            if ((args.Length == 2 || args.Length == 3) && args[0] == "--startup")
+                return OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn, args.Length == 3 ? args[2] : null) : 2;
 
             if (args.Length == 1 && args[0] == "--setup-audio")
             {
@@ -205,9 +207,14 @@ namespace TailRemote
                 return AudioTest(args.Length > 1 ? args[1] : null);
             }
 
+            // Speech first: waiting for the old copy to close (up to 15 seconds) used to come before it,
+            // so right after an update NVDA heard nothing at all until the window appeared. Now it hears
+            // "Finishing the update." if there is a wait. Settings are still read only after the wait:
+            // the old copy may write them as it closes.
+            Speech.Init();
             int after = Array.IndexOf(args, "--after-update");
             if (after >= 0 && after + 1 < args.Length && int.TryParse(args[after + 1], out int oldPid))
-                Updater.FinishUpdate(oldPid);
+                Updater.FinishUpdate(oldPid, () => Speech.Speak("Finishing the update."));
 
             ClearOldCopies();
 
@@ -215,7 +222,6 @@ namespace TailRemote
             // hosting or connected, whichever was running when the old copy closed.
             string resume = Array.IndexOf(args, "--resume") >= 0 ? Settings.Load().ResumeState : "";
 
-            Speech.Init();
             RunWindow(() => new MainForm(
                 autoHost: Array.IndexOf(args, "--host") >= 0 || resume == "host",
                 autoConnect: Array.IndexOf(args, "--connect") >= 0 || resume == "connect",
@@ -531,6 +537,67 @@ namespace TailRemote
         private static int SelfTest()
         {
             string lossless = "";
+            // Windows tools run from System32 by full path, never a same-named exe next to Kova.exe.
+            {
+                string sys = Environment.SystemDirectory;
+                if (Native.SystemTool("netsh") != Path.Combine(sys, "netsh.exe") || Native.SystemTool("sc.exe") != Path.Combine(sys, "sc.exe")
+                    || Native.SystemTool(@"C:\x\y.exe") != @"C:\x\y.exe")
+                    return Fail("a Windows tool was not given its full System32 path");
+            }
+            // VB-Cable's signer: exactly VB-Audio's name, not any name that holds it.
+            if (!AudioSetup.SignerIsVbAudio("CN=BUREL VINCENT, O=BUREL VINCENT, L=Paris, C=FR")
+                || !AudioSetup.SignerIsVbAudio("CN=BUREL VINCENT Entrepreneur individuel, O=BUREL VINCENT Entrepreneur individuel, STREET=21 avenue des Marguerites, L=Eymet, S=Dordogne, C=FR, OID.1.3.6.1.4.1.311.60.2.1.3=FR, SERIALNUMBER=423 734 177, OID.2.5.4.15=Private Organization")
+                || AudioSetup.SignerIsVbAudio("CN=NOT BUREL VINCENT LTD, O=Someone, C=US")
+                || AudioSetup.SignerIsVbAudio("CN=Someone, OU=BUREL VINCENT, C=US"))
+                return Fail("VB-Cable's signer check took the wrong certificate names");
+            // Release tags: a v or V, a -beta or +build, two or four parts all read as a three-part
+            // version (Version.Parse failed on all but "v4.0.0"), and 3.10.0 is newer than 3.9.0.
+            {
+                var want = new Version(4, 0, 0);
+                foreach (var tag in new[] { "v4.0.0", "V4.0.0", "4.0.0", "v4.0.0-beta", "4.0.0+build.7", "v4.0", "4.0.0.1", " v4.0.0 " })
+                    if (Updater.NormalizeTag(tag) != want) return Fail("the release tag " + tag + " read as " + Updater.NormalizeTag(tag) + ", not 4.0.0");
+                if (Updater.NormalizeTag("latest") != null || Updater.NormalizeTag("") != null || Updater.NormalizeTag(null) != null)
+                    return Fail("a release tag that is no version was taken as one");
+                if (!(Updater.NormalizeTag("v3.10.0") > Updater.NormalizeTag("v3.9.0"))) return Fail("3.10.0 was not newer than 3.9.0");
+            }
+            // GitHub's answer: a Wi-Fi sign-in page, an empty object, a release with no files and notes
+            // that are null are each a plain sentence or handled, never a raw exception.
+            {
+                string ParseProblem(string text)
+                {
+                    try { Updater.ParseRelease(text, "Kova-x64.exe"); return ""; }
+                    catch (InvalidOperationException e) { return e.Message; }
+                    catch (Exception e) { return "raw " + e.GetType().Name; }
+                }
+                if (!ParseProblem("<!DOCTYPE html><html><body>Sign in to the hotel Wi-Fi</body></html>").Contains("web page")) return Fail("a sign-in page from GitHub's address was not recognised");
+                if (!ParseProblem("not json at all").Contains("web page")) return Fail("an answer that is not JSON was not recognised");
+                if (!ParseProblem("{}").Contains("could not be understood")) return Fail("an empty answer from GitHub was not a plain sentence: " + ParseProblem("{}"));
+                var none = Updater.ParseRelease("{\"tag_name\":\"v9.1.0\",\"body\":null}", "Kova-x64.exe");
+                if (none.Version != new Version(9, 1, 0) || none.Notes != "" || none.Url != null) return Fail("a release with no files and null notes was read wrongly");
+                var full = Updater.ParseRelease("{\"tag_name\":\"v9.1.0-beta\",\"body\":\"Notes\",\"assets\":[{\"name\":\"Kova-arm64.exe\",\"browser_download_url\":\"https://a\"},{\"name\":\"Kova-x64.exe\",\"browser_download_url\":\"https://b\",\"digest\":\"sha256:ABCD\"}]}", "Kova-x64.exe");
+                if (full.Version != new Version(9, 1, 0) || full.Notes != "Notes" || full.Url != "https://b" || full.Sha256 != "ABCD") return Fail("a normal release was read wrongly");
+            }
+            // A remote folder of exactly the most it lists says nothing is left out; one more, and it does.
+            {
+                string many = Path.Combine(Path.GetTempPath(), "kova-selftest-many");
+                try
+                {
+                    if (Directory.Exists(many)) Directory.Delete(many, true);
+                    Directory.CreateDirectory(many);
+                    for (int i = 0; i < RemoteTools.MaxEntries; i++) File.WriteAllBytes(Path.Combine(many, "f" + i + ".txt"), Array.Empty<byte>());
+                    string exact = RemoteTools.ListFolder(many);
+                    if (exact.Split('\n').Any(l => l.StartsWith("T\t")) || exact.Split('\n').Count(l => l.StartsWith("F\t")) != RemoteTools.MaxEntries)
+                        return Fail("a folder of exactly " + RemoteTools.MaxEntries + " files was listed as cut short, or not all listed");
+                    Directory.CreateDirectory(Path.Combine(many, "a folder"));
+                    string over = RemoteTools.ListFolder(many);
+                    if (!over.Split('\n').Any(l => l.StartsWith("T\t")) || over.Split('\n').Count(l => l.StartsWith("F\t") || l.StartsWith("D\t")) != RemoteTools.MaxEntries || !over.StartsWith("D\t"))
+                        return Fail("a folder of more than " + RemoteTools.MaxEntries + " entries was not cut short properly");
+                }
+                finally { try { Directory.Delete(many, true); } catch { } }
+            }
+            // The sign-in task's account: a real one comes back as Windows spells it, a made-up one is refused.
+            if (Startup.Account(System.Security.Principal.WindowsIdentity.GetCurrent().Name) == null || Startup.Account(@"NoSuchDomain\no such user 'x") != null)
+                return Fail("the sign-in task's account was not checked properly");
             // The service's agent restarts: one failing at once, again and again, ends up retried once a
             // minute (it used to stop at 16 seconds), and one that ran a while is retried in 2 seconds.
             {

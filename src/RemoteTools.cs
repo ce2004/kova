@@ -18,6 +18,7 @@ namespace TailRemote
         private static readonly Guid FolderDocuments = new("FDD39AD0-238F-46AF-ADB4-6C85480369C7");
 
         public const int MaxEntries = 5000;
+        private static readonly HashSet<string> Asking = new(StringComparer.OrdinalIgnoreCase); // drives whose last look has not come back yet
 
         /// <summary>
         /// A folder's contents, one line per entry, tab-separated: kind (D folder, F file),
@@ -52,39 +53,75 @@ namespace TailRemote
                         }
                     }
                     else if (Directory.Exists(@"C:\Users")) Line('D', @"C:\Users", "Users (everyone's folders)");
-                    foreach (var d in DriveInfo.GetDrives())
+                    // A network drive whose server is gone, an empty CD drive or a sleeping USB disk can
+                    // take tens of seconds to say whether it is ready, and the controlling PC gives up
+                    // after 15: the whole list of drives failed because of one. So every drive is asked
+                    // at once, each on a thread of its own, and one that has not answered within about a
+                    // second is listed without its details, as not answering.
+                    var drives = DriveInfo.GetDrives();
+                    var details = drives.Select(d =>
                     {
-                        string name = d.Name.TrimEnd('\\');
-                        try
-                        {
-                            if (d.IsReady)
-                                name += (d.VolumeLabel.Length > 0 ? " " + d.VolumeLabel : "") + ", " + FileChannel.Size(d.AvailableFreeSpace) + " free of " + FileChannel.Size(d.TotalSize);
-                            else name += ", not ready";
-                        }
-                        catch { }
-                        Line('D', d.Name, name);
+                        // Still stuck from the last look: not asked again, so stuck threads never pile up.
+                        lock (Asking) if (!Asking.Add(d.Name)) return System.Threading.Tasks.Task.FromException<string>(new TimeoutException());
+                        return System.Threading.Tasks.Task.Factory.StartNew(() => { try { return DriveDetails(d); } finally { lock (Asking) Asking.Remove(d.Name); } },
+                            System.Threading.CancellationToken.None, System.Threading.Tasks.TaskCreationOptions.LongRunning, System.Threading.Tasks.TaskScheduler.Default);
+                    }).ToArray();
+                    try { System.Threading.Tasks.Task.WaitAll(details, 1200); } catch { }
+                    for (int i = 0; i < drives.Length; i++)
+                    {
+                        var t = details[i];
+                        string name = drives[i].Name.TrimEnd('\\') + (t.IsCompletedSuccessfully ? t.Result : ", not answering");
+                        Line('D', drives[i].Name, name);
                     }
                     return sb.ToString();
                 }
                 var dir = new DirectoryInfo(path);
-                if (!dir.Exists) return "E\tThat folder is not there any more.\n";
-                int n = 0;
+                if (!dir.Exists)
+                {
+                    // An empty CD drive or a disk that is asleep or locked is not "a folder not there any more".
+                    string? root = Path.GetPathRoot(dir.FullName);
+                    if (root != null && root.Length <= 3 && !Directory.Exists(root) &&
+                        DriveInfo.GetDrives().Any(d => string.Equals(d.Name, root, StringComparison.OrdinalIgnoreCase)))
+                        return "E\tThat drive is not ready.\n";
+                    return "E\tThat folder is not there any more.\n";
+                }
                 const FileAttributes hiddenSystem = FileAttributes.Hidden | FileAttributes.System;
-                // At most MaxEntries + 1 of each are read before sorting: a folder of a million files must not be read whole.
-                foreach (var d in dir.EnumerateDirectories().Where(d => (d.Attributes & hiddenSystem) != hiddenSystem).Take(MaxEntries + 1).OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase))
+                // At most MaxEntries + 1 in all are read, then sorted: a folder of a million files must
+                // not be read whole. The one extra says whether there were more than MaxEntries, so
+                // "only the first" is said only when something really was left out (a folder of exactly
+                // MaxEntries used to say it too).
+                var dirs = dir.EnumerateDirectories().Where(d => (d.Attributes & hiddenSystem) != hiddenSystem).Take(MaxEntries + 1).ToList();
+                var files = dirs.Count > MaxEntries ? new List<FileInfo>()
+                    : dir.EnumerateFiles().Where(f => (f.Attributes & hiddenSystem) != hiddenSystem).Take(MaxEntries + 1 - dirs.Count).ToList();
+                bool more = dirs.Count + files.Count > MaxEntries;
+                int n = 0;
+                foreach (var d in dirs.OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase))
                 {
                     if (++n > MaxEntries) break;
                     Line('D', d.FullName, d.Name, 0, d.LastWriteTimeUtc.Ticks);
                 }
-                foreach (var f in dir.EnumerateFiles().Where(f => (f.Attributes & hiddenSystem) != hiddenSystem).Take(MaxEntries + 1).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase))
+                foreach (var f in files.OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase))
                 {
                     if (++n > MaxEntries) break;
                     Line('F', f.FullName, f.Name, f.Length, f.LastWriteTimeUtc.Ticks);
                 }
+                // T: there were more than were listed. An older controlling PC skips lines it does not know.
+                if (more) sb.Append("T\t").Append(MaxEntries).Append('\n');
                 return sb.ToString();
             }
             catch (UnauthorizedAccessException) { return "E\tKova on the remote PC is not allowed into that folder.\n"; }
             catch (Exception e) { return "E\t" + e.Message.Replace('\n', ' ').Replace('\t', ' ') + "\n"; }
+        }
+
+        /// <summary>A drive's label and space (", not ready" if it has no disk), as shown after its letter.</summary>
+        private static string DriveDetails(DriveInfo d)
+        {
+            try
+            {
+                if (!d.IsReady) return ", not ready";
+                return (d.VolumeLabel.Length > 0 ? " " + d.VolumeLabel : "") + ", " + FileChannel.Size(d.AvailableFreeSpace) + " free of " + FileChannel.Size(d.TotalSize);
+            }
+            catch { return ""; }
         }
 
         /// <summary>About this PC, one "Name: value" line each, for Remote PC info.</summary>

@@ -23,9 +23,11 @@ namespace TailRemote
             var item = new MenuItem(text) { Tag = KeepOpenTag };
             item.Click += (_, _) =>
             {
-                // Said before the setting's own handlers run, so their message follows it.
-                Speech.Speak(item.Checked ? "unchecked" : "checked");
+                // The setting's own handlers run inside this and often speak (interrupting). Said
+                // first, "checked" was cut off by their message and NVDA often never said the state;
+                // queued after them without interrupting, both are heard.
                 item.Checked = !item.Checked;
+                Speech.Speak(item.Checked ? "checked" : "unchecked", interrupt: false);
             };
             return item;
         }

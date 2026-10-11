@@ -43,6 +43,9 @@ namespace TailRemote
         private int _askedAfter, _sentAfter;
         private string? _sentWhat;
         private bool _picking;
+        // Which connection each was asked on, and when: see ForgetStale.
+        private Client? _pendingOn, _sentOn;
+        private long _pendingAt, _sentAt;
 
         private sealed record Entry(bool Folder, string Path, string Name, long Bytes, long Ticks);
 
@@ -155,6 +158,7 @@ namespace TailRemote
             if (_client() is not Client c) { _say("Not connected to the remote PC."); return; }
             if (!c.CanSendTo) { _say("The remote PC has an older Kova that cannot take files into a folder. Update it first."); return; }
             if (_picking) { _say("The file picker is already open."); return; }
+            ForgetStale();
             if (_sentInto != null) { _say("Still sending the last ones into " + _sentInto + ". Send more when they have gone."); return; }
             string into = _path;
             string[]? paths;
@@ -168,6 +172,8 @@ namespace TailRemote
             _sentWhat = what;
             if (_client() is not Client now || !now.SendFilesTo(paths, into)) { _say("Not connected to the remote PC, so nothing was sent."); return; }
             _sentInto = into;
+            _sentOn = now;
+            _sentAt = Environment.TickCount64;
             _say("Sending " + what + " into " + into + " on the remote PC. Kova says when it has gone.");
         }
 
@@ -182,7 +188,8 @@ namespace TailRemote
 
         private async void Up()
         {
-            if (_path.Length == 0) return;
+            // Backspace here used to do nothing at all, which sounds like a key that did not register.
+            if (_path.Length == 0) { _say("Already at the list of drives."); return; }
             // A drive's root goes back to the drives and usual folders; the folder just left is where you land.
             string trimmed = _path.TrimEnd('\\');
             string parent = trimmed.Length <= 2 ? "" : System.IO.Path.GetDirectoryName(trimmed) ?? "";
@@ -203,26 +210,35 @@ namespace TailRemote
                 var entries = text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(Parse).OfType<Entry>().ToList();
                 _path = path;
                 _where.Text = path.Length == 0 ? "Drives and usual folders" : path;
+                // T: the remote PC had more than it listed (it lists at most RemoteTools.MaxEntries).
+                bool more = text.Split('\n').Any(l => l.StartsWith("T\t"));
                 _list.BeginUpdate();
-                _filling = true;
-                _list.Items.Clear();
-                foreach (var e in entries)
+                // EndUpdate in finally: a problem while filling must not leave the list frozen, never redrawn.
+                try
                 {
-                    // "Desktop, folder", not the Size column saying "folder"; then how getting it went.
-                    var item = new ListViewItem(Label(e)) { Tag = e, Checked = _chosen.ContainsKey(e.Path) };
-                    item.SubItems.Add(e.Folder ? "" : FileChannel.Size(e.Bytes));
-                    item.SubItems.Add(e.Ticks > 0 ? new DateTime(e.Ticks, DateTimeKind.Utc).ToLocalTime().ToString("g") : "");
-                    _list.Items.Add(item);
+                    _filling = true;
+                    _list.Items.Clear();
+                    foreach (var e in entries)
+                    {
+                        // "Desktop, folder", not the Size column saying "folder"; then how getting it went.
+                        var item = new ListViewItem(Label(e)) { Tag = e, Checked = _chosen.ContainsKey(e.Path) };
+                        item.SubItems.Add(e.Folder ? "" : FileChannel.Size(e.Bytes));
+                        item.SubItems.Add(e.Ticks > 0 ? new DateTime(e.Ticks, DateTimeKind.Utc).ToLocalTime().ToString("g") : "");
+                        _list.Items.Add(item);
+                    }
                 }
-                _filling = false;
-                _list.EndUpdate();
+                finally
+                {
+                    _filling = false;
+                    _list.EndUpdate();
+                }
                 if (_list.Items.Count == 0) { _say("This folder is empty."); _list.Focus(); return; }
                 var land = _list.Items.Cast<ListViewItem>().FirstOrDefault(i => focus != null && string.Equals(((Entry)i.Tag!).Path.TrimEnd('\\'), focus.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
                     ?? _list.Items[0];
                 land.Selected = land.Focused = true;
                 land.EnsureVisible();
                 _list.Focus();
-                if (entries.Count >= RemoteTools.MaxEntries) _say("Only the first " + RemoteTools.MaxEntries + " are shown.");
+                if (more) _say("Only the first " + RemoteTools.MaxEntries + " are shown.");
             }
             catch (TimeoutException) { if (!IsDisposed) _say("The remote PC did not answer. Try again."); }
             catch (System.IO.IOException e) { if (!IsDisposed) _say("Could not list the folder: " + e.Message); }
@@ -245,8 +261,29 @@ namespace TailRemote
             return new Entry(p[0] == "D", p[1], p[2], bytes, ticks);
         }
 
+        /// <summary>
+        /// A Get or a sending whose end this window can no longer hear about must not block the next
+        /// one for as long as the window is open: after a reconnect (a new connection), or when no
+        /// transfer at all began within a minute of asking (the remote PC never answered).
+        /// </summary>
+        private void ForgetStale()
+        {
+            var now = _client();
+            long ms = Environment.TickCount64;
+            if (_pending != null && (now != _pendingOn || (FileChannel.Transfer.Latest == _askedAfter && ms - _pendingAt > 60_000)))
+            {
+                foreach (var e in _pending)
+                    if (_state.TryGetValue(e.Path, out var st) && st == "getting") _state.Remove(e.Path); // no longer known
+                _pending = null;
+                Relabel();
+            }
+            if (_sentInto != null && (now != _sentOn || (FileChannel.Transfer.Latest == _sentAfter && ms - _sentAt > 60_000)))
+                _sentInto = null;
+        }
+
         private void Get()
         {
+            ForgetStale();
             if (_pending != null) { _say("Still getting the last ones. Check more meanwhile, and Get them when those have arrived."); return; }
             var chosen = _chosen.Values.ToList();
             if (chosen.Count == 0) { _say("Nothing is checked. Check files and folders with Space, or Enter on a file, then Get."); return; }
@@ -255,6 +292,8 @@ namespace TailRemote
             _askedAfter = FileChannel.Transfer.Latest; // only a transfer begun after this can be the answer
             if (_client() is not Client client || !client.Fetch(chosen.Select(c => c.Path))) { _say("Not connected to the remote PC, so nothing was asked for."); return; }
             _pending = chosen;
+            _pendingOn = client;
+            _pendingAt = Environment.TickCount64;
             foreach (var c in chosen) _state[c.Path] = "getting";
             _chosen.Clear();
             _filling = true;

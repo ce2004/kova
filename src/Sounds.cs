@@ -162,11 +162,16 @@ namespace TailRemote
         }
 
         private static readonly Dictionary<string, byte[]> Cache = new();
-        // Every sound currently playing, kept alive until it is done: a single static field was
-        // overwritten by the next sound (rapid connect/disconnect, clipboard events...), leaving
-        // the one before it unreferenced and liable to be finalised mid-playback, cutting it off.
-        private static readonly List<SoundPlayer> Playing = new();
-        private static readonly object PlayingGate = new();
+
+        // One thread makes and starts every sound. Windows plays one SoundPlayer sound at a time (a
+        // new one stops the one before), so only the newest request matters: moving quickly
+        // through the Sounds lists used to queue a pool thread per sound, each asleep for the
+        // sound's whole length, and old previews kept starting after newer ones.
+        private static readonly object SlotGate = new();
+        private static (string Name, int Key)? _next;
+        private static System.Threading.Thread? _soundThread;
+        // The sound playing now, held so it is never finalised mid-playback (that cut it off).
+        private static SoundPlayer? _current;
 
         /// <summary>Plays an event's sound. Built and started in the background: the window never waits on a sound.</summary>
         public static void Play(Tone t)
@@ -176,34 +181,49 @@ namespace TailRemote
         }
 
         /// <summary>Plays a sound by name, in the background (the Sounds window previews with it).</summary>
-        public static void PlayNamed(string name) => System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        public static void PlayNamed(string name)
         {
-            SoundPlayer? player = null;
-            try
+            lock (SlotGate)
             {
-                if (Get(name) is not byte[] wav) return;
-                player = new SoundPlayer(new MemoryStream(wav));
-                lock (PlayingGate) Playing.Add(player);
-                player.Play();
-                // SoundPlayer has no "done playing" event of its own: the wav is 16-bit stereo
-                // PCM after a 44-byte header, so its length gives how long Play() will run for.
-                int ms = Math.Max(50, (int)((long)(wav.Length - 44) * 1000 / (Rate * 4)));
-                System.Threading.Thread.Sleep(ms);
-            }
-            catch { }
-            finally
-            {
-                if (player != null)
+                _next = (name, Key); // the key now: the Sounds window may put it back before this is made
+                if (_soundThread == null)
                 {
-                    lock (PlayingGate) Playing.Remove(player);
-                    try { player.Dispose(); } catch { }
+                    _soundThread = new System.Threading.Thread(SoundLoop) { IsBackground = true, Name = "Kova sounds" };
+                    _soundThread.Start();
                 }
+                System.Threading.Monitor.Pulse(SlotGate);
             }
-        });
+        }
+
+        private static void SoundLoop()
+        {
+            while (true)
+            {
+                (string Name, int Key) want;
+                lock (SlotGate)
+                {
+                    while (_next == null) System.Threading.Monitor.Wait(SlotGate);
+                    want = _next.Value;
+                    _next = null;
+                }
+                try
+                {
+                    if (Get(want.Name, want.Key) is not byte[] wav) continue;
+                    // A newer one came in while this was being made: play that one instead.
+                    lock (SlotGate) if (_next != null) continue;
+                    var player = new SoundPlayer(new MemoryStream(wav));
+                    player.Play(); // returns at once; stops whatever was playing
+                    var before = _current;
+                    _current = player;
+                    before?.Dispose();
+                }
+                catch { }
+            }
+        }
 
         public static void PlayNamedAndWait(string name)
         {
-            try { if (Get(name) is byte[] wav) new SoundPlayer(new MemoryStream(wav)).PlaySync(); } catch { }
+            try { if (Get(name, Key) is byte[] wav) new SoundPlayer(new MemoryStream(wav)).PlaySync(); } catch { }
         }
 
         public static void PlayAndWait(Tone t) => PlayNamedAndWait(Resolve(t, Choice(t)));
@@ -211,13 +231,12 @@ namespace TailRemote
         /// <summary>Decodes the piano in the background, so the first sounds play at once.</summary>
         public static void Warm() => System.Threading.ThreadPool.QueueUserWorkItem(_ =>
         {
-            foreach (Tone t in Enum.GetValues<Tone>()) try { Get(Default(t)); } catch { }
+            foreach (Tone t in Enum.GetValues<Tone>()) try { Get(Default(t), Key); } catch { }
         });
 
-        private static byte[]? Get(string name)
+        private static byte[]? Get(string name, int key)
         {
             if (name == NoSound) return null;
-            int key = Key;
             string cacheKey = name + "|" + key;
             lock (Cache)
             {

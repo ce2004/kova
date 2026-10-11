@@ -1,3 +1,88 @@
+4.0.0
+New feature: the mouse goes to the remote PC too. While you control it, moving the mouse, clicking and the wheel all happen there, and this PC's pointer stays put until you come back.
+Changed: Show the remote screen is now a checkbox in the File menu, like the other settings. Control Shift S turns it on and off.
+Changed: Escape in the remote screen window now goes back to the main window and leaves the screen on. Uncheck Show the remote screen, or press Control Shift S, to turn it off.
+New feature: NVDA plus T reads how many frames a second the remote screen is showing, in the screen window and in the main window while the screen is on.
+Changed: the internet speed tests are now called Measure this PC's internet speed and Measure the remote PC's internet speed, so each item in the File menu has its own letter.
+Changed: update Kova on both PCs to 4.0. Sending files and the clipboard between a 4.0 PC and an older one no longer works, so update the remote PC first (File, Update the remote PC), then this one.
+Bug fixed: if you pressed Disconnect while Kova was trying to reconnect, the Connect button could stop working until you restarted Kova. Now it always works.
+Bug fixed: if you changed the address, port or password while Kova was reconnecting, a new box asking for it opened every second, one inside the other. Now Kova stops trying and tells you to fix it and press Connect.
+Bug fixed: if you switched to Host mode while a connection was still being made, Kova kept reconnecting in the background with no way to stop it. Now Mode waits until connecting is done.
+Bug fixed: if you picked another saved PC while connected, Kova could name the wrong PC, park it under the wrong name, or reconnect to the wrong one. Now it always knows which PC is in front.
+Bug fixed: if you disconnected the last PC waiting in the background, Mode stayed greyed out. Now it is available straight away.
+Bug fixed: if you typed an address with a port, such as mypc:47120, Kova could not find it. Now the port goes into the Port setting by itself.
+Bug fixed: if the remote PC already had 100 people listening or controlling, the next one only heard that the connection closed. Now it hears why.
+Bug fixed: if a key or mouse button was held when the connection stalled for a moment, it could stay held down on the remote PC. Now it is always let go.
+Bug fixed: a stranger trickling in very slow logins could stop new PCs from connecting. Now every login must finish within a few seconds.
+Bug fixed: if two PCs behind the same router controlled one PC, a short Wi-Fi hiccup on one could disconnect it when the other reconnected. Now both stay connected.
+Bug fixed: if the remote PC stopped just as you connected, Kova could say connected while nothing worked. Now it notices and reconnects.
+Bug fixed: if you unplugged headphones or a Bluetooth speaker on either PC, Kova announced an audio problem and the sound stopped for a second. Now it moves to the new device quietly.
+Bug fixed: if a sound packet went missing, the next one could wait for the one after it, so the sound broke up more than it needed to at low quality. Now it plays as soon as its short wait is over.
+Bug fixed: if you switched back to a PC waiting in the background, the sound could be up to a third of a second late for a few minutes. Now it starts fresh.
+Bug fixed: messages from a PC waiting in the background sounded as if they came from the PC in front. Now they start with that PC's name.
+Bug fixed: if the login timed out on a slow line, Kova said the host closed the connection. Now it says there was no answer in time.
+Bug fixed: if you restored settings from a file that was not a Kova backup, Kova asked for its password first. Now it tells you straight away.
+Bug fixed: if logging could not write next to Kova (in Program Files without administrator rights), it said it was logging but wrote nothing. Now it writes to AppData, Local, Kova and says so.
+Bug fixed: the Wi-Fi note on the Streaming line stayed after you moved to a cable. Now it goes.
+Bug fixed: after the PC woke from sleep, Kova could note that its window had stopped responding for hours. Now sleep is not counted.
+Bug fixed: in Port editor, pressing Enter while a change was waiting for administrator permission started a second one. Now it waits.
+Bug fixed: if you restarted the remote PC and switched to another PC before it went down, Kova could later think the other PC was restarting. Now it only expects the restart from the PC you restarted.
+Bug fixed: if you sent a folder with more than a million files and folders, the sending PC waited forever. Now Kova says straight away that it is too many for one go.
+Bug fixed: if a file being sent was locked, deleted or not allowed, the other PC said the sending was stopped. Now both PCs say it failed and why.
+Bug fixed: if you used Get files on something that had just been deleted or moved, it said getting forever. Now it says nothing was there to get.
+Bug fixed: if you sent a big folder and pressed Stop or sent something else while Kova was still listing it, the old one could still go out after the newer one. Now it is dropped.
+Bug fixed: if you sent a whole drive, the other PC refused it with a confusing message about a path leaving the folder. Now it arrives in a folder called after the drive, such as D drive.
+Bug fixed: if you stopped a transfer, a file still being written could keep its full name even though it was cut off. Now every cut-off file is marked incomplete.
+Bug fixed: if a PC crashed or lost power while receiving, cut-off files looked finished. Now a file keeps "(incomplete)" in its name until all of it has arrived.
+Bug fixed: if you sent files or the clipboard to a PC running Kova as a service, they were saved as the system account rather than as the person signed in. Now they belong to the signed-in user, and Kova says so if nobody is signed in.
+Bug fixed: if a file or folder you sent had a name Windows cannot use, such as CON or one ending in a dot, the transfer failed with an unclear message. Now Kova says which name Windows does not allow.
+Bug fixed: if the remote PC sent you something while you were waiting in Get files, Get files could mark your files as got before they arrived. Now it only marks them when your own files arrive.
+Bug fixed: if you received files into a folder that is another drive mounted inside a folder, Kova checked the free space of the wrong drive. Now it checks the drive the files really go to.
+Bug fixed: if you watched a PC's screen from a PC that cannot play H.264 video (such as Windows N without the Media Feature Pack), the picture froze while things moved. Now it switches to still pictures and keeps up.
+Bug fixed: if the PC you watched had no Media Foundation (Windows N), the remote screen could fail instead of showing pictures. Now it shows still pictures.
+Bug fixed: if the line slowed down while things were moving on the remote screen, the video stopped and a whole still picture was sent in the middle of scrolling. Now the video carries on at the new size.
+Bug fixed: if the remote PC had a portrait or upside-down monitor, its screen arrived sideways. Now it shows the right way round.
+Bug fixed: if the remote PC's graphics chip had one hiccup while encoding video, it was never used again until Kova restarted. Now it is only set aside after three failures in a row, and tried again 10 minutes later.
+Bug fixed: if the remote PC's video encoder broke, the remote screen could freeze waiting for it. Now it switches to still pictures.
+Bug fixed: if you started watching just after the remote screen was locked or unlocked, the first picture could be black. Now the first picture shows the screen.
+Bug fixed: if two PCs watched the same screen at different quality levels on a PC without fast screen capture, the remote PC kept capturing the screen 30 times a second even when nothing changed. Now it slows down on a still screen.
+Bug fixed: if Kova ran as a service and the remote PC was busy, watching its screen could use a whole processor core. Now it waits a moment before trying again.
+Bug fixed: if you picked your own folder for received files while the Kova service was hosting, files kept going there after you closed Kova or another person signed in. Now they go back to the usual Downloads folder.
+Bug fixed: if you switched user on a PC running the Kova service, Kova in the first user's session kept getting clipboard text and files meant for whoever was at the screen. Now only the person at the screen gets them.
+Bug fixed: if the Kova service crashed, the helper it left behind could fight the new one, so keys sometimes went nowhere. Now the helper closes when the service does.
+Bug fixed: if turning the Kova service on or updating it failed partway, the service could be left stopped and the PC unreachable. Now the new copy is put in place before the service stops, and the service always starts again.
+Bug fixed: if the Kova service's helper kept failing, it was restarted every few seconds forever. Now it waits longer each time, up to once a minute.
+Bug fixed: if the Kova service's settings were damaged or could not be read, it quietly stopped hosting. Now it falls back to the copy kept before the last change, or says clearly in its log what is wrong.
+Bug fixed: if a service update could not get as far as starting, it was never rolled back. Now every start is counted, and an update only counts as good after it has really been hosting for 2 minutes.
+Bug fixed: if your Kova settings file was damaged, Kova started with everything reset and the old file was lost. Now it keeps a copy as settings.json.bad, and blank entries in the file no longer stop Kova from opening.
+Bug fixed: if you updated Kova without administrator rights, the Kova service did not update with it. Now it follows your update either way.
+Bug fixed: if a program named like a Windows tool (netsh, schtasks, powershell or sc) was in the same folder as Kova.exe, Kova could run it with administrator rights while changing a setting. Now Kova only runs Windows' own tools.
+Bug fixed: if the internet connection stalled partway through downloading VB-Cable, audio setup could wait forever, and a download that was cut short was not noticed. Now a stalled or cut-short download is tried again.
+Bug fixed: if the VB-Cable output had been turned off or renamed in the Sound settings, Set up audio device reinstalled it and asked for a restart every time. Now it turns the output back on and names it Kova.
+Bug fixed: if you moved to another port in the Port editor while Windows was asking for administrator permission, Open and Close came back on and could start a second change. Now they stay off until the change is done.
+Bug fixed: if Windows refused a firewall or start-with-Windows change after you gave permission, Kova said permission was not given. Now it tells you whether permission was refused or the change itself failed.
+Bug fixed: if audio setup could not reach vb-audio.com, Kova read out the countdown every second. Now it says it once and the countdown only shows on screen.
+Bug fixed: if you moved quickly through the lists in Sounds, older previews kept playing after newer ones. Now only the sound you are on plays.
+Bug fixed: if you turned a setting on or off in the menus, its own message often cut off "checked" or "unchecked". Now you hear both.
+Bug fixed: if you turned on Start hosting when Windows starts as a standard user and typed an administrator's password, the task was made for the administrator. Now it is made for you.
+Bug fixed: if you pressed Cancel while VB-Cable's installer was open, Kova said Cancelled even though the installer could still install. Now it tells you the installer is still open.
+Bug fixed: if you removed the Kova audio device, the default output went to whichever other output came first. Now it goes back to the one you had before setup, if it is still there.
+Bug fixed: if you updated Kova over a slow internet connection, the download gave up after five minutes and the update could never finish. Now it keeps going as long as data is still arriving.
+Bug fixed: if you opened Get files from the remote PC while it had a network drive that was not reachable, or an empty CD drive, the list of drives took ages and then failed. Now those drives show as not answering and the list appears straight away.
+Bug fixed: if you opened an empty CD drive or a sleeping disk in Get files from the remote PC, Kova said the folder was not there any more. Now it says the drive is not ready.
+Bug fixed: if a remote folder held exactly 5000 items, Kova said only the first 5000 were shown even though nothing was missing. Now it only says that when items really were left out.
+Bug fixed: if GitHub was limiting update checks, or a Wi-Fi sign-in page answered instead, Check for updates read out a confusing technical error. Now it says what happened and what to do.
+Bug fixed: if a Kova release had a tag like 4.0.0-beta, Check for updates failed with an error. Now it reads those versions correctly.
+Bug fixed: if you chose Update the remote PC, nothing was said until GitHub answered, and pressing it again asked twice. Now Kova says it is checking GitHub, waits at most 15 seconds, and tells you if a check is already running.
+Bug fixed: if you tried to send something while the Kova service was still on an older version, Kova could say it was updating and then say it could not ask it to. Now you hear one message once Kova knows what happened.
+Bug fixed: if a new version had long release notes, the update question box was taller than the screen. Now it shows the first 12 lines and points you to About, View the changelog for the rest.
+Bug fixed: if logging was on in both the Kova window and the Kova service, they wrote over each other in the same log file. Now the service writes its own file, Kova-service-log.txt.
+Bug fixed: if one ping in the internet speed test got lost, the whole test failed. Now a few lost pings are skipped. The speed result is also more accurate on slow connections.
+Bug fixed: if a virus scanner briefly held the new Kova file during an update, the update failed and wrongly told you to run Kova as administrator. Now Kova tries again for a few seconds, and only suggests administrator when the folder really cannot be changed.
+Bug fixed: if Kova restarted after an update, NVDA said nothing for up to 15 seconds. Now it says "Finishing the update." while it waits.
+Bug fixed: if you pressed Backspace at the list of drives in Get files from the remote PC, nothing was said. Now Kova says you are already at the list of drives.
+Bug fixed: if the connection dropped while files were being fetched or sent from Get files from the remote PC, Get and Send could stay blocked until you closed the window. Now they work again after a reconnect.
+
 3.1.0
 New feature: smooth video of the remote screen, up to 60 frames a second, the way game streaming and video calls do it. While things move on the remote PC, such as scrolling, dragging a window or a video playing, it streams H.264 video, using the remote PC's graphics chip when it has one and Windows' own encoder when it does not. As soon as things stop moving, an exact picture follows, every pixel as on the remote screen.
 New feature: the remote screen's title bar says how many frames a second are coming.

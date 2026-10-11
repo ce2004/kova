@@ -34,7 +34,14 @@ namespace TailRemote
         [DllImport("wlanapi.dll")] private static extern void WlanFreeMemory(IntPtr memory);
 
         /// <summary>Opens in the background: the Wi-Fi service can be slow to answer, and the window must never wait on it.</summary>
-        public WlanStreaming(string who) => _opened = System.Threading.Tasks.Task.Run(() => Open(who));
+        // Hosting and a connection can each hold one: the note is cleared only when the last one goes.
+        private static int _instances;
+
+        public WlanStreaming(string who)
+        {
+            System.Threading.Interlocked.Increment(ref _instances);
+            _opened = System.Threading.Tasks.Task.Run(() => Open(who));
+        }
 
         private void Open(string who)
         {
@@ -60,19 +67,27 @@ namespace TailRemote
                     }
                 }
                 finally { WlanFreeMemory(list); }
-                if (done.Count == 0) State = null; // no Wi-Fi in use now (on a cable): nothing to say about it
+                if (System.Threading.Volatile.Read(ref _disposed) != 0) { } // hosting or the connection ended while this was opening: say nothing
+                else if (done.Count == 0) State = null; // no Wi-Fi in use now (on a cable): nothing to say about it
                 else State = done.Exists(d => d.Contains("refused")) ? "Wi-Fi would not hold off its scans for networks (its driver refused)" : "Wi-Fi scans for networks held off while connected";
                 DiagLog.Write(who + ": Wi-Fi " + (done.Count == 0 ? "none" : string.Join("; ", done)));
             }
             catch (Exception e) { DiagLog.Write(who + ": Wi-Fi settings not changed: " + e.Message); }
         }
 
-        public void Dispose() => _opened.ContinueWith(_ =>
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0 && System.Threading.Interlocked.Decrement(ref _instances) == 0) State = null;
+            CloseLater();
+        }
+
+        private void CloseLater() => _opened.ContinueWith(_ =>
         {
             if (_handle == IntPtr.Zero) return;
             try { WlanCloseHandle(_handle, IntPtr.Zero); } catch { } // Windows restores both settings
             _handle = IntPtr.Zero;
-            State = null;
         });
     }
 }

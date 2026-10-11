@@ -544,25 +544,28 @@ namespace TailRemote
             }
             Log("Updating the service to version " + r.Version + ".");
             reply?.Invoke("The remote PC's Kova service is downloading " + r.Version + ". Everything carries on until it is ready.");
-            byte[] data;
-            using (var h = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMinutes(10) })
-            {
-                h.DefaultRequestHeaders.UserAgent.ParseAdd("Kova-service/" + Updater.Current);
-                data = h.GetByteArrayAsync(r.Url).GetAwaiter().GetResult();
-            }
-            if (r.Sha256 == null || !Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data)).Equals(r.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("the download did not match GitHub's fingerprint, so it was not used");
+            if (r.Sha256 == null) throw new InvalidOperationException("GitHub gave no fingerprint for the download, so it was not used");
             string exe = Environment.ProcessPath!, fresh = exe + ".new", old = exe + ".old";
-            File.WriteAllBytes(fresh, data);
-            try { File.Delete(old); } catch { }
+            // Streamed and checked as it comes, for as long as data keeps arriving: a whole-download time limit
+            // meant a slow line could never update the service. A damaged download throws and changes nothing.
+            try { Updater.DownloadAsync(r.Url, fresh, r.Sha256).GetAwaiter().GetResult(); }
+            catch { try { File.Delete(fresh); } catch { } throw; }
+            // This copy is itself still on trial (updated less than 2 minutes of hosting ago): the copy kept
+            // from before it is the last one known to work, and stays the one to go back to.
+            string[]? trial = null;
+            try { if (File.Exists(RollbackNote)) trial = File.ReadAllLines(RollbackNote); } catch { }
+            bool keepPrevious = trial is { Length: >= 2 } && File.Exists(trial[0]);
+            if (!keepPrevious || !string.Equals(Path.GetFullPath(trial![0]), Path.GetFullPath(old), StringComparison.OrdinalIgnoreCase))
+                try { File.Delete(old); } catch { }
             // Still there (antivirus, a lingering handle): a name of its own, cleared up later
             // with the other leftovers, rather than every update failing until it is freed.
             if (File.Exists(old)) old = exe + ".old-" + DateTime.UtcNow.Ticks;
             File.Move(exe, old);       // a running exe can be renamed, not overwritten
             try { File.Move(fresh, exe); }
             catch { File.Move(old, exe); throw; }
-            // Until the new copy has run for 2 minutes, the old one is kept and can come back.
-            try { File.WriteAllLines(RollbackNote, new[] { old, Updater.Current.ToString(), "0" }); } catch { }
+            // Until the new copy has run for 2 minutes, the old one is kept and can come back (or, if this
+            // copy was still on trial, the one before it that is known to work).
+            try { File.WriteAllLines(RollbackNote, keepPrevious ? new[] { trial![0], trial[1], "0" } : new[] { old, Updater.Current.ToString(), "0" }); } catch { }
             _restartingTo = r.Version.ToString();
             Restarting = true;
         }

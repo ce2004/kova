@@ -7,10 +7,11 @@ namespace TailRemote
 {
     /// <summary>
     /// The optional diagnostic log: Enable logging in the main window (or the
-    /// service's settings). Writes TailRemote-log.txt next to the exe, one line
-    /// per event and one status line a second from each side, all timestamped
-    /// to the millisecond. Never what is typed: key presses are only counted.
-    /// At 20 MB the file becomes TailRemote-log.old.txt and a new one starts.
+    /// service's settings). Writes Kova-log.txt next to the exe (the service:
+    /// Kova-service-log.txt), one line per event and one status line a second
+    /// from each side, all timestamped to the millisecond. Never what is typed:
+    /// key presses are only counted. At 20 MB the file becomes Kova-log.old.txt
+    /// and a new one starts.
     /// </summary>
     internal static class DiagLog
     {
@@ -23,7 +24,16 @@ namespace TailRemote
         // Next to Kova, unless that folder can't be written (a copy in Program Files run without
         // administrator): then in AppData\Local\Kova, and FilePath says so, rather than claiming to log.
         private static string? _fallback;
-        private static string NextToKova => Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "Kova-log.txt");
+        // The service and the window often run the same Kova.exe from the same folder, and with one
+        // file name they wrote over each other's lines. The service (started as "Kova.exe --service")
+        // keeps its own file.
+        private static readonly string FileName = IsService() ? "Kova-service-log.txt" : "Kova-log.txt";
+        private static bool IsService()
+        {
+            try { var a = Environment.GetCommandLineArgs(); return a.Length == 2 && a[1] == "--service"; }
+            catch { return false; }
+        }
+        private static string NextToKova => Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, FileName);
         public static string FilePath => _fallback ?? NextToKova;
 
         public static bool Enabled
@@ -99,7 +109,7 @@ namespace TailRemote
                 {
                     string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Kova");
                     Directory.CreateDirectory(dir);
-                    _fallback = Path.Combine(dir, "Kova-log.txt");
+                    _fallback = Path.Combine(dir, FileName);
                     var fs = new FileStream(_fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
                     _writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = false };
                 }

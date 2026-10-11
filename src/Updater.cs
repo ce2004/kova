@@ -32,36 +32,115 @@ namespace TailRemote
         private static string AssetName =>
             "Kova-" + (RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64") + ".exe";
 
+        // No overall time limit on the client: a 33 MB download over a slow line can take far longer
+        // than any fixed limit (five minutes used to mean a slow line could never update). Asking
+        // GitHub what is newest has its own limit (ApiLimit), and the download is given up only
+        // when nothing at all arrives for StallLimit.
         private static HttpClient Http()
         {
-            var h = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            var h = new HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
             h.DefaultRequestHeaders.UserAgent.ParseAdd("Kova/" + Current);
             return h;
         }
 
-        /// <summary>The newest version on GitHub, whatever this copy is.</summary>
-        public static async Task<Version> LatestAsync()
+        private static readonly TimeSpan ApiLimit = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan StallLimit = TimeSpan.FromSeconds(60);
+        private const string WebPageInstead = "The internet connection answered with a web page instead of GitHub (a Wi-Fi sign-in page?).";
+
+        /// <summary>
+        /// A release tag as a three-part version: "v4.0.0", "V4.0.0", "4.0.0-beta", "4.0.0+build",
+        /// "4.0" and "4.0.0.1" all work (the fourth part is dropped, a missing third is 0). Null when
+        /// it is not a version at all. Version.Parse alone failed on everything but "v4.0.0".
+        /// </summary>
+        public static Version? NormalizeTag(string? tag)
+        {
+            if (string.IsNullOrWhiteSpace(tag)) return null;
+            string t = tag.Trim().TrimStart('v', 'V');
+            int cut = t.IndexOfAny(new[] { '-', '+', ' ' });
+            if (cut >= 0) t = t[..cut];
+            if (Version.TryParse(t, out var v)) return new Version(v.Major, v.Minor, Math.Max(0, v.Build));
+            return int.TryParse(t, out int major) && major >= 0 ? new Version(major, 0, 0) : null;
+        }
+
+        /// <summary>What GitHub's newest release says: its version, notes, and this PC's download (null if it has none).</summary>
+        internal sealed record Parsed(Version Version, string Notes, string? Url, string? Sha256);
+
+        /// <summary>
+        /// Reads GitHub's answer about the newest release. Anything missing or odd is a plain sentence,
+        /// never a raw exception: a Wi-Fi sign-in page answering instead, an empty answer, a release
+        /// with no files yet, or notes that are null.
+        /// </summary>
+        internal static Parsed ParseRelease(string text, string asset)
+        {
+            if (LooksLikeWebPage(text)) throw new InvalidOperationException(WebPageInstead);
+            JsonDocument doc;
+            try { doc = JsonDocument.Parse(text); }
+            catch (JsonException) { throw new InvalidOperationException(WebPageInstead); }
+            using (doc)
+            {
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object ||
+                    !root.TryGetProperty("tag_name", out var tagEl) || tagEl.ValueKind != JsonValueKind.String ||
+                    NormalizeTag(tagEl.GetString()) is not Version version)
+                    throw new InvalidOperationException("GitHub's answer about the newest Kova could not be understood. Try again later.");
+                string notes = root.TryGetProperty("body", out var b) && b.ValueKind == JsonValueKind.String ? b.GetString() ?? "" : "";
+                if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var a in assets.EnumerateArray())
+                    {
+                        if (a.ValueKind != JsonValueKind.Object || !a.TryGetProperty("name", out var n) || n.ValueKind != JsonValueKind.String || n.GetString() != asset) continue;
+                        if (!a.TryGetProperty("browser_download_url", out var u) || u.ValueKind != JsonValueKind.String) continue;
+                        string? sha = a.TryGetProperty("digest", out var d) && d.ValueKind == JsonValueKind.String && d.GetString() is string ds && ds.StartsWith("sha256:") ? ds[7..] : null;
+                        return new Parsed(version, notes, u.GetString(), sha);
+                    }
+                }
+                return new Parsed(version, notes, null, null);
+            }
+        }
+
+        private static bool LooksLikeWebPage(string text)
+        {
+            string t = text.TrimStart();
+            return t.StartsWith("<", StringComparison.Ordinal);
+        }
+
+        /// <summary>GitHub's newest release as text, with every way that can fail said in plain words.</summary>
+        private static async Task<string> ReleaseJsonAsync()
         {
             using var h = Http();
-            using var doc = JsonDocument.Parse(await h.GetStringAsync("https://api.github.com/repos/" + Repo + "/releases/latest"));
-            return Version.Parse(doc.RootElement.GetProperty("tag_name").GetString()!.TrimStart('v'));
+            using var limit = new System.Threading.CancellationTokenSource(ApiLimit);
+            try
+            {
+                using var resp = await h.GetAsync("https://api.github.com/repos/" + Repo + "/releases/latest", limit.Token);
+                string text = await resp.Content.ReadAsStringAsync(limit.Token);
+                // A sign-in page can answer with any status, so it is recognised first.
+                if (resp.Content.Headers.ContentType?.MediaType == "text/html" || LooksLikeWebPage(text)) throw new InvalidOperationException(WebPageInstead);
+                // GitHub allows 60 questions an hour from one internet address; past that it answers 403 or 429.
+                if ((int)resp.StatusCode is 403 or 429) throw new InvalidOperationException("GitHub is limiting update checks right now. Try again in an hour.");
+                if (!resp.IsSuccessStatusCode)
+                    throw new InvalidOperationException("GitHub answered " + (int)resp.StatusCode + " " + resp.ReasonPhrase + " when asked for the newest Kova. Try again later.");
+                return text;
+            }
+            catch (OperationCanceledException) when (limit.IsCancellationRequested)
+            {
+                throw new InvalidOperationException("GitHub did not answer. Check the internet connection and try again.");
+            }
+            catch (HttpRequestException e)
+            {
+                throw new InvalidOperationException("Could not reach GitHub: " + e.Message, e);
+            }
         }
+
+        /// <summary>The newest version on GitHub, whatever this copy is.</summary>
+        public static async Task<Version> LatestAsync() => ParseRelease(await ReleaseJsonAsync(), AssetName).Version;
 
         /// <summary>The latest release, or null when this copy is already up to date.</summary>
         public static async Task<Release?> CheckAsync()
         {
-            using var h = Http();
-            using var doc = JsonDocument.Parse(await h.GetStringAsync("https://api.github.com/repos/" + Repo + "/releases/latest"));
-            var root = doc.RootElement;
-            var version = Version.Parse(root.GetProperty("tag_name").GetString()!.TrimStart('v'));
-            if (version <= Current) return null;
-            foreach (var a in root.GetProperty("assets").EnumerateArray())
-            {
-                if (a.GetProperty("name").GetString() != AssetName) continue;
-                string? sha = a.TryGetProperty("digest", out var d) && d.GetString() is string ds && ds.StartsWith("sha256:") ? ds[7..] : null;
-                return new Release(version, root.GetProperty("body").GetString() ?? "", a.GetProperty("browser_download_url").GetString()!, sha);
-            }
-            throw new InvalidOperationException("Version " + version + " has no " + AssetName + ".");
+            var p = ParseRelease(await ReleaseJsonAsync(), AssetName);
+            if (p.Version <= Current) return null;
+            if (p.Url == null) throw new InvalidOperationException("Version " + p.Version + " has no " + AssetName + " yet. Try again later.");
+            return new Release(p.Version, p.Notes, p.Url, p.Sha256);
         }
 
         /// <summary>
@@ -74,17 +153,12 @@ namespace TailRemote
         {
             string exe = Environment.ProcessPath!;
             string fresh = exe + ".new", old = exe + ".old";
+            // No checksum from GitHub means nothing to check against: refuse before downloading
+            // 33 MB for nothing, rather than after.
+            if (r.Sha256 == null) throw new InvalidOperationException("GitHub gave no checksum for the download, so it was not installed. Try again later.");
             try
             {
-                using (var h = Http())
-                {
-                    byte[] data = await h.GetByteArrayAsync(r.Url);
-                    // No checksum from GitHub means nothing to check against: refuse rather than trust it.
-                    if (r.Sha256 == null) throw new InvalidOperationException("GitHub gave no checksum for the download, so it was not installed. Try again later.");
-                    if (!Convert.ToHexString(SHA256.HashData(data)).Equals(r.Sha256, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidOperationException("The download was damaged. Nothing was changed.");
-                    await File.WriteAllBytesAsync(fresh, data);
-                }
+                await DownloadAsync(r.Url, fresh, r.Sha256);
                 // The running copy is swapped for the new one (Windows lets a running program be
                 // renamed or replaced, not deleted). If an older leftover cannot be deleted (a
                 // TailRemote still running from it, or a virus scan holding it), it is left alone
@@ -95,18 +169,36 @@ namespace TailRemote
                 // of two separate File.Move calls, so a kill between steps can no longer leave no exe
                 // at all behind. It deletes/overwrites the backup path itself if one already exists,
                 // so it does not need "old" to be absent first.
-                File.Replace(fresh, exe, old, ignoreMetadataErrors: true);
+                // A read-only exe (copied from a CD or a zip that kept the flag) refuses to be replaced.
+                ClearReadOnly(exe);
+                // A virus scan often opens the brand new file for a moment just as it is written:
+                // that is a sharing error that clears by itself, so it is tried a few more times.
+                for (int attempt = 1; ; attempt++)
+                {
+                    // Half done (the old copy already moved aside, the new one not in yet): finish it by hand.
+                    if (!File.Exists(exe) && File.Exists(fresh)) { File.Move(fresh, exe); break; }
+                    try { File.Replace(fresh, exe, old, ignoreMetadataErrors: true); break; }
+                    catch (IOException) when (attempt < 5) { await Task.Delay(500); }
+                }
             }
             catch (Exception e)
             {
                 // Leave nothing half-done behind: the running exe stays where it was.
                 try { if (!File.Exists(exe) && File.Exists(old)) File.Move(old, exe); } catch { }
-                try { File.Delete(fresh); } catch { }
-                // In Program Files, a copy not running as administrator cannot change its own folder,
-                // and "Access to the path ... is denied" says nothing about what to do.
+                try { ClearReadOnly(fresh); File.Delete(fresh); } catch { }
                 if (e is UnauthorizedAccessException)
-                    throw new InvalidOperationException("Nothing was changed. Kova is in " + Path.GetDirectoryName(exe) +
-                        ", and this copy could not change it (" + e.Message + "). If Kova is in Program Files, open it with Run as administrator, then update again.", e);
+                {
+                    string dir = Path.GetDirectoryName(exe)!;
+                    // In Program Files, a copy not running as administrator cannot change its own folder,
+                    // and "Access to the path ... is denied" says nothing about what to do. But only then:
+                    // when the folder can be written, something else holds the file, and running as
+                    // administrator would not help.
+                    if (!CanWriteIn(dir))
+                        throw new InvalidOperationException("Nothing was changed. Kova is in " + dir +
+                            ", and this copy could not change it (" + e.Message + "). If Kova is in Program Files, open it with Run as administrator, then update again.", e);
+                    throw new InvalidOperationException("Nothing was changed. Kova could not swap in the new copy (" + e.Message +
+                        "). Another program, such as a virus scan, may be holding it. Try again in a minute.", e);
+                }
                 throw;
             }
             string args = beforeStart();
@@ -125,10 +217,87 @@ namespace TailRemote
             }
         }
 
-        /// <summary>At startup after an update: wait for the old copy to exit, then delete every leftover it can.</summary>
-        public static void FinishUpdate(int oldPid)
+        /// <summary>
+        /// Streams the download into the .new file, hashing as it goes, and checks the hash at the end.
+        /// Given up only when nothing arrives for a whole minute: a slow line keeps going as long as
+        /// it keeps moving.
+        /// </summary>
+        internal static async Task DownloadAsync(string url, string fresh, string sha256) // the service's own updates use it too
         {
-            try { Process.GetProcessById(oldPid).WaitForExit(15000); } catch { }
+            using var h = Http();
+            using var stall = new System.Threading.CancellationTokenSource(StallLimit);
+            try
+            {
+                using var resp = await h.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, stall.Token);
+                if (resp.Content.Headers.ContentType?.MediaType == "text/html") throw new InvalidOperationException(WebPageInstead + " Nothing was changed.");
+                resp.EnsureSuccessStatusCode();
+                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                ClearReadOnly(fresh); // a read-only leftover from an earlier try cannot be written over
+                await using (var src = await resp.Content.ReadAsStreamAsync(stall.Token))
+                await using (var dst = new FileStream(fresh, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+                {
+                    byte[] buf = new byte[1 << 16];
+                    int n;
+                    stall.CancelAfter(StallLimit);
+                    while ((n = await src.ReadAsync(buf, stall.Token)) > 0)
+                    {
+                        stall.CancelAfter(StallLimit); // something arrived: the minute starts again
+                        hash.AppendData(buf, 0, n);
+                        await dst.WriteAsync(buf.AsMemory(0, n), stall.Token);
+                    }
+                }
+                if (!Convert.ToHexString(hash.GetHashAndReset()).Equals(sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The download was damaged. Nothing was changed.");
+            }
+            catch (OperationCanceledException) when (stall.IsCancellationRequested)
+            {
+                throw new IOException("The download stopped: nothing arrived for a minute. Nothing was changed. Try again when the connection is better.");
+            }
+            catch (HttpRequestException e)
+            {
+                throw new IOException("The download failed: " + e.Message + " Nothing was changed.", e);
+            }
+        }
+
+        private static void ClearReadOnly(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                var a = File.GetAttributes(path);
+                if ((a & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, a & ~FileAttributes.ReadOnly);
+            }
+            catch { }
+        }
+
+        /// <summary>Can this copy make a file in that folder? (Program Files without administrator cannot.)</summary>
+        private static bool CanWriteIn(string dir)
+        {
+            try
+            {
+                using (new FileStream(Path.Combine(dir, "Kova-write-test-" + Guid.NewGuid().ToString("N") + ".tmp"), FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose)) { }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// At startup after an update: wait for the old copy to exit, then delete every leftover it can.
+        /// stillRunning is called first if the old copy has not gone yet, so NVDA says something
+        /// during the wait instead of a silence of up to 15 seconds.
+        /// </summary>
+        public static void FinishUpdate(int oldPid, Action? stillRunning = null)
+        {
+            try
+            {
+                using var p = Process.GetProcessById(oldPid);
+                if (!p.WaitForExit(300))
+                {
+                    stillRunning?.Invoke();
+                    p.WaitForExit(15000);
+                }
+            }
+            catch { }
             // In the background: when the service runs the same file, its running copy is one of the
             // leftovers and cannot go until it restarts, and five seconds of retries here held up
             // everything, NVDA's first words included.

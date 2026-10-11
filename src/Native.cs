@@ -144,12 +144,21 @@ namespace TailRemote
             _desktopName = null;
         }
 
-        /// <summary>Runs a console program with no window; its exit code, or -1 if it would not start.</summary>
+        /// <summary>
+        /// A Windows tool's full path in System32 ("netsh" or "netsh.exe" gives C:\Windows\System32\netsh.exe).
+        /// A bare name is looked for next to Kova.exe first, so a fake netsh.exe dropped in the
+        /// Downloads folder beside it would have run as administrator in the elevated copies.
+        /// </summary>
+        public static string SystemTool(string name) =>
+            System.IO.Path.IsPathRooted(name) ? name
+            : System.IO.Path.Combine(Environment.SystemDirectory, System.IO.Path.HasExtension(name) ? name : name + ".exe");
+
+        /// <summary>Runs a console program with no window; its exit code, or -1 if it would not start. Bare names are Windows' own tools, from System32.</summary>
         public static int RunHidden(string file, string args)
         {
             try
             {
-                using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(file, args)
+                using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(SystemTool(file), args)
                     { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true })!;
                 var errors = p.StandardError.ReadToEndAsync(); // both pipes are read, so a chatty program never blocks on a full one
                 p.StandardOutput.ReadToEnd();

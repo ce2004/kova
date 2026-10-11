@@ -71,12 +71,22 @@ namespace TailRemote
         private static async Task<(int Ping, int Jitter)> Ping(HttpClient http)
         {
             var times = new List<double>();
+            Exception? last = null;
+            bool warm = false;
             for (int i = 0; i < 13; i++)
             {
-                var clock = Stopwatch.StartNew();
-                using var resp = await http.GetAsync(Server + "/__down?bytes=0", HttpCompletionOption.ResponseHeadersRead).WaitAsync(TimeSpan.FromSeconds(10));
-                if (i > 0) times.Add(clock.Elapsed.TotalMilliseconds); // the first one also opens the connection
+                // One lost request on a busy line used to end the whole test: now it is skipped, and
+                // the test fails only if fewer than 5 answered.
+                try
+                {
+                    var clock = Stopwatch.StartNew();
+                    using var resp = await http.GetAsync(Server + "/__down?bytes=0", HttpCompletionOption.ResponseHeadersRead).WaitAsync(TimeSpan.FromSeconds(warm ? 5 : 10));
+                    if (warm) times.Add(clock.Elapsed.TotalMilliseconds); // the first answer also opened the connection
+                    warm = true;
+                }
+                catch (Exception e) { last = e; }
             }
+            if (times.Count < 5) throw new IOException("Cloudflare's speed test server did not answer" + (last != null ? ": " + last.Message : "."));
             var sorted = times.OrderBy(t => t).ToList();
             double jitter = times.Zip(times.Skip(1), (a, b) => Math.Abs(a - b)).Average();
             return ((int)Math.Round(sorted[sorted.Count / 2]), (int)Math.Round(jitter));
@@ -89,13 +99,19 @@ namespace TailRemote
         /// </summary>
         private static async Task<double> Measure(int streams, Func<CancellationToken, Action<long>, Task> one, Action<long> total)
         {
-            long moved = 0, atOneSecond = -1;
+            long moved = 0, atOneSecond = -1, baselineMs = -1;
             using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(8));
             var clock = Stopwatch.StartNew();
             void Count(long n)
             {
-                if (Interlocked.Add(ref moved, n) >= MaxBytes) stop.Cancel();
-                if (atOneSecond < 0 && clock.ElapsedMilliseconds >= 1000) Interlocked.CompareExchange(ref atOneSecond, Interlocked.Read(ref moved), -1);
+                long now = Interlocked.Add(ref moved, n);
+                if (now >= MaxBytes) stop.Cancel();
+                // The first count after one second is the starting point, and when it really happened is
+                // kept too: on a slow line it can be well after one second, and dividing by "all but one
+                // second" then counted the bytes over too long and said the line was slower than it is.
+                if (Interlocked.Read(ref atOneSecond) < 0 && clock.ElapsedMilliseconds >= 1000 &&
+                    Interlocked.CompareExchange(ref atOneSecond, now, -1) == -1)
+                    Interlocked.Exchange(ref baselineMs, clock.ElapsedMilliseconds);
             }
             string? problem = null;
             var tasks = Enumerable.Range(0, streams).Select(_ => Task.Run(async () =>
@@ -108,13 +124,15 @@ namespace TailRemote
                 }
             })).ToArray();
             try { await Task.WhenAll(tasks); } catch { }
-            double secs = Math.Max(0.5, clock.Elapsed.TotalSeconds - 1);
+            double end = clock.Elapsed.TotalSeconds;
             long all = Interlocked.Read(ref moved);
             // Nothing moved is not a speed of zero: the test could not run (blocked, refused, offline).
             if (all < 1 << 20 && problem != null) throw new IOException("Cloudflare's speed test server could not be used: " + problem);
             total(all);
-            long counted = all - Math.Max(0, Interlocked.Read(ref atOneSecond));
-            return counted * 8 / secs;
+            long baseline = Interlocked.Read(ref atOneSecond), startMs = Interlocked.Read(ref baselineMs);
+            // Nothing counted after the first second (it all came at once, or stopped early): the whole time it took.
+            if (baseline < 0 || startMs < 0) return all * 8 / Math.Max(0.5, end);
+            return (all - baseline) * 8 / Math.Max(0.5, end - startMs / 1000.0);
         }
 
         private static async Task Download(HttpClient http, CancellationToken token, Action<long> count)

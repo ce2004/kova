@@ -23,6 +23,10 @@ namespace TailRemote
         private readonly Button _add = new() { Text = "&Add and open", AutoSize = true };
         private readonly Button _done = new() { Text = "&Done", AutoSize = true, DialogResult = DialogResult.OK };
         private readonly Dictionary<int, bool?> _state = new();
+        // A change is waiting on its administrator prompt: no other button may start a second one.
+        private bool _busy;
+        // Counts changes per port, so the slow first check never writes back an answer older than a change's.
+        private readonly Dictionary<int, int> _changes = new();
 
         public PortEditorForm(Settings settings)
         {
@@ -69,8 +73,10 @@ namespace TailRemote
             // Checking takes a moment per port; do it off the window's thread.
             foreach (int p in _state.Keys.ToList())
             {
+                int before = _changes.GetValueOrDefault(p);
                 bool open = await Task.Run(() => Firewall.IsOpen(p));
                 if (IsDisposed) return;
+                if (_changes.GetValueOrDefault(p) != before) continue; // opened or closed meanwhile: that answer is newer
                 _state[p] = open;
                 Refill();
             }
@@ -98,8 +104,9 @@ namespace TailRemote
         private void UpdateButtons()
         {
             int? p = Selected;
-            _open.Enabled = p != null && _state[p.Value] != true;
-            _close.Enabled = p != null && _state[p.Value] != false;
+            _open.Enabled = !_busy && p != null && _state[p.Value] != true;
+            _close.Enabled = !_busy && p != null && _state[p.Value] != false;
+            _add.Enabled = !_busy;
         }
 
         private void Add()
@@ -116,21 +123,33 @@ namespace TailRemote
 
         private async void Change(int? port, bool open)
         {
-            if (port == null) return;
+            if (port == null || _busy) return;
             int p = port.Value;
             Speech.Speak((open ? "Opening port " : "Closing port ") + p + ". Windows asks for administrator permission.");
-            _open.Enabled = _close.Enabled = _add.Enabled = false;
-            bool ok = await Firewall.SetAsync(p, open);
-            if (IsDisposed) return;
-            // Checking takes a moment; do it off the window's thread, as OnShown does.
-            _state[p] = await Task.Run(() => Firewall.IsOpen(p));
-            if (IsDisposed) return;
+            // Kept off until the change is over: selecting another port used to turn Open and Close
+            // back on while the prompt was still up, and a second press started a second change.
+            _busy = true;
+            _changes[p] = _changes.GetValueOrDefault(p) + 1;
+            UpdateButtons();
+            ChangeResult result;
+            try
+            {
+                result = await Firewall.ChangeAsync(p, open);
+                if (IsDisposed) return;
+                // Checking takes a moment; do it off the window's thread, as OnShown does.
+                _state[p] = await Task.Run(() => Firewall.IsOpen(p));
+                if (IsDisposed) return;
+            }
+            finally { _busy = false; }
+            _changes[p]++;
             Refill();
-            _add.Enabled = true;
             _list.Focus();
-            Speech.Speak(ok
-                ? "Port " + p + (open ? " is open." : " is closed.")
-                : "Port " + p + " was not changed: administrator permission was not given.");
+            Speech.Speak(result switch
+            {
+                ChangeResult.Done => "Port " + p + (open ? " is open." : " is closed."),
+                ChangeResult.Declined => "Port " + p + " was not changed: administrator permission was not given.",
+                _ => "Port " + p + " could not be " + (open ? "opened" : "closed") + ": Windows Firewall did not take the change.",
+            });
         }
 
         /// <summary>Adds a port to the record of ports TailRemote has used.</summary>

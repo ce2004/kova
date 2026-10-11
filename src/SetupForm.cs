@@ -66,7 +66,10 @@ namespace TailRemote
             _button.Text = "Close";
         }
 
-        /// <summary>Status text, and a percentage (or -1 for "working, no percentage").</summary>
+        /// <summary>For Report: working, no percentage, and the text is only shown, not spoken (a countdown that changes every second).</summary>
+        public const int ShowOnly = -2;
+
+        /// <summary>Status text, and a percentage (or -1 for "working, no percentage", or ShowOnly).</summary>
         private void Report(string text, int percent)
         {
             // Called from the work's own thread. Once the window is closed this must do
@@ -80,7 +83,8 @@ namespace TailRemote
             }
             if (percent < 0) _bar.Style = ProgressBarStyle.Marquee;
             else { _bar.Style = ProgressBarStyle.Blocks; _bar.Value = Math.Clamp(percent, 0, 100); }
-            if (text != _status.Text) Say(text);
+            if (percent == ShowOnly) { _status.Text = text; _status.AccessibleName = text; }
+            else if (text != _status.Text) Say(text);
         }
 
         private void Say(string text)
