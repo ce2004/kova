@@ -67,6 +67,20 @@ namespace TailRemote
 
         internal static readonly object KeepOpenTag = new();
 
+        /// <summary>
+        /// Empties a menu for good. Clear() alone keeps every removed item's handles and drop-down alive (Windows
+        /// Forms never lets go of them), and menus rebuilt on every transfer or switch added up over months.
+        /// </summary>
+        internal static void ClearAndDispose(ToolStripItemCollection items)
+        {
+            for (int i = items.Count - 1; i >= 0; i--)
+            {
+                var item = items[i];
+                items.RemoveAt(i);
+                item.Dispose();
+            }
+        }
+
         // When a key that means "open this" (Right, Enter, a letter) or a mouse click last came in.
         private static long _openAsked;
 
@@ -122,7 +136,10 @@ namespace TailRemote
             {
                 if (_keepOpen && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
             };
-            dd.ItemAdded += (_, e) => { if (e.Item is ToolStripMenuItem sub) Attach(sub); };
+            // Only items with a submenu of their own: asking a plain item for its drop-down makes one (a whole
+            // ToolStrip Windows Forms remembers for good), and items added later (history lines, saved PCs,
+            // file bars) are added and replaced thousands of times over months.
+            dd.ItemAdded += (_, e) => { if (e.Item is ToolStripMenuItem { HasDropDownItems: true } sub) Attach(sub); };
             foreach (ToolStripItem i in menu.DropDownItems)
                 if (i is ToolStripMenuItem sub) Attach(sub);
         }
@@ -155,7 +172,7 @@ namespace TailRemote
         {
             _names.Clear();
             _index = -1;
-            Menu.DropDownItems.Clear();
+            Menus.ClearAndDispose(Menu.DropDownItems);
             Menu.Text = _title;
         }
 

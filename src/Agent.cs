@@ -180,7 +180,7 @@ namespace TailRemote
             // the PC's screens, as each viewer chooses.
             var screens = new ScreenSource();
             AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), (kind, a, b) => Native.SendMouse(kind, a, b), clip.Arrived, clip.FilesArrived, reader.Read,
-                new ScreenVideo(screens.Take, screens.Screens));
+                new ScreenVideo(screens.Take, screens.Screens, screens.Idle)); // Idle: nothing of the screen is held while nobody watches
             return 0;
         }
 

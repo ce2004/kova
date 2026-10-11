@@ -1,3 +1,15 @@
+4.1.2
+Changed: Kova is now built to run for months and years without a restart. A new soak test repeats connecting, sending files, watching the screen and rebuilding menus round after round, and checks that memory, handles and threads stay flat.
+Bug fixed: Kova's memory slowly grew every time a transfer finished, a menu was rebuilt or you switched between PCs. Old menu items are now let go properly.
+Bug fixed: Kova checked the sound device every second and left a little behind each time. Over days that added up. It now cleans up after every check, and when a sound device refuses to open.
+Bug fixed: after you watched the remote screen, the remote PC kept a copy of the screen and its video encoder in memory, up to a few hundred megabytes on big screens. Now they are let go when nobody is watching, or when the screen window is minimized.
+Bug fixed: on a remote PC running the Kova service, closing the screen window could occasionally leave its video encoder running on the remote PC until it restarted.
+Bug fixed: event sounds, especially Random sound, kept every sound ever played in memory. Now only the recent ones are kept.
+Bug fixed: a file transfer interrupted by a PC that never came back kept its files locked on the other PC until Kova restarted. After a week it is now closed, and what arrived is kept, marked incomplete.
+Bug fixed: Kova-crash.txt could grow without limit if a problem kept happening. It now stays around a megabyte, with the one before it kept as Kova-crash.old.txt.
+Bug fixed: after about 124 days of sound with no pause, the sound could glitch for a second.
+Bug fixed: on a PC with a graphics chip encoder, the remote screen could be slower while Kova sat minimized or in the notification area.
+
 4.1.1
 Bug fixed: if you connected straight over the internet with IPv6 and stayed connected for about a day, the sound stopped, file transfers stalled and the remote screen went blank, and Kova wrongly said the UDP port was blocked. Windows changes its IPv6 address daily, and Kova now allows for that.
 Bug fixed: if a PC waited in the background, the PC in front could drop its sound quality for no reason, and a moment of the old PC's sound could play when you switched.

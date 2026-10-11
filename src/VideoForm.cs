@@ -98,6 +98,7 @@ namespace TailRemote
         }
 
         private int? _lastShown;
+        private int _pending; // a redraw is already on its way to the window's thread (Interlocked)
 
         private void ScreenTold(ScreenChoice c)
         {
@@ -135,10 +136,14 @@ namespace TailRemote
             s.Updated += () =>
             {
                 if (IsDisposed) return;
+                // One redraw waiting at a time: up to 60 pictures a second would otherwise queue one each
+                // behind a window that is busy (or stuck), without end. The one waiting draws the newest.
+                if (System.Threading.Interlocked.Exchange(ref _pending, 1) == 1) return;
                 try
                 {
                     BeginInvoke(() =>
                     {
+                        System.Threading.Volatile.Write(ref _pending, 0);
                         _view.Note = null;
                         _view.Invalidate();
                         if (!_saidShowing)
@@ -152,7 +157,7 @@ namespace TailRemote
                         }
                     });
                 }
-                catch { }
+                catch { System.Threading.Volatile.Write(ref _pending, 0); }
             };
             s.Note += t => { try { BeginInvoke(() => Note(t)); } catch { } };
             s.ScreenTold += c => { try { BeginInvoke(() => { if (_stream == s) ScreenTold(c); }); } catch { } };

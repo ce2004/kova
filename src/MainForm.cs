@@ -1005,7 +1005,7 @@ namespace TailRemote
         private void FillWakeMenu()
         {
             var items = _wake.DropDownItems;
-            items.Clear();
+            Menus.ClearAndDispose(items); // rebuilt each time it opens
             foreach (var pc in _settings.SavedPcs)
             {
                 bool known = Wake.Parse(pc.Wake).Count > 0;
@@ -1051,7 +1051,7 @@ namespace TailRemote
         private void FillSwitchMenu()
         {
             var items = _switchTo.DropDownItems;
-            items.Clear();
+            Menus.ClearAndDispose(items); // rebuilt each time it opens
             string State(string address, int port) =>
                 (_client != null || _reconnecting || _connecting) && SamePc(FrontAddress, FrontPort, address, port) ? (_client != null ? "in front" : "connecting")
                 : FindParked(address, port) != null ? "in the background" : "not connected";
@@ -1305,7 +1305,7 @@ namespace TailRemote
         private void FillHistory()
         {
             var items = _history.DropDownItems;
-            items.Clear();
+            Menus.ClearAndDispose(items); // rebuilt after every transfer: the old lines must really go
             _history.Text = "&History of transfers" + (_historyLines.Count > 0 ? " (" + _historyLines.Count + ")" : "");
             // Never an empty menu: with nothing to land on, NVDA froze.
             if (_historyLines.Count == 0) { items.Add(new MenuStatus("Nothing has been sent or received yet.").Item); return; }
@@ -1330,7 +1330,7 @@ namespace TailRemote
             int n = Math.Min(files.Count, 32);
             // One file alone is the Files line itself: no list to open.
             if (n < 2) n = 0;
-            while (items.Count > n) items.RemoveAt(items.Count - 1);
+            while (items.Count > n) { var gone = items[items.Count - 1]; items.RemoveAt(items.Count - 1); gone.Dispose(); }
             while (items.Count < n) items.Add(new ToolStripMenuItem { Tag = Menus.KeepOpenTag });
             for (int i = 0; i < n; i++)
             {

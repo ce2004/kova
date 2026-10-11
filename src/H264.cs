@@ -196,21 +196,36 @@ namespace TailRemote
             catch { return null; }
         }
 
-        /// <summary>The asynchronous encoder's events, waited for here and counted, until it is shut down.</summary>
+        /// <summary>
+        /// The asynchronous encoder's events, looked for here and counted, until it is closed. Never waits
+        /// inside Media Foundation: a wait there only ends when the encoder shuts down, and one that would
+        /// not (seen on some drivers) left this thread and the whole encoder behind every time things
+        /// stopped moving. Instead it asks without waiting and, with nothing there, looks again a
+        /// millisecond later (the process asks Windows for 1 ms timers), so events are still taken at once.
+        /// </summary>
         private void Pump()
         {
-            Mf.Start();
-            while (!_closing)
+            bool com = Mf.StartThread();
+            try
             {
-                IntPtr ev;
-                if (Mf.Call(_events, 3, 0u, (IntPtr)(&ev)) < 0 || ev == IntPtr.Zero) break; // GetEvent, waiting; fails once shut down
-                uint type = 0;
-                Mf.Call(ev, 33, (IntPtr)(&type)); // GetType
-                Marshal.Release(ev);
-                if (type == 601) _needInput.Release(); // METransformNeedInput
-                else if (type == 602) _haveOutput.Release(); // METransformHaveOutput
+                while (!_closing)
+                {
+                    IntPtr ev;
+                    int hr = Mf.Call(_events, 3, 1u, (IntPtr)(&ev)); // GetEvent, MF_EVENT_FLAG_NO_WAIT
+                    if (hr == unchecked((int)0xC00D3E80)) { Thread.Sleep(1); continue; } // MF_E_NO_EVENTS_AVAILABLE
+                    if (hr < 0 || ev == IntPtr.Zero) break; // shut down, or broken
+                    uint type = 0;
+                    Mf.Call(ev, 33, (IntPtr)(&type)); // GetType
+                    Marshal.Release(ev);
+                    if (type == 601) _needInput.Release(); // METransformNeedInput
+                    else if (type == 602) _haveOutput.Release(); // METransformHaveOutput
+                }
             }
+            catch { }
+            finally { if (com) Mf.EndThread(); }
         }
+
+        private static int _toldStuck;
 
         private byte[]? Output(out bool isKey)
         {
@@ -283,7 +298,12 @@ namespace TailRemote
 
         public void Dispose()
         {
+            // The pump ends first: it never waits inside Media Foundation, so it sees _closing within a
+            // millisecond or two, and nothing below happens under it.
             _closing = true;
+            bool pumpEnded = _pump == null || _pump.Join(2000);
+            if (!pumpEnded && Interlocked.Exchange(ref _toldStuck, 1) == 0)
+                DiagLog.Write("video: an H.264 encoder's event thread did not end; that encoder is left as it is");
             if (_mft != IntPtr.Zero)
             {
                 try { Mf.Call(_mft, 23, 0x10000001u, IntPtr.Zero); } catch { } // END_STREAMING
@@ -292,9 +312,8 @@ namespace TailRemote
                 Guid iid = Mf.IID_IMFShutdown;
                 if (Marshal.QueryInterface(_mft, ref iid, out IntPtr shut) >= 0) { try { Mf.Call(shut, 3); } catch { } Marshal.Release(shut); } // Shutdown
             }
-            // The pump may still be inside GetEvent if it did not end: freeing the queue under it would
+            // A pump still running (it should never be) may be using the queue: freeing it under it would
             // crash the process, so it is left (a small leak) rather than released.
-            bool pumpEnded = _pump == null || _pump.Join(1000);
             if (_events != IntPtr.Zero && pumpEnded) { Marshal.Release(_events); _events = IntPtr.Zero; }
             if (_codec != IntPtr.Zero) { Marshal.Release(_codec); _codec = IntPtr.Zero; }
             if (_mft != IntPtr.Zero) { Marshal.Release(_mft); _mft = IntPtr.Zero; }
@@ -546,6 +565,14 @@ namespace TailRemote
             }
         }
 
+        /// <summary>
+        /// COM on a thread of Kova's own that ends (an encoder's event pump), with no Media Foundation
+        /// start of its own: that is once for the whole process, done before any encoder exists. True:
+        /// call EndThread as it ends, so a pump started for every burst of motion leaves nothing behind.
+        /// </summary>
+        public static bool StartThread() { try { return CoInitializeEx(IntPtr.Zero, 0) >= 0; } catch { return false; } }
+        public static void EndThread() { try { CoUninitialize(); } catch { } }
+
         /// <summary>The first transform of this kind Windows lists (best first), made ready; or zero.</summary>
         public static IntPtr FindTransform(Guid category, uint flags, Guid input, Guid output)
         {
@@ -686,5 +713,6 @@ namespace TailRemote
         [DllImport("mfplat.dll")] private static extern int MFCreateSample(out IntPtr sample);
         [DllImport("mfplat.dll")] private static extern int MFCreateMemoryBuffer(uint length, out IntPtr buffer);
         [DllImport("ole32.dll")] private static extern int CoInitializeEx(IntPtr reserved, int flags);
+        [DllImport("ole32.dll")] private static extern void CoUninitialize();
     }
 }

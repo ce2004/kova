@@ -145,7 +145,7 @@ namespace TailRemote
 
         private static void Open(string target)
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(target) { UseShellExecute = true }); }
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(target) { UseShellExecute = true })?.Dispose(); }
             catch (Exception e) { Speech.Speak("Could not open it: " + e.Message); }
         }
     }

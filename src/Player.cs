@@ -186,10 +186,29 @@ namespace TailRemote
                 string s = $"lost {_diagLost}, late {_diagLate}, restarts {_diagSpurts}, dry {_diagDry}, skips {_diagSkips} ({_diagSkippedMs:0} ms)" +
                     $", fast-forwarded {_diagFastMs:0} ms, buffer {(_diagLevelMin == double.MaxValue ? 0 : _diagLevelMin):0.0}-{_diagLevelMax:0.0} ms" +
                     $", target {_targetMs + _periodMs:0.0} ms, riding out {_rideNow:0} ms, device period {_periodMs:0.0} ms, delay {DelayUnlocked()} ms, biggest step {_diagJump:0.0000000}";
-                _diagDry = 0; _diagSkips = 0; _diagLost = 0; _diagLate = 0; _diagSpurts = 0; _diagJump = 0;
-                _diagSkippedMs = 0; _diagFastMs = 0; _diagLevelMin = double.MaxValue; _diagLevelMax = 0;
+                ClearDiag();
                 return s;
             }
+        }
+
+        private long _diagAt = Environment.TickCount64; // when the counts were last read or cleared
+
+        private void ClearDiag()
+        {
+            _diagDry = 0; _diagSkips = 0; _diagLost = 0; _diagLate = 0; _diagSpurts = 0; _diagJump = 0;
+            _diagSkippedMs = 0; _diagFastMs = 0; _diagLevelMin = double.MaxValue; _diagLevelMax = 0;
+            _diagAt = Environment.TickCount64;
+        }
+
+        /// <summary>
+        /// Diagnose only runs while logging is on: otherwise nobody reads the counts, and over months
+        /// they would run past what an int holds. The render thread clears them once nobody has read
+        /// them for a minute. Nothing the sound does depends on them.
+        /// </summary>
+        private void ForgetOldDiag(long now)
+        {
+            if (now - Volatile.Read(ref _diagAt) < 60_000) return;
+            lock (_gate) ClearDiag();
         }
 
         /// <summary>How long a missing packet may be waited for: part of the jitter the buffer already allows for, so waiting adds no delay and leaves room for loss.</summary>
@@ -288,7 +307,18 @@ namespace TailRemote
         private void Measure(double now, uint seq, int ticks)
         {
             // The reference creeps later at 200 ppm so a slow host clock is not mistaken for growing lateness.
-            double raw = now - (int)(seq + (uint)ticks - _spurtSeq) * Protocol.TickMs;
+            // Ticks since the start, counted unsigned: an int ran over after 2^31 ticks (about 124 days of
+            // unbroken sound). Past 2^30 the start moves forward along with the reference, which changes
+            // no lateness, so it never runs over at all.
+            uint since = seq + (uint)ticks - _spurtSeq;
+            if (since > 1u << 30)
+            {
+                const uint Shift = 1u << 29;
+                _spurtSeq += Shift;
+                _ref += Shift * Protocol.TickMs;
+                since -= Shift;
+            }
+            double raw = now - since * Protocol.TickMs;
             _ref = Math.Min(raw, _ref + ticks * Protocol.TickMs * 0.0002);
             float lateMs = (float)Math.Min(raw - _ref, 400);
             if (_measured && lateMs > _coverMs + 40)
@@ -396,49 +426,53 @@ namespace TailRemote
 
         private unsafe void PlayUntilDeviceChanges()
         {
-            var dev = Wasapi.OutputDevice(_deviceId);
-            dev.GetId(out string devId);
-            bool followDefault = string.IsNullOrEmpty(_deviceId) || devId != _deviceId;
-            var client = Wasapi.Activate(dev);
-            client.GetMixFormat(out IntPtr fmtPtr);
-            var fmt = Wasapi.ReadFormat(fmtPtr);
-            // The normal engine period, on purpose. Asking for the smallest one
-            // makes Windows reconfigure the device for every program, which cut
-            // all sound on the PC for about a second on connect and disconnect,
-            // and a period of 3 ms or less underruns (crackles) on a busy PC.
-            try { client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, fmtPtr, IntPtr.Zero); }
-            catch
-            {
-                // Tried again every second while the device refuses: nothing may be left behind each time.
-                Marshal.FreeCoTaskMem(fmtPtr);
-                try { Marshal.ReleaseComObject(client); } catch { }
-                try { Marshal.ReleaseComObject(dev); } catch { }
-                throw;
-            }
-            client.GetDevicePeriod(out long def, out _);
-            double periodMs = def / 10000.0;
-            DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "") + ", period " + periodMs.ToString("0.0") + " ms";
-            DiagLog.Write("player: opened " + DeviceInfo);
-            Marshal.FreeCoTaskMem(fmtPtr);
-
-            using var ev = new AutoResetEvent(false);
-            client.SetEventHandle(ev.SafeWaitHandle.DangerousGetHandle());
-            client.GetBufferSize(out uint bufFrames);
-            var iid = Wasapi.IID_IAudioRenderClient;
-            client.GetService(ref iid, out object o);
-            var render = (Wasapi.IAudioRenderClient)o;
-
-            lock (_gate)
-            {
-                _read = 0; _count = 0; _playing = false; _ff = 0; _xfLeft = 0;
-                _periodMs = periodMs;
-            }
-            _deviceRate = fmt.Rate;
-
-            long lastDeviceCheck = Environment.TickCount64;
-            client.Start();
+            // Opened again every 20 ms to 2 s while a device refuses, for as long as the app runs: whatever
+            // step fails, nothing may be left behind, so everything is let go in the one finally below.
+            // The enumerator is made per open rather than kept for the thread's life: after Windows'
+            // audio service restarts, an old one may no longer answer, and a failed open starts afresh.
+            Wasapi.IMMDeviceEnumerator? en = null;
+            Wasapi.IMMDevice? dev = null;
+            Wasapi.IAudioClient3? client = null;
+            Wasapi.IAudioRenderClient? render = null;
+            AutoResetEvent? ev = null;
+            IntPtr fmtPtr = IntPtr.Zero;
             try
             {
+                en = Wasapi.Enumerator();
+                dev = Wasapi.OutputDevice(en, _deviceId);
+                dev.GetId(out string devId);
+                bool followDefault = string.IsNullOrEmpty(_deviceId) || devId != _deviceId;
+                client = Wasapi.Activate(dev);
+                client.GetMixFormat(out fmtPtr);
+                var fmt = Wasapi.ReadFormat(fmtPtr);
+                // The normal engine period, on purpose. Asking for the smallest one
+                // makes Windows reconfigure the device for every program, which cut
+                // all sound on the PC for about a second on connect and disconnect,
+                // and a period of 3 ms or less underruns (crackles) on a busy PC.
+                client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, fmtPtr, IntPtr.Zero);
+                client.GetDevicePeriod(out long def, out _);
+                double periodMs = def / 10000.0;
+                DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "") + ", period " + periodMs.ToString("0.0") + " ms";
+                DiagLog.Write("player: opened " + DeviceInfo);
+                Marshal.FreeCoTaskMem(fmtPtr);
+                fmtPtr = IntPtr.Zero; // freed: the finally must not free it again
+
+                ev = new AutoResetEvent(false);
+                client.SetEventHandle(ev.SafeWaitHandle.DangerousGetHandle());
+                client.GetBufferSize(out uint bufFrames);
+                var iid = Wasapi.IID_IAudioRenderClient;
+                client.GetService(ref iid, out object o);
+                render = (Wasapi.IAudioRenderClient)o;
+
+                lock (_gate)
+                {
+                    _read = 0; _count = 0; _playing = false; _ff = 0; _xfLeft = 0;
+                    _periodMs = periodMs;
+                }
+                _deviceRate = fmt.Rate;
+
+                long lastDeviceCheck = Environment.TickCount64;
+                client.Start();
                 while (!_stop)
                 {
                     ev.WaitOne(50);
@@ -458,11 +492,13 @@ namespace TailRemote
                     if (now - lastDeviceCheck > 1000)
                     {
                         lastDeviceCheck = now;
+                        ForgetOldDiag(now);
                         // Reopen when the default output changes (if following it), or when
                         // the chosen output that was missing comes back.
-                        var want = Wasapi.OutputDevice(_deviceId);
-                        want.GetId(out string curId);
-                        Wasapi.Release(want);
+                        var want = Wasapi.OutputDevice(en, _deviceId);
+                        string curId;
+                        try { want.GetId(out curId); }
+                        finally { Wasapi.Release(want); }
                         if (curId != devId && (followDefault || curId == _deviceId)) return;
                     }
                 }
@@ -470,10 +506,14 @@ namespace TailRemote
             finally
             {
                 _deviceRate = 0;
-                try { client.Stop(); } catch { }
+                if (client != null) try { client.Stop(); } catch { }
+                // Let go before the event it signals is closed: a closed handle's number can be reused.
                 Wasapi.Release(render);
                 Wasapi.Release(client);
                 Wasapi.Release(dev);
+                Wasapi.Release(en);
+                if (fmtPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(fmtPtr);
+                ev?.Dispose();
             }
         }
 

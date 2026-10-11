@@ -16,7 +16,14 @@ namespace TailRemote
             try
             {
                 string text = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  Kova " + Updater.Current + ": " + what + Environment.NewLine;
-                System.IO.File.AppendAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "Kova-crash.txt"), text);
+                string path = System.IO.Path.Combine(AppContext.BaseDirectory, "Kova-crash.txt");
+                // Kept to about a megabyte (the one before it becomes Kova-crash.old.txt): a problem that keeps
+                // happening for months must never fill the drive.
+                var file = new System.IO.FileInfo(path);
+                if (file.Exists && file.Length > 1 << 20)
+                    try { System.IO.File.Move(path, System.IO.Path.Combine(AppContext.BaseDirectory, "Kova-crash.old.txt"), overwrite: true); }
+                    catch { } // the old one locked: this line is still written, to the big file
+                System.IO.File.AppendAllText(path, text);
                 DiagLog.Write("problem: " + what);
             }
             catch { }
@@ -171,6 +178,8 @@ namespace TailRemote
             }
             if (args.Length == 1 && args[0] == "--chaostest") return ChaosTest.Run();
             if (args.Length == 1 && args[0] == "--cliptest") return ClipTest();
+            // --soaktest [minutes]: months of use in a few minutes; handles, threads and memory must stay put.
+            if (args.Length >= 1 && args[0] == "--soaktest") return SoakTest.Run(args.Length > 1 && int.TryParse(args[1], out int soakMinutes) ? soakMinutes : 10);
             if (args.Length >= 3 && args[0] == "--testhost" && int.TryParse(args[1], out int testPort))
             {
                 // A host with no window, for testing a controlling window against (until it is stopped).

@@ -492,12 +492,14 @@ namespace TailRemote
 
         private void Start()
         {
+            // First: a connection that drops at once closes from these threads, and a Wi-Fi handle made after
+            // that close was never let go (scans stayed off for good).
+            _wifi = new WlanStreaming("client"); // steady Wi-Fi while connected
             new Thread(SendLoop) { IsBackground = true, Name = "Kova send", Priority = ThreadPriority.AboveNormal }.Start();
             new Thread(TcpLoop) { IsBackground = true, Name = "Kova tcp" }.Start();
             new Thread(UdpLoop) { IsBackground = true, Name = "Kova udp", Priority = ThreadPriority.Highest }.Start();
             new Thread(Heartbeat) { IsBackground = true, Name = "Kova heartbeat" }.Start();
             new Thread(QualityLoop) { IsBackground = true, Name = "Kova quality" }.Start();
-            _wifi = new WlanStreaming("client"); // steady Wi-Fi while connected
         }
 
         public void Dispose() => Close(null);
@@ -1125,7 +1127,17 @@ namespace TailRemote
             {
                 Thread.Sleep(QualityTickMs);
                 try { AdaptQuality(); } catch { }
-                if (++tick % (1000 / QualityTickMs) == 0 && DiagLog.Enabled && !Muted) LogSecond(); // the shared Player's figures are the front PC's
+                if (++tick % (1000 / QualityTickMs) == 0)
+                {
+                    if (DiagLog.Enabled && !Muted) LogSecond(); // the shared Player's figures are the front PC's
+                    else
+                    {
+                        // Taken every second anyway: left adding up for months, they wrapped round and the
+                        // first line after logging was turned on said nonsense.
+                        Interlocked.Exchange(ref _rxPackets, 0); Interlocked.Exchange(ref _rxBytes, 0);
+                        Interlocked.Exchange(ref _keysSent, 0); Interlocked.Exchange(ref _rxDamaged, 0);
+                    }
+                }
             }
         }
 

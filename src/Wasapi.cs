@@ -69,9 +69,11 @@ namespace TailRemote
 
         public static string? ReadString(IMMDevice dev, Guid fmtid, uint pid)
         {
+            // Read every time a device name is shown: the store is let go at once, not left to the finalizer.
+            IPropertyStore? store = null;
             try
             {
-                dev.OpenPropertyStore(0, out var store);
+                dev.OpenPropertyStore(0, out store);
                 var key = new PropertyKey { fmtid = fmtid, pid = pid };
                 store.GetValue(ref key, out var pv);
                 string? s = pv.vt == 31 ? Marshal.PtrToStringUni(pv.ptr) : null;
@@ -79,6 +81,7 @@ namespace TailRemote
                 return s;
             }
             catch { return null; }
+            finally { Release(store); }
         }
 
         /// <summary>Writes a string property. Needs administrator rights for endpoint names.</summary>
@@ -88,7 +91,7 @@ namespace TailRemote
             var key = new PropertyKey { fmtid = fmtid, pid = pid };
             var pv = new PropVariant { vt = 31, ptr = Marshal.StringToCoTaskMemUni(value) };
             try { store.SetValue(ref key, ref pv); store.Commit(); }
-            finally { PropVariantClear(ref pv); }
+            finally { PropVariantClear(ref pv); Release(store); }
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -150,43 +153,54 @@ namespace TailRemote
         public static List<(string Id, string Name)> OutputDevices()
         {
             var list = new List<(string, string)>();
+            // Everything asked of Windows here is let go before returning: the list is built every
+            // time the device list is shown, for as long as the app runs.
+            IMMDeviceEnumerator? e = null;
+            IMMDeviceCollection? coll = null;
             try
             {
-                Enumerator().EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, out var coll);
+                e = Enumerator();
+                e.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, out coll);
                 coll.GetCount(out uint n);
                 for (uint i = 0; i < n; i++)
                 {
-                    coll.Item(i, out var dev);
-                    dev.GetId(out string id);
-                    list.Add((id, FriendlyName(dev) ?? id));
+                    IMMDevice? dev = null;
+                    try
+                    {
+                        coll.Item(i, out dev);
+                        dev.GetId(out string id);
+                        list.Add((id, FriendlyName(dev) ?? id));
+                    }
+                    finally { Release(dev); }
                 }
             }
             catch { }
+            finally { Release(coll); Release(e); }
             return list;
         }
 
-        internal static string? FriendlyName(IMMDevice dev)
-        {
-            try
-            {
-                dev.OpenPropertyStore(0, out var store);
-                var key = new PropertyKey { fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), pid = 14 };
-                store.GetValue(ref key, out var pv);
-                string? s = pv.vt == 31 ? Marshal.PtrToStringUni(pv.ptr) : null;
-                PropVariantClear(ref pv);
-                return s;
-            }
-            catch { return null; }
-        }
+        internal static string? FriendlyName(IMMDevice dev) => ReadString(dev, new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), 14);
 
-        /// <summary>The chosen output device, or the default one when id is empty or gone.</summary>
+        /// <summary>The chosen output device, or the default one when id is empty or gone. For a one-off look.</summary>
         public static IMMDevice OutputDevice(string? id)
         {
             var e = Enumerator();
+            try { return OutputDevice(e, id); }
+            finally { Release(e); } // the device it found stays good without it
+        }
+
+        /// <summary>
+        /// The same, with an enumerator the caller keeps: the sound threads look once a second, and a new
+        /// enumerator each time was 86,400 COM objects a day waiting on the finalizer.
+        /// </summary>
+        public static IMMDevice OutputDevice(IMMDeviceEnumerator e, string? id)
+        {
             if (!string.IsNullOrEmpty(id))
             {
-                try { e.GetDevice(id, out var d); d.GetState(out uint st); if (st == DEVICE_STATE_ACTIVE) return d; }
+                IMMDevice? d = null;
+                try { e.GetDevice(id, out d); d.GetState(out uint st); if (st == DEVICE_STATE_ACTIVE) return d; }
                 catch { }
+                Release(d); // there but not active (unplugged, disabled): not ours to keep
             }
             e.GetDefaultAudioEndpoint(eRender, eConsole, out var def);
             return def;

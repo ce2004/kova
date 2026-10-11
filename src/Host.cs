@@ -553,12 +553,14 @@ namespace TailRemote
                         _status("No sound can reach " + s.Address + ": nothing from it arrives here over UDP port " + ((IPEndPoint)_listener.LocalEndpoint).Port +
                             ", though its keys do. Open the port with Port editor on this PC, or check the firewall and the network.");
                     }
+                // Taken every second, logging or not: left adding up for months they wrapped round, and the
+                // first line after logging was turned on said nonsense.
+                int packets = Interlocked.Exchange(ref _txPackets, 0), bytes = Interlocked.Exchange(ref _txBytes, 0);
                 if (!DiagLog.Enabled) continue;
                 int fills = Interlocked.Exchange(ref LoopbackCapture.TestGapFills, 0);
                 int fillMs = Interlocked.Exchange(ref LoopbackCapture.TestGapFillMs, 0);
                 int skips = Interlocked.Exchange(ref LoopbackCapture.TestSeqSkips, 0);
                 int chunk = Interlocked.Exchange(ref LoopbackCapture.TestChunkMax, 0);
-                int packets = Interlocked.Exchange(ref _txPackets, 0), bytes = Interlocked.Exchange(ref _txBytes, 0);
                 var sb = new System.Text.StringBuilder();
                 foreach (var s in AllSessions())
                     sb.Append(" [").Append(s.Address).Append(s.Role == Protocol.RoleControl ? " control" : " listen")
@@ -948,7 +950,7 @@ namespace TailRemote
                 owner.VideoLastDown = t; owner.VideoFloor = step; owner.VideoFloorUntil = t + owner.VideoBackoffMs;
                 if (VideoSettings.Ladder[step].MaxWidth != VideoSettings.Ladder[was].MaxWidth) Volatile.Write(ref whole, 1);
             }
-            new Thread(() =>
+            var reader = new Thread(() =>
             {
                 byte[]? b = null;
                 try
@@ -977,12 +979,14 @@ namespace TailRemote
                 }
                 catch { }
                 Volatile.Write(ref closed, 1);
-                got.Set();
-            }) { IsBackground = true, Name = "Kova remote screen in" }.Start();
+                try { got.Set(); } catch { } // the lane may be gone (and its event with it) by now
+            }) { IsBackground = true, Name = "Kova remote screen in" };
+            reader.Start();
             try
             {
                 uint number = 0;
                 bool lastWasVideo = false;
+                bool resting = false; // the viewer is minimized and its copies of the screen and encoder were let go of
                 long lastSent = Environment.TickCount64;
                 string? said = null;
                 while (!_stop && Volatile.Read(ref closed) == 0 && IsController(owner))
@@ -991,10 +995,14 @@ namespace TailRemote
                     owner.VideoStep = step;
                     if (Volatile.Read(ref paused) == 1)
                     {
+                        // Minimized: what is kept for this viewer (its copies of the screen, its H.264 encoder) goes
+                        // until it looks again; it then starts with a whole picture (the unpause asks for one).
+                        if (!resting) { resting = true; try { VideoForget(viewer); } catch { } }
                         if (now - lastSent > 5000) { Send(Protocol.VideoStill, default); lastSent = now; }
                         got.WaitOne(1000);
                         continue;
                     }
+                    resting = false;
                     // H.264's share of the line while things move: most of the pace, less on the lower steps.
                     double linePace = Math.Max(16 << 10, Math.Min(TestPaceCap, Volatile.Read(ref owner.Pace)));
                     int kbps = (int)Math.Clamp(linePace * 8 / 1000 * 0.7 * Math.Pow(0.7, Math.Max(0, step - VideoSettings.Start)), 250, 40_000);
@@ -1133,6 +1141,9 @@ namespace TailRemote
                 Volatile.Write(ref closed, 1);
                 try { tcp.Dispose(); } catch { }
                 try { VideoForget(viewer); } catch { }
+                // The reader ends with the line closed above; only then are the event and keys let go
+                // (a handle each per screen opened, otherwise left to the collector).
+                if (reader.Join(2000)) { got.Dispose(); try { link.Dispose(); } catch { } }
                 Interlocked.Decrement(ref _viewers);
                 Thread.CurrentThread.Priority = priority;
             }
@@ -1404,12 +1415,15 @@ namespace TailRemote
                 else
                 {
                     f.Detach();
+                    _kept.RemoveAll(k => k.Gone); // ones that closed themselves since
                     if (!_kept.Contains(f)) _kept.Add(f);
                     while (_kept.Count > MaxControllers) { _kept[0].Dispose(); _kept.RemoveAt(0); }
                 }
                 s.Files = null; // kept or closed: no longer this session's
             }
-            if (why == null) { try { s.Tcp.Dispose(); } catch { } return; }
+            // The session's keys (Windows key handles) go with it, not whenever the collector gets round to it.
+            // Late senders (audio, health, broadcasts) all catch what a disposed link throws.
+            if (why == null) { try { s.Tcp.Dispose(); } catch { } try { s.Link.Dispose(); } catch { } return; }
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 try { Protocol.SendMessage(s.Link, s.Stream, why); } catch { }
@@ -1425,6 +1439,7 @@ namespace TailRemote
                 }
                 catch { }
                 try { s.Tcp.Dispose(); } catch { }
+                try { s.Link.Dispose(); } catch { }
             });
         }
 

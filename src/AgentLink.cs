@@ -121,7 +121,17 @@ namespace TailRemote
                 finally { _videoWaits.TryRemove(id, out _); }
             }
 
-            public void ForgetVideo(int viewer) { if (_pipe != null) _out.TryAdd((VideoForgetMessage, BitConverter.GetBytes(viewer)), 1000); }
+            // Viewers gone, kept apart from the bounded queue: a full queue (an agent busy switching desktops)
+            // would drop one, and the agent would keep that viewer's copies of the screen and its encoder.
+            private readonly ConcurrentQueue<int> _forgets = new();
+            private const byte Wake = 0; // not a message: only wakes the writer to send the forgets
+
+            public void ForgetVideo(int viewer)
+            {
+                if (_pipe == null) return; // no agent: the next one to connect forgets every viewer anyway
+                _forgets.Enqueue(viewer);
+                _out.TryAdd((Wake, Array.Empty<byte>())); // full: the writer is busy and sends them before its next one
+            }
 
             /// <summary>What the agent read from its clipboard, in answer to GetClipboard. Raised on the link's read thread.</summary>
             public Action<string>? ClipboardText;
@@ -134,7 +144,7 @@ namespace TailRemote
             /// </summary>
             private void ReadLoop(Stream pipe)
             {
-                byte[] head = new byte[5];
+                byte[] head = new byte[5], reply = new byte[5];
                 try
                 {
                     while (true)
@@ -142,16 +152,23 @@ namespace TailRemote
                         Protocol.ReadExactly(pipe, head);
                         int n = BitConverter.ToInt32(head, 1);
                         if (n < 0 || n > 600 << 20) throw new InvalidDataException("a message too big");
+                        if (head[0] == VideoReplyMessage && n >= 5)
+                        {
+                            // A picture: its 5 bytes of answer first, then the update read straight into an
+                            // array of its own, rather than read whole and copied out again.
+                            Protocol.ReadExactly(pipe, reply);
+                            byte[] update = new byte[n - 5];
+                            Protocol.ReadExactly(pipe, update);
+                            if (_videoWaits.TryGetValue(BitConverter.ToInt32(reply, 0), out var wait))
+                                wait.TrySetResult(reply[4] == 1 ? update : null);
+                            continue;
+                        }
                         byte[] p = new byte[n];
                         Protocol.ReadExactly(pipe, p);
                         switch (head[0])
                         {
                             case ClipTextMessage: ClipboardText?.Invoke(Encoding.UTF8.GetString(p)); break;
                             case ClipFilesMessage: ClipboardFiles?.Invoke(Encoding.UTF8.GetString(p).Split('\n', StringSplitOptions.RemoveEmptyEntries)); break;
-                            case VideoReplyMessage when n >= 5:
-                                if (_videoWaits.TryGetValue(BitConverter.ToInt32(p, 0), out var wait))
-                                    wait.TrySetResult(p[4] == 1 ? p.AsSpan(5).ToArray() : null);
-                                break;
                         }
                     }
                 }
@@ -220,15 +237,21 @@ namespace TailRemote
             {
                 foreach (var (type, payload) in _out.GetConsumingEnumerable())
                 {
-                    var pipe = _pipe;
-                    if (pipe == null) continue;
-                    try { Write(pipe, type, payload); }
-                    catch
-                    {
-                        // The agent is gone (signed out, or switching user): until the next one connects, keys go nowhere.
-                        Interlocked.CompareExchange(ref _pipe, null, pipe);
-                        try { pipe.Dispose(); } catch { }
-                    }
+                    while (_forgets.TryDequeue(out int viewer)) Send(VideoForgetMessage, BitConverter.GetBytes(viewer));
+                    if (type != Wake) Send(type, payload);
+                }
+            }
+
+            private void Send(byte type, byte[] payload)
+            {
+                var pipe = _pipe;
+                if (pipe == null) return;
+                try { Write(pipe, type, payload); }
+                catch
+                {
+                    // The agent is gone (signed out, or switching user): until the next one connects, keys go nowhere.
+                    Interlocked.CompareExchange(ref _pipe, null, pipe);
+                    try { pipe.Dispose(); } catch { }
                 }
             }
         }
@@ -250,8 +273,30 @@ namespace TailRemote
             // The newest request for each viewer: an older one still queued (the service gave up waiting
             // on it) is skipped, so the agent never takes pictures nobody waits for.
             var newest = new ConcurrentDictionary<int, int>();
-            var worker = new Thread(() => { foreach (var job in pictures.GetConsumingEnumerable()) try { job(); } catch { } })
-                { IsBackground = true, Name = "Kova agent screen", Priority = ThreadPriority.BelowNormal };
+            // Viewers gone, and "every viewer gone" (a new link), kept out of the bounded queue: a full one
+            // would drop them, and the viewer's copies of the screen and its encoder would stay until the
+            // agent restarts. The picture thread does them before each picture, on its own thread, so they
+            // never race a picture.
+            var forgets = new ConcurrentQueue<int>();
+            int forgetAll = 0, link = 0; // link: counts links, so a picture asked for on an old one is never taken for the new one
+            void Forgets()
+            {
+                if (screen == null) return;
+                if (Interlocked.Exchange(ref forgetAll, 0) == 1) screen.ForgetAll();
+                while (forgets.TryDequeue(out int gone)) screen.Forget(gone);
+            }
+            var worker = new Thread(() =>
+            {
+                while (true)
+                {
+                    // Woken at least once a minute, so viewers whose "gone" never came are dropped even
+                    // when nobody asks for pictures any more.
+                    pictures.TryTake(out var job, 60_000);
+                    try { Forgets(); } catch { }
+                    try { job?.Invoke(); } catch { }
+                    try { screen?.Sweep(); } catch { }
+                }
+            }) { IsBackground = true, Name = "Kova agent screen", Priority = ThreadPriority.BelowNormal };
             worker.Start();
             while (true)
             {
@@ -275,10 +320,22 @@ namespace TailRemote
                     // never while the read loop below is also writing, so one lock keeps writes whole.
                     var writeGate = new object();
                     void Reply(byte type, byte[] payload) { try { lock (writeGate) Write(pipe, type, payload); } catch { } }
+                    // A picture's answer: its header, then the update as it is, rather than copied into one
+                    // message and then again into what is written.
+                    void ReplyPicture(int id, byte[]? update)
+                    {
+                        byte[] h = new byte[10];
+                        h[0] = VideoReplyMessage;
+                        BitConverter.TryWriteBytes(h.AsSpan(1), 5 + (update?.Length ?? 0));
+                        BitConverter.TryWriteBytes(h.AsSpan(5), id);
+                        h[9] = (byte)(update == null ? 0 : 1);
+                        try { lock (writeGate) { pipe.Write(h); if (update != null) pipe.Write(update); pipe.Flush(); } } catch { }
+                    }
                     // A new link (the service may have restarted, numbering its viewers from 1 again): what
                     // was kept for the old viewers goes, on the picture thread so it never races a picture.
                     newest.Clear();
-                    if (screen != null) pictures.TryAdd(screen.ForgetAll, 1000);
+                    int thisLink = Interlocked.Increment(ref link);
+                    if (screen != null) { Volatile.Write(ref forgetAll, 1); pictures.TryAdd(() => { }); }
                     while (true)
                     {
                         Protocol.ReadExactly(pipe, head);
@@ -305,13 +362,13 @@ namespace TailRemote
                                     newest[viewer] = id;
                                     pictures.TryAdd(() =>
                                     {
-                                        if (newest.TryGetValue(viewer, out int latest) && latest != id) return;
-                                        byte[]? update = screen.Update(viewer, whole, settings);
-                                        byte[] r = new byte[5 + (update?.Length ?? 0)];
-                                        BitConverter.TryWriteBytes(r.AsSpan(0), id);
-                                        r[4] = (byte)(update == null ? 0 : 1);
-                                        update?.CopyTo(r, 5);
-                                        Reply(VideoReplyMessage, r);
+                                        // Asked on a link that has since gone: taken now it would bring back a
+                                        // viewer just forgotten (and the new link may give its number to another).
+                                        if (Volatile.Read(ref link) != thisLink) return;
+                                        // Not the newest ask, or the viewer has gone since (its "gone" is done
+                                        // before this, so taking it now would bring the viewer back for good).
+                                        if (!newest.TryGetValue(viewer, out int latest) || latest != id) return;
+                                        ReplyPicture(id, screen.Update(viewer, whole, settings));
                                     });
                                     break;
                                 }
@@ -319,7 +376,8 @@ namespace TailRemote
                                 {
                                     int viewer = BitConverter.ToInt32(p, 0);
                                     newest.TryRemove(viewer, out _);
-                                    pictures.TryAdd(() => screen.Forget(viewer), 1000);
+                                    forgets.Enqueue(viewer);
+                                    pictures.TryAdd(() => { }); // wakes the picture thread; full: it is busy and does them before its next picture
                                     break;
                                 }
                         }

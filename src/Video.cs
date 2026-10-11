@@ -405,6 +405,24 @@ namespace TailRemote
             return new Frame { Width = ow, Height = oh, Pixels = o };
         }
 
+        /// <summary>
+        /// Nobody is watching any more: everything kept for taking the screen goes (the graphics card's
+        /// duplication of each screen, the last copies of the screen, the smaller copy), so a host left
+        /// running for months holds none of it between viewers. The next picture starts it all again.
+        /// </summary>
+        public void Idle()
+        {
+            lock (_gate)
+            {
+                foreach (var dd in _dd.Values) dd.Dispose();
+                _dd.Clear();
+                _ddUsed.Clear();
+                _gdi.Clear();
+                _scaled = _scaledFrom = null;
+                _screens = null;
+            }
+        }
+
         public void Dispose() { lock (_gate) { _disposed = true; foreach (var dd in _dd.Values) dd.Dispose(); _dd.Clear(); } }
     }
 
@@ -434,6 +452,12 @@ namespace TailRemote
         private readonly Func<IReadOnlyList<ScreenInfo>>? _screens; // null: one screen, nothing said about it (tests)
         private readonly object _taking = new();
         private readonly Dictionary<int, Viewer> _viewers = new();
+        // Run when the last viewer goes (ScreenSource.Idle): what was kept for taking the screen is let go of.
+        private readonly Action? _idle;
+        private bool _sourceIdle = true; // nothing taken since the last idle (under _viewers)
+        private long _sweptAt;           // when viewers nobody asked about were last looked for (under _viewers)
+        /// <summary>A viewer not asked for a picture in this long is dropped: its "gone" was lost on the way (AgentLink), or it is minimized.</summary>
+        public const int StaleMs = 10 * 60_000;
         private static readonly ImageCodecInfo Jpeg = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
         /// <summary>Test only: no H.264, still pictures only (the tests of still pictures need exact pixels).</summary>
@@ -453,15 +477,29 @@ namespace TailRemote
             public int ToldCount;          // what the viewer was last told: how many screens, and the one shown
             public ScreenInfo ToldScreen;
             public Rectangle ShownArea;    // where the shown screen is on the desktop: followed when others come and go
+            public long UsedAt;            // when a picture was last asked for (under _viewers): the sweep drops ones long unused
+            public bool Resting;           // forgotten (gone, or minimized): only its screen choice is kept, a few numbers
         }
+
+        // A resting viewer is a few numbers (which screen it chose and where that is): kept a day, so one that was
+        // minimized comes back to the same screen even after others were unplugged meanwhile.
+        private const long RestingKeptMs = 24L * 3600_000;
 
         public ScreenVideo(ScreenTaker take) => _take = (int w, int _, int wait, out bool changed) => take(w, wait, out changed);
         public ScreenVideo(Func<int, Frame?> take) : this((int w, int _, out bool changed) => { changed = true; return take(w); }) { }
 
-        /// <summary>Any of the PC's screens, as each viewer chooses (VideoSettings.Screen).</summary>
-        public ScreenVideo(ScreensTaker take, Func<IReadOnlyList<ScreenInfo>> screens) { _take = take; _screens = screens; }
+        /// <summary>
+        /// Any of the PC's screens, as each viewer chooses (VideoSettings.Screen). idle: run when the last
+        /// viewer goes; when not given and the pictures come from a ScreenSource (take is its Take), that
+        /// source's Idle, so whoever makes one this way never has to remember it.
+        /// </summary>
+        public ScreenVideo(ScreensTaker take, Func<IReadOnlyList<ScreenInfo>> screens, Action? idle = null)
+        {
+            _take = take; _screens = screens;
+            _idle = idle ?? (take.Target is ScreenSource source ? source.Idle : null);
+        }
 
-        public int Viewers { get { lock (_viewers) return _viewers.Count; } }
+        public int Viewers { get { lock (_viewers) return _viewers.Values.Count(v => !v.Resting); } }
 
         /// <summary>Test only: this viewer is being sent H.264 now.</summary>
         public bool IsMoving(int viewer) { lock (_viewers) return _viewers.TryGetValue(viewer, out var v) && v.Moving; }
@@ -470,7 +508,21 @@ namespace TailRemote
         public byte[]? Update(int viewer, bool everything, VideoSettings settings)
         {
             Viewer v;
-            lock (_viewers) if (!_viewers.TryGetValue(viewer, out v!)) _viewers[viewer] = v = new Viewer();
+            long asked = Environment.TickCount64;
+            lock (_viewers)
+            {
+                if (!_viewers.TryGetValue(viewer, out v!)) _viewers[viewer] = v = new Viewer();
+                v.UsedAt = asked; // stamped while the list is held, so the sweep never drops one being asked for now
+                v.Resting = false;
+                _sourceIdle = false;
+            }
+            Sweep(asked);
+            // One viewer's pictures at a time: the sweep (on another viewer's thread) may let this one's go.
+            lock (v) return UpdateNow(v, everything, settings);
+        }
+
+        private byte[]? UpdateNow(Viewer v, bool everything, VideoSettings settings)
+        {
             byte[]? told = ChooseScreen(v, settings.Screen);
             if (told != null) return told;
             Frame? f;
@@ -655,11 +707,18 @@ namespace TailRemote
             return ms.ToArray();
         }
 
+        /// <summary>
+        /// The viewer has gone, or has nothing to look at for now (its window is minimized): everything kept
+        /// for it goes (its copies of the screen, its H.264 encoder). Safe to carry on from: asked for a
+        /// picture again, it starts afresh with a whole one, on the same screen as before (which screen it
+        /// chose, and where that one is, are kept: a few numbers, swept after a day).
+        /// </summary>
         public void Forget(int viewer)
         {
             Viewer? v;
-            lock (_viewers) { if (!_viewers.Remove(viewer, out v)) return; }
-            v.Encoder?.Dispose();
+            lock (_viewers) _viewers.TryGetValue(viewer, out v);
+            if (v != null) lock (v) { DropNow(v); lock (_viewers) v.Resting = true; }
+            IdleIfNobody();
         }
 
         /// <summary>
@@ -670,7 +729,65 @@ namespace TailRemote
         {
             List<Viewer> all;
             lock (_viewers) { all = _viewers.Values.ToList(); _viewers.Clear(); }
-            foreach (var v in all) v.Encoder?.Dispose();
+            foreach (var v in all) Drop(v);
+            IdleIfNobody();
+        }
+
+        /// <summary>
+        /// Drops viewers not asked for a picture in StaleMs (looked for at most once a minute). A "gone"
+        /// lost on the way would otherwise keep a viewer's copies of the screen and its encoder until the
+        /// agent restarts, which could be months. One that was only minimized starts afresh, whole.
+        /// </summary>
+        public void Sweep() { Sweep(Environment.TickCount64); IdleIfNobody(); }
+
+        private void Sweep(long now)
+        {
+            List<Viewer> stale;
+            lock (_viewers)
+            {
+                if (now - _sweptAt < 60_000) return;
+                _sweptAt = now;
+                stale = _viewers.Values.Where(v => now - v.UsedAt > (v.Resting ? RestingKeptMs : StaleMs)).ToList();
+            }
+            foreach (var v in stale)
+            {
+                // Busy making a picture: not stale after all.
+                if (!Monitor.TryEnter(v)) continue;
+                try
+                {
+                    lock (_viewers)
+                    {
+                        // Asked for again since it was picked out: it stays.
+                        if (now - v.UsedAt <= (v.Resting ? RestingKeptMs : StaleMs)) continue;
+                        foreach (var p in _viewers) if (p.Value == v) { _viewers.Remove(p.Key); break; }
+                    }
+                    DropNow(v);
+                }
+                finally { Monitor.Exit(v); }
+            }
+        }
+
+        private static void Drop(Viewer v) { lock (v) DropNow(v); }
+
+        private static void DropNow(Viewer v)
+        {
+            v.Encoder?.Dispose(); v.Encoder = null;
+            v.Has = v.Seen = null;
+            v.Changes.Clear();
+            v.Moving = false;
+        }
+
+        /// <summary>No viewer left: what the screen source keeps for taking pictures goes too (once, until someone watches again).</summary>
+        private void IdleIfNobody()
+        {
+            if (_idle == null) return;
+            lock (_viewers)
+            {
+                if (_sourceIdle || _viewers.Values.Any(v => !v.Resting)) return;
+                _sourceIdle = true;
+            }
+            // Never in the middle of a picture being taken for someone who has just come.
+            try { lock (_taking) _idle(); } catch { }
         }
 
         /// <summary>Which tiles changed between two pictures of the same size.</summary>
@@ -758,11 +875,18 @@ namespace TailRemote
         /// pictures are decoded before the lock is taken, so a big one never holds up the window drawing
         /// the last; only JPEG and PNG of exactly the size given are taken.
         /// </summary>
-        public int Apply(byte[] m, int offset)
+        public int Apply(byte[] m, int offset) => Apply(m, offset, m.Length - offset);
+
+        /// <summary>
+        /// The same, from length bytes of m at offset: straight from the buffer the line was read into.
+        /// Nothing of m is kept once this returns (pieces are copied out, video goes into the decoder), so
+        /// the caller may read the next update into it.
+        /// </summary>
+        public int Apply(byte[] m, int offset, int length)
         {
-            if (m.Length - offset < 6) throw new InvalidDataException("a picture cut short");
-            if (m[offset] == ScreenVideo.VideoFrame) return ApplyVideo(m, offset);
-            using var r = new BinaryReader(new MemoryStream(m, offset, m.Length - offset));
+            if (offset < 0 || length < 6 || offset + length > m.Length) throw new InvalidDataException("a picture cut short");
+            if (m[offset] == ScreenVideo.VideoFrame) return ApplyVideo(m, offset, length);
+            using var r = new BinaryReader(new MemoryStream(m, offset, length));
             if (r.ReadByte() != ScreenVideo.StillPicture) throw new InvalidDataException("a picture of a kind this version does not know");
             int width = r.ReadUInt16(), height = r.ReadUInt16();
             bool all = (r.ReadByte() & 1) != 0;
@@ -802,7 +926,7 @@ namespace TailRemote
             return count;
         }
 
-        private int ApplyVideo(byte[] m, int offset)
+        private int ApplyVideo(byte[] m, int offset, int length)
         {
             int width = BitConverter.ToUInt16(m, offset + 1), height = BitConverter.ToUInt16(m, offset + 3);
             if (width < 16 || height < 16) throw new InvalidDataException("a video frame of no size");
@@ -815,7 +939,7 @@ namespace TailRemote
                 _decoder ??= H264Decoder.Create();
                 if (_decoder == null) { CannotDecode = true; return -1; }
                 if (_decoded == null || _decoded.Length != width * height * 4) _decoded = new byte[width * height * 4];
-                if (!_decoder.Decode(m, offset + 6, m.Length - offset - 6, width, height, _decoded, out got))
+                if (!_decoder.Decode(m, offset + 6, length - 6, width, height, _decoded, out got))
                 {
                     _decoder.Dispose(); _decoder = null; // a fresh decoder for the key frame asked for
                     return -1;
@@ -953,9 +1077,10 @@ namespace TailRemote
                             case Protocol.VideoPicture when n >= 5:
                                 {
                                     uint number = BitConverter.ToUInt32(buffer, 1);
-                                    byte[] update = buffer.AsSpan(5, n - 5).ToArray();
-                                    int pieces = Canvas.Apply(update, 0);
-                                    bool isVideo = update.Length > 0 && update[0] == ScreenVideo.VideoFrame;
+                                    // Shown straight from the buffer (Apply keeps nothing of it), not a copy per picture.
+                                    int length = n - 5;
+                                    int pieces = Canvas.Apply(buffer, 5, length);
+                                    bool isVideo = length > 0 && buffer[5] == ScreenVideo.VideoFrame;
                                     if (pieces < 0)
                                     {
                                         // The H.264 stream broke here: a key frame, please. But a PC that cannot
@@ -964,7 +1089,7 @@ namespace TailRemote
                                         // failures in a row the host is told to send still pictures only.
                                         // Only key frames count: the frames still on their way after a break fail
                                         // too, and used to switch H.264 off for good on a PC that decodes it fine.
-                                        bool key = isVideo && update.Length > 5 && update[5] == 1;
+                                        bool key = isVideo && length > 5 && buffer[10] == 1;
                                         if (!_noH264 && (Canvas.CannotDecode || (key && ++_videoFailures >= 3)))
                                         {
                                             _noH264 = true;

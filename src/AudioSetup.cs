@@ -117,7 +117,7 @@ namespace TailRemote
         {
             try
             {
-                var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--setup-audio") { UseShellExecute = true, Verb = "runas" });
+                using var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--setup-audio") { UseShellExecute = true, Verb = "runas" });
                 if (p == null) return false;
                 await p.WaitForExitAsync();
                 return p.ExitCode == 0;
@@ -325,7 +325,7 @@ namespace TailRemote
         {
             try
             {
-                var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--remove-audio") { UseShellExecute = true, Verb = "runas" });
+                using var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--remove-audio") { UseShellExecute = true, Verb = "runas" });
                 if (p == null) return false;
                 await p.WaitForExitAsync();
                 return p.ExitCode == 0;

@@ -239,7 +239,8 @@ namespace TailRemote
             if (_device != IntPtr.Zero) { Marshal.Release(_device); _device = IntPtr.Zero; }
         }
 
-        public void Dispose() => Stop();
+        // The last pictures go too: a whole screen each, kept by nothing else once this is let go of.
+        public void Dispose() { Stop(); _last = _shown = null; }
 
         // ---- COM calls by the vtable slot (no interface declarations needed) ----
         private static IntPtr Slot(IntPtr o, int i) => (*(IntPtr**)o)[i];

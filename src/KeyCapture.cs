@@ -80,8 +80,16 @@ namespace TailRemote
             if (c == null && _remote) Leave(announce: true, old);
             // Whether the remote PC takes the mouse is only known once it says what it can do, which can
             // come just after remote control resumed by itself on reconnecting: look again then.
-            if (c != null) c.FeaturesKnown += () => { if (_remote && _client == c && _mouseHook == IntPtr.Zero) Native.PostThreadMessageW(_threadId, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero); };
+            // Once per connection: switching back and forth to a PC in the background for months added one each time.
+            if (c != null && !_watched.TryGetValue(c, out _))
+            {
+                _watched.Add(c, c);
+                c.FeaturesKnown += () => { if (_remote && _client == c && _mouseHook == IntPtr.Zero) Native.PostThreadMessageW(_threadId, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero); };
+            }
         }
+
+        // Connections already watched (weakly: a closed one is never kept alive by this).
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<Client, Client> _watched = new();
 
         private void Loop()
         {

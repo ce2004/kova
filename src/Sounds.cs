@@ -161,7 +161,11 @@ namespace TailRemote
             }
         }
 
-        private static readonly Dictionary<string, byte[]> Cache = new();
+        // Made sounds, newest used first, at most CacheMax of them. Kept for ever, they grew past 100 MB over
+        // weeks of Random sound. Dropping one is always safe: a SoundPlayer playing it holds its own reference.
+        private const int CacheMax = 32;
+        private static readonly Dictionary<string, LinkedListNode<(string Key, byte[] Wav)>> Cache = new();
+        private static readonly LinkedList<(string Key, byte[] Wav)> CacheOrder = new();
 
         // One thread makes and starts every sound. Windows plays one SoundPlayer sound at a time (a
         // new one stops the one before), so only the newest request matters: moving quickly
@@ -223,7 +227,13 @@ namespace TailRemote
 
         public static void PlayNamedAndWait(string name)
         {
-            try { if (Get(name, Key) is byte[] wav) new SoundPlayer(new MemoryStream(wav)).PlaySync(); } catch { }
+            try
+            {
+                if (Get(name, Key) is not byte[] wav) return;
+                using var player = new SoundPlayer(new MemoryStream(wav));
+                player.PlaySync();
+            }
+            catch { }
         }
 
         public static void PlayAndWait(Tone t) => PlayNamedAndWait(Resolve(t, Choice(t)));
@@ -237,17 +247,39 @@ namespace TailRemote
         private static byte[]? Get(string name, int key)
         {
             if (name == NoSound) return null;
-            string cacheKey = name + "|" + key;
+            // Only the patterns play in a key: the same fixed sound made once per key was twelve copies.
+            string cacheKey = UsesKey(name) ? name + "|" + key : name;
             lock (Cache)
             {
-                if (Cache.TryGetValue(cacheKey, out var have)) return have;
+                if (Cache.TryGetValue(cacheKey, out var have))
+                {
+                    CacheOrder.Remove(have);
+                    CacheOrder.AddFirst(have);
+                    return have.Value.Wav;
+                }
                 var (l, r) = Make(name, key);
                 if (l == null) return null;
                 byte[] wav = Wav(l, r!);
-                Cache[cacheKey] = wav;
+                Cache[cacheKey] = CacheOrder.AddFirst((cacheKey, wav));
+                while (Cache.Count > CacheMax)
+                {
+                    var oldest = CacheOrder.Last!;
+                    CacheOrder.RemoveLast();
+                    Cache.Remove(oldest.Value.Key);
+                }
                 return wav;
             }
         }
+
+        /// <summary>Whether a sound depends on the key: the patterns do; phone tunes and recordings don't.</summary>
+        private static bool UsesKey(string name) =>
+            !name.StartsWith("Classic phone: ") && FixedResource(name) == null;
+
+        /// <summary>The built-in recording a fixed sound plays, or null if it is not one.</summary>
+        private static string? FixedResource(string name) =>
+            name.StartsWith("Android effect: ") ? "snd.fixed.android effect." + name["Android effect: ".Length..] + ".opus"
+            : name.StartsWith("Android: ") ? "snd.fixed.android." + name["Android: ".Length..] + ".opus"
+            : name.StartsWith("Nepalese bell") ? "snd.fixed.bell." + name + ".opus" : null;
 
         private static (double[]? L, double[]? R) Make(string name, int key)
         {
@@ -256,14 +288,9 @@ namespace TailRemote
                 var tune = PhoneTunes.FirstOrDefault(t => t.Name == name["Classic phone: ".Length..]);
                 return tune.Notes == null ? (null, null) : PhoneTune(tune.Notes);
             }
-            string? res = name.StartsWith("Android effect: ") ? "snd.fixed.android effect." + name["Android effect: ".Length..] + ".opus"
-                : name.StartsWith("Android: ") ? "snd.fixed.android." + name["Android: ".Length..] + ".opus"
-                : name.StartsWith("Nepalese bell") ? "snd.fixed.bell." + name + ".opus" : null;
-            if (res != null)
-            {
-                var (fl, fr) = Recording(res);
-                return (Copy(fl), Copy(fr));
-            }
+            // A fixed sound is decoded, made and let go: only its finished WAV is cached. (Keeping the
+            // decoded recording as well was 768 KB a second of sound, for every one ever played.)
+            if (FixedResource(name) is string res) return Recording(res, keep: false);
             int comma = name.IndexOf(", ", StringComparison.Ordinal);
             if (comma < 0) return (null, null);
             int instrument = Array.FindIndex(Instruments, i => i.Name == name[..comma]);
@@ -271,8 +298,6 @@ namespace TailRemote
             if (instrument < 0 || pattern < 0) return (null, null);
             return PatternSound(Instruments[instrument], Patterns[pattern].Notes, key);
         }
-
-        private static double[] Copy(double[] a) => (double[])a.Clone();
 
         // ---- Patterns on real instruments ----
 
@@ -417,14 +442,20 @@ namespace TailRemote
 
         private static readonly Dictionary<string, (double[] L, double[] R)> Recordings = new();
 
-        /// <summary>A built-in recording (Ogg Opus), decoded once and kept.</summary>
-        private static (double[] L, double[] R) Recording(string resource)
+        /// <summary>
+        /// A built-in recording (Ogg Opus), decoded. keep: decoded once and kept, for the instrument notes
+        /// the patterns are built from (a fixed set); fixed sounds are not kept, their WAV is cached instead.
+        /// A caller that is given a kept one must not change it.
+        /// </summary>
+        private static (double[] L, double[] R) Recording(string resource, bool keep = true)
         {
             if (Recordings.TryGetValue(resource, out var have)) return have;
             using var s = typeof(Sounds).Assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException("No " + resource);
             using var ms = new MemoryStream();
             s.CopyTo(ms);
-            return Recordings[resource] = OggOpus(ms.ToArray());
+            var decoded = OggOpus(ms.ToArray());
+            if (keep) Recordings[resource] = decoded;
+            return decoded;
         }
 
         /// <summary>

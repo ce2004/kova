@@ -357,6 +357,10 @@ namespace TailRemote
                 // Detached with nothing going: nothing to carry on with, so closed after a minute.
                 long d = Interlocked.Read(ref _detachedAt);
                 if (d != 0 && now - d > GiveUpMs + 10_000 && _out == null && _in == null) { Dispose(); return false; }
+                // Detached for a week: that PC is not coming back for it (a restarted Kova there has a new
+                // channel). Closed so it holds no files, threads or rights for years; what arrived is kept
+                // as "(incomplete)", as with any transfer that ends early.
+                if (d != 0 && now - d > 7L * 24 * 3600_000) { Dispose(); return false; }
             }
             return true;
         }

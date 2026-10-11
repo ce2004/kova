@@ -580,7 +580,8 @@ namespace TailRemote
                     });
                     bool ok = hostSays?.Failed == false && clientSays?.Failed == false && landed != null && Same(file, landed[0]);
                     return ok ? "cut " + cuts + " times, arrived whole, both sides said so (" + ctrl.Files!.TestLanes + " lanes open after)"
-                        : "FAIL: after " + cuts + " cuts host said " + hostSays?.Result + ", client said " + clientSays?.Result;
+                        : "FAIL: after " + cuts + " cuts host said " + hostSays?.Result + ", client said " + clientSays?.Result +
+                          (landed == null ? "; the files never reached the clipboard" : "; what landed (" + landed[0] + ", " + (File.Exists(landed[0]) ? new FileInfo(landed[0]).Length + " bytes" : "missing") + ") differs from what was sent");
                 });
 
                 Scenario("the receiving PC stalls for 20 seconds: lanes are reopened and it finishes", 120, () =>
@@ -1105,21 +1106,31 @@ namespace TailRemote
 
                 Scenario("pressing Stop part-way through a folder: what arrived is kept, and a cut-off file is marked incomplete", 120, () =>
                 {
-                    string src = Path.Combine(Root, "src", "Stopped");
-                    Directory.CreateDirectory(src);
-                    for (int i = 0; i < 8; i++) File.Move(Big("stopped" + i + ".bin", 64), Path.Combine(src, "stopped" + i + ".bin"));
+                    // Over this PC's own loopback 512 MB can all arrive (2 GB a second) before the first progress
+                    // report says it is moving: then Stop came too late to test anything, and it is tried again.
                     FileChannel.Transfer? hostEnd = null;
-                    bool moving = false;
-                    Action<FileChannel.Transfer> note = t => { if (t.What == "Stopped") { if (t.Finished) hostEnd = t; else if (t.Done > 0) moving = true; } };
-                    host.TransferProgress += note;
-                    var send = Task.Run(() => ctrl.Files!.SendFiles(new[] { src }, toClipboard: false));
-                    for (int i = 0; i < 500 && !moving; i++) Thread.Sleep(5);
-                    ctrl.CancelTransfer();
-                    send.Wait(20_000);
-                    for (int i = 0; i < 250 && hostEnd == null; i++) Thread.Sleep(20);
-                    host.TransferProgress -= note;
+                    string name = "Stopped";
+                    for (int attempt = 1; attempt <= 3; attempt++)
+                    {
+                        name = attempt == 1 ? "Stopped" : "Stopped" + attempt;
+                        string src = Path.Combine(Root, "src", name);
+                        Directory.CreateDirectory(src);
+                        for (int i = 0; i < 8; i++) File.Move(Big(name + i + ".bin", 64), Path.Combine(src, name + i + ".bin"));
+                        hostEnd = null;
+                        bool moving = false;
+                        Action<FileChannel.Transfer> note = t => { if (t.What == name) { if (t.Finished) hostEnd = t; else if (t.Done > 0) moving = true; } };
+                        host.TransferProgress += note;
+                        var send = Task.Run(() => ctrl.Files!.SendFiles(new[] { src }, toClipboard: false));
+                        for (int i = 0; i < 500 && !moving && hostEnd == null; i++) Thread.Sleep(5);
+                        ctrl.CancelTransfer();
+                        send.Wait(20_000);
+                        for (int i = 0; i < 250 && hostEnd == null; i++) Thread.Sleep(20);
+                        host.TransferProgress -= note;
+                        if (hostEnd is { Failed: false }) { Console.WriteLine("all of it arrived before Stop; trying again"); continue; }
+                        break;
+                    }
                     Thread.Sleep(1000); // a file still being written is marked incomplete a moment later
-                    string landed = Path.Combine(FileChannel.Downloads, "Stopped");
+                    string landed = Path.Combine(FileChannel.Downloads, name);
                     var kept = Directory.Exists(landed) ? Directory.GetFiles(landed) : Array.Empty<string>();
                     bool marked = kept.Any(f => f.Contains("(incomplete)")), empty = kept.Any(f => new FileInfo(f).Length == 0);
                     bool ok = hostEnd?.Cancelled == true && kept.Length > 0 && !empty && (marked || kept.Length == 8);

@@ -44,7 +44,9 @@ namespace TailRemote
         {
             try
             {
-                var s = new PROCESS_POWER_THROTTLING_STATE { Version = 1, ControlMask = 1 /* EXECUTION_SPEED */, StateMask = 0 /* off */ };
+                // Also IGNORE_TIMER_RESOLUTION (4) off: Windows 11 drops a minimized or hidden window's 1 ms timer
+                // request (a host in the tray), and every short sleep (the H.264 event poll) then took 15 ms.
+                var s = new PROCESS_POWER_THROTTLING_STATE { Version = 1, ControlMask = 1 /* EXECUTION_SPEED */ | 4 /* IGNORE_TIMER_RESOLUTION */, StateMask = 0 /* off */ };
                 SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref s, Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
                 timeBeginPeriod(1);
             }

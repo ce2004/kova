@@ -104,46 +104,47 @@ namespace TailRemote
 
         private void CaptureUntilDeviceChanges()
         {
-            // The chosen output, or Windows' default when none is chosen or it has gone.
-            var dev = Wasapi.OutputDevice(_deviceId);
-            dev.GetId(out string devId);
-            bool followDefault = _deviceId == null || devId != _deviceId;
-            var client = Wasapi.Activate(dev);
-            client.GetMixFormat(out IntPtr fmtPtr);
-            var fmt = Wasapi.ReadFormat(fmtPtr);
-            DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
-            DiagLog.Write("host capture: opened " + DeviceInfo + (followDefault ? " (Windows default)" : " (chosen device)"));
+            // Opened again every few seconds while a device refuses (another program has it alone), for as
+            // long as the host runs: whatever step fails, nothing may be left behind, so everything is let
+            // go in the one finally below. The enumerator is made per open rather than kept for the
+            // thread's life: after Windows' audio service restarts, an old one may no longer answer.
+            Wasapi.IMMDeviceEnumerator? en = null;
+            Wasapi.IMMDevice? dev = null;
+            Wasapi.IAudioClient3? client = null;
+            Wasapi.IAudioCaptureClient? cap = null;
+            AutoResetEvent? ev = null;
+            IntPtr fmtPtr = IntPtr.Zero;
             try
             {
+                // The chosen output, or Windows' default when none is chosen or it has gone.
+                en = Wasapi.Enumerator();
+                dev = Wasapi.OutputDevice(en, _deviceId);
+                dev.GetId(out string devId);
+                bool followDefault = _deviceId == null || devId != _deviceId;
+                client = Wasapi.Activate(dev);
+                client.GetMixFormat(out fmtPtr);
+                var fmt = Wasapi.ReadFormat(fmtPtr);
+                DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
+                DiagLog.Write("host capture: opened " + DeviceInfo + (followDefault ? " (Windows default)" : " (chosen device)"));
                 client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                     200_000, 0, fmtPtr, IntPtr.Zero);
-            }
-            catch
-            {
-                // Tried again every few seconds while the device refuses (another program has it alone):
-                // nothing may be left behind each time.
-                try { Marshal.ReleaseComObject(client); } catch { }
-                try { Marshal.ReleaseComObject(dev); } catch { }
-                throw;
-            }
-            finally { Marshal.FreeCoTaskMem(fmtPtr); }
+                Marshal.FreeCoTaskMem(fmtPtr);
+                fmtPtr = IntPtr.Zero; // freed: the finally must not free it again
 
-            using var ev = new AutoResetEvent(false);
-            client.SetEventHandle(ev.SafeWaitHandle.DangerousGetHandle());
-            var iid = Wasapi.IID_IAudioCaptureClient;
-            client.GetService(ref iid, out object o);
-            var cap = (Wasapi.IAudioCaptureClient)o;
+                ev = new AutoResetEvent(false);
+                client.SetEventHandle(ev.SafeWaitHandle.DangerousGetHandle());
+                var iid = Wasapi.IID_IAudioCaptureClient;
+                client.GetService(ref iid, out object o);
+                cap = (Wasapi.IAudioCaptureClient)o;
 
-            // Most devices already run at 48 kHz, Opus's own rate: then nothing is converted.
-            var rs = fmt.Rate == Protocol.AudioRate ? null : new Resampler(fmt.Rate, Protocol.AudioRate);
-            float[] stereo = new float[4096];
-            client.Start();
-            long lastDataAt = Environment.TickCount64, lastDeviceCheck = lastDataAt;
-            ulong expectedPos = 0;  // the device's own sample counter where the next audio should start
-            bool havePos = false;
-            float[] silence = new float[2 * (fmt.Rate / 5)]; // as long as the biggest gap that is filled (200 ms)
-            try
-            {
+                // Most devices already run at 48 kHz, Opus's own rate: then nothing is converted.
+                var rs = fmt.Rate == Protocol.AudioRate ? null : new Resampler(fmt.Rate, Protocol.AudioRate);
+                float[] stereo = new float[4096];
+                client.Start();
+                long lastDataAt = Environment.TickCount64, lastDeviceCheck = lastDataAt;
+                ulong expectedPos = 0;  // the device's own sample counter where the next audio should start
+                bool havePos = false;
+                float[] silence = new float[2 * (fmt.Rate / 5)]; // as long as the biggest gap that is filled (200 ms)
                 while (!_stop)
                 {
                     ev.WaitOne(5); // loopback events are not guaranteed on every build; poll too
@@ -205,20 +206,24 @@ namespace TailRemote
                         lastDeviceCheck = now;
                         // Reopen when the default output changes (if following it), or when
                         // the chosen output that was missing comes back.
-                        var want = Wasapi.OutputDevice(_deviceId);
-                        want.GetId(out string curId);
-                        Wasapi.Release(want);
+                        var want = Wasapi.OutputDevice(en, _deviceId);
+                        string curId;
+                        try { want.GetId(out curId); }
+                        finally { Wasapi.Release(want); }
                         if (curId != devId && (followDefault || curId == _deviceId)) return;
                     }
                 }
             }
             finally
             {
-                try { client.Stop(); } catch { }
+                if (client != null) try { client.Stop(); } catch { }
                 // Let go now, before the event it signals is closed: a closed handle's number can be reused.
                 Wasapi.Release(cap);
                 Wasapi.Release(client);
                 Wasapi.Release(dev);
+                Wasapi.Release(en);
+                if (fmtPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(fmtPtr);
+                ev?.Dispose();
             }
         }
 
