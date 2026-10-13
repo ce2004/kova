@@ -98,6 +98,8 @@ namespace TailRemote
         }
 
         private int? _lastShown;
+        private System.Net.IPEndPoint? _keptFor; // the PC the last stream watched, and the screen chosen there (-1: none)
+        private int _kept = -1;
         private int _pending; // a redraw is already on its way to the window's thread (Interlocked)
 
         private void ScreenTold(ScreenChoice c)
@@ -117,8 +119,11 @@ namespace TailRemote
         {
             var c = _client();
             if (c == _watching && (_stream != null || c == null)) return;
-            // A reconnect to the same PC keeps the screen chosen; another PC starts on its main one.
-            int keep = _stream != null && c != null && _watching != null && _watching.HostEndPoint.Equals(c.HostEndPoint) ? _stream.Chosen : -1;
+            // A reconnect to the same PC keeps the screen chosen; another PC starts on its main one. Kept
+            // past the stream: a dropped connection is first no connection at all (the stream goes), then
+            // a new one, so comparing with the stream just before lost the choice on every reconnect.
+            if (_stream != null && _watching != null) { _keptFor = _watching.HostEndPoint; _kept = _stream.Chosen; }
+            int keep = c != null && _keptFor != null && _keptFor.Equals(c.HostEndPoint) ? _kept : -1;
             _stream?.Dispose();
             _stream = null;
             _view.Stream = null;

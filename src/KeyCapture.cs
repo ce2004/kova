@@ -278,6 +278,16 @@ namespace TailRemote
             }
             bool toggle = k.vkCode == VK_RETURN && !up && ctrl && shift && !alt && !win;
 
+            // Ctrl+Alt+End's own End is let go here whether or not remote control is still on (like Enter
+            // above): when the connection dropped while End was held, the flag stayed set, and the next
+            // plain End on the remote PC had its key-up swallowed, so End stayed held down there.
+            if (k.vkCode == VK_END && up && _swallowEndUp)
+            {
+                _swallowEndUp = false;
+                lock (_held) _held.Remove((VK_END, true));
+                return 1;
+            }
+
             if (!_remote)
             {
                 if (toggle && IsOurWindowFocused())
@@ -297,12 +307,6 @@ namespace TailRemote
             }
 
             // Ctrl+Alt+End stands for Ctrl+Alt+Del, which never reaches a hook (as in Remote Desktop).
-            if (k.vkCode == VK_END && up && _swallowEndUp)
-            {
-                _swallowEndUp = false;
-                lock (_held) _held.Remove((VK_END, true));
-                return 1;
-            }
             if (k.vkCode == VK_END && !up && ctrl && alt && !shift && !win && _client is Client sas)
             {
                 _swallowEndUp = true;

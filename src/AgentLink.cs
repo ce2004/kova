@@ -142,7 +142,7 @@ namespace TailRemote
             /// pipe is now two-way (it was one-way, service to agent), so the service can pull as well
             /// as push. The old copy's thread ends when its pipe is disposed on the next connection.
             /// </summary>
-            private void ReadLoop(Stream pipe)
+            private void ReadLoop(NamedPipeServerStream pipe)
             {
                 byte[] head = new byte[5], reply = new byte[5];
                 try
@@ -173,6 +173,11 @@ namespace TailRemote
                     }
                 }
                 catch { } // the agent went: its read thread ends, the accept loop takes the next one
+                // Nobody is there any more until the next agent connects. Left set, keys looked typed and
+                // every picture waited 5 seconds and came back as "too slow", stepping the viewer's
+                // quality down after each sign in or switch of user (only a write noticed the agent had gone).
+                if (Interlocked.CompareExchange(ref _pipe, null, pipe) == pipe)
+                    try { pipe.Dispose(); } catch { }
             }
 
             private void AcceptLoop()
@@ -196,12 +201,13 @@ namespace TailRemote
                     // squatter is gone.
                     bool useFirst = first;
                     first = false;
+                    NamedPipeServerStream? pipe = null;
                     try
                     {
                         // Two-way and asynchronous: the service writes keys and clipboard to the agent while a
                         // thread of its own reads the clipboard the agent sends back. On a plain pipe a waiting
                         // read holds up every write (as the service link found), so nothing would reach the agent.
-                        var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 2, PipeTransmissionMode.Byte,
+                        pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 2, PipeTransmissionMode.Byte,
                             PipeOptions.Asynchronous | (useFirst ? PipeOptions.FirstPipeInstance : PipeOptions.None), 0, 0, sec);
                         // A later instance takes the rules of the name's first one, whoever made it. Not ours
                         // (a program squatted on the name first): its maker could connect here posing as the
@@ -221,11 +227,16 @@ namespace TailRemote
                         var old = Interlocked.Exchange(ref _pipe, pipe);
                         try { old?.Dispose(); } catch { }
                         while (_out.TryTake(out _)) { }
-                        new Thread(() => ReadLoop(pipe)) { IsBackground = true, Name = "Kova agent link in" }.Start();
+                        var linked = pipe;
+                        new Thread(() => ReadLoop(linked)) { IsBackground = true, Name = "Kova agent link in" }.Start();
                         ServiceHost.Log("The agent in the signed-in session is connected.");
                     }
                     catch (Exception e)
                     {
+                        // A pipe that never got its agent (one that connected and went at once makes the wait
+                        // throw) is let go: kept, it held one of the name's two places for good, and after
+                        // that no agent could ever connect again until the service restarted.
+                        if (pipe != null && pipe != _pipe) try { pipe.Dispose(); } catch { }
                         if (!warned) ServiceHost.Log("Agent link: " + e.Message + (useFirst ? " Another program may hold the pipe " + PipeName + "." : ""));
                         warned = true;
                         Thread.Sleep(1000);
@@ -340,7 +351,9 @@ namespace TailRemote
                     {
                         Protocol.ReadExactly(pipe, head);
                         int n = BitConverter.ToInt32(head, 1);
-                        if (n < 0 || n > 64 << 20) throw new InvalidDataException("a message too big");
+                        // As big as the service may send: clipboard text up to 512 MB (FileChannel.MaxText). At
+                        // 64 MB, bigger text broke the link (and the keys queued behind it) and never arrived.
+                        if (n < 0 || n > 600 << 20) throw new InvalidDataException("a message too big");
                         byte[] p = new byte[n];
                         Protocol.ReadExactly(pipe, p);
                         switch (head[0])

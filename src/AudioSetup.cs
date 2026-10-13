@@ -131,8 +131,8 @@ namespace TailRemote
             if (FindCable() == null)
             {
                 // Program Files: only administrators can change files there between
-                // the signature check and running the installer.
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "TailRemote-vbcable");
+                // the signature check and running the installer. Named Kova, as every folder Kova makes is.
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Kova-vbcable");
                 byte[] zip = await DownloadAsync(report, ct);
                 Process? installer = null;
                 try

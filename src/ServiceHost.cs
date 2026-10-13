@@ -60,8 +60,13 @@ namespace TailRemote
             return cfg;
         }
 
+        private static readonly object LogGate = new();
+
         public static void Log(string line)
         {
+            // One at a time: the service logs from many threads (hosting, the agent link, the window link,
+            // updates), and a line written while another had the file open was lost without a word.
+            lock (LogGate)
             try
             {
                 // Kept, not wiped: the previous half megabyte moves to service.log.old.
@@ -123,8 +128,10 @@ namespace TailRemote
                 bool copy = !string.Equals(Path.GetFullPath(Environment.ProcessPath!), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
                 if (copy) File.Copy(Environment.ProcessPath!, fresh, true);
 
-                RunHidden("sc.exe", "stop " + Name);
-                stopped = true;
+                // 1060: there is no service yet (the first install), so nothing was stopped. Counted as stopped,
+                // any failure after this spent a minute trying to start a service that did not exist before
+                // saying what went wrong.
+                stopped = RunHidden("sc.exe", "stop " + Name) != 1060;
                 WaitForStopped();
 
                 if (copy)

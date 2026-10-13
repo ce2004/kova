@@ -193,6 +193,9 @@ namespace TailRemote
             Interlocked.Exchange(ref _detachedAt, Now);
         }
 
+        /// <summary>A kept channel taken back by its PC's new connection (host side, under the host's lock).</summary>
+        internal void Reattached() => Interlocked.Exchange(ref _detachedAt, 0);
+
         /// <summary>
         /// Disconnect pressed: the transfers wait (their lanes close, so nothing moves) and carry
         /// on where they were on the next connection to the same PC. Only Stop ends them.
@@ -212,7 +215,8 @@ namespace TailRemote
             _closed = true;
             _dial = null;
             _dialWake.Set();
-            var lanes = _lanes;
+            Lane[] lanes;
+            lock (_lanesGate) lanes = _lanes; // after _closed is set: AddLane checks it under this lock, so no lane is missed
             // Off this thread: ending what comes in waits up to 2 seconds for writes still landing, and this is
             // called with the host's lock held (or from the window), where that would hold up keys or freeze
             // the window. Then a moment for the goodbyes to go out, then the lanes close.
@@ -231,7 +235,7 @@ namespace TailRemote
 
         public void AddLane(TcpClient tcp, SecureLink link)
         {
-            if (_closed) { tcp.Dispose(); return; }
+            if (_closed) { tcp.Dispose(); link.Dispose(); return; }
             tcp.NoDelay = true;
             // No timeouts: a lane that stops is found by the watch (nothing heard for 12 s, or
             // pieces not confirmed for 10 s) and closed, which ends any wait on it.
@@ -243,6 +247,9 @@ namespace TailRemote
             Lane? extra = null;
             lock (_lanesGate)
             {
+                // Checked again under the lock Dispose takes its list of lanes under: a lane added just as the
+                // channel closed was never closed, and kept its threads and connection for good.
+                if (_closed) { tcp.Dispose(); link.Dispose(); return; }
                 var list = _lanes.ToList();
                 if (list.Count >= MaxLanes) { extra = list.OrderBy(l => l.LastIn).First(); list.Remove(extra); }
                 for (int s = 0; ; s++) if (list.All(l => l.Slot != s)) { lane.Slot = s; break; }
@@ -250,7 +257,8 @@ namespace TailRemote
                 _lanes = list.OrderBy(l => l.Slot).ToArray();
             }
             if (extra != null) Kill(extra);
-            Interlocked.Exchange(ref _detachedAt, 0);
+            // _detachedAt is not cleared here: a lane arriving just after Detach would make a kept channel think it
+            // was attached again, and it never closed. Reattaching is the Dial setter (controller) or Reattached (host).
             // Stops that may not have reached the other PC yet (sent while it was unreachable).
             lock (_stops) foreach (var (at, stop) in _stops) if (Now - at < 2 * GiveUpMs) lane.Control.Enqueue(stop);
             // Below normal: keys and sound run on their own threads at higher priority, so even a
@@ -269,6 +277,9 @@ namespace TailRemote
                 _lanes = _lanes.Where(l => l != lane).ToArray();
             }
             try { lane.Tcp.Dispose(); } catch { }
+            // Its keys too, at once rather than whenever memory is next tidied: lanes come and go for years. Safe
+            // while its own threads may still be in a send or receive: they fail, and end, as with the connection.
+            try { lane.Link.Dispose(); } catch { }
             lane.Wake.Set();
             // Its pieces not confirmed yet go again, on the other lanes.
             if (_out is Out o)
@@ -302,7 +313,7 @@ namespace TailRemote
                 if (lane is { } l)
                 {
                     failures = 0;
-                    if (_dial == null || _closed) l.Tcp.Dispose();
+                    if (_dial == null || _closed) { l.Tcp.Dispose(); l.Link.Dispose(); }
                     else AddLane(l.Tcp, l.Link);
                 }
                 else _dialWake.WaitOne(Math.Min(250 << Math.Min(++failures, 3), 2000));
@@ -1042,6 +1053,9 @@ namespace TailRemote
             bool all, entryDone;
             lock (o.Gate)
             {
+                // Ended: nothing more to count, and its list of files may already be let go (emptied), where
+                // looking up this file threw and closed a working lane for nothing.
+                if (o.Ended) return;
                 if (!o.InFlight.Remove((e, offset), out var p)) return; // already counted (sent twice)
                 // Counted against the lane that sent it, which may not be the one the answer came back on
                 // (a piece sent again elsewhere). A lane already cut has had its count cleared: never brought back.

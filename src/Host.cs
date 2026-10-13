@@ -301,15 +301,18 @@ namespace TailRemote
             lock (_guesses)
             {
                 if (!_pending.TryGetValue(a, out var list)) _pending[a] = list = new LinkedList<TcpClient>();
-                if (list.Count >= MaxHandshakesPerAddress)
+                // A flood of new addresses cannot use the last slots: those are kept for blocks that have logged in before.
+                int cap = _known.Contains(a) ? MaxHandshakes + ReservedForKnown : MaxHandshakes;
+                bool full = list.Count >= MaxHandshakesPerAddress;
+                // Decided before anything is dropped: dropping the oldest and then refusing this one anyway
+                // left that oldest login running on, no longer counted and never hung up on.
+                if (_handshakes - (full ? 1 : 0) >= cap) { if (list.Count == 0) _pending.Remove(a); return false; }
+                if (full)
                 {
                     drop = list.First!.Value; // the oldest from this address makes room
                     list.RemoveFirst();
                     _handshakes--;
                 }
-                // A flood of new addresses cannot use the last slots: those are kept for blocks that have logged in before.
-                int cap = _known.Contains(a) ? MaxHandshakes + ReservedForKnown : MaxHandshakes;
-                if (_handshakes >= cap) { if (list.Count == 0) _pending.Remove(a); return false; }
                 list.AddLast(tcp);
                 _handshakes++;
             }
@@ -700,7 +703,7 @@ namespace TailRemote
                             var stale = _controllers.Find(c => c != owner && c.Files is FileChannel f && Same(f));
                             var kept = _kept.Find(Same);
                             if (stale != null) { files = stale.Files!; stale.Files = null; }
-                            else if (kept != null) { files = kept; _kept.Remove(kept); }
+                            else if (kept != null) { files = kept; _kept.Remove(kept); files.Reattached(); }
                             else
                             {
                                 files = new FileChannel(channel)
@@ -857,7 +860,13 @@ namespace TailRemote
                         if (was) { End(s, null); Rebuild(); }
                     }
                     if (was) _status((s.Role == Protocol.RoleControl ? "Disconnected: " : "Stopped listening: ") + remote + ".");
-                    else s.Tcp.Dispose(); // never registered (the host was stopping, or full)
+                    else
+                    {
+                        // Never registered (the host was stopping, or the line broke before it was): its keys
+                        // (Windows key handles) go now too, as End lets them go, not whenever the collector runs.
+                        try { s.Tcp.Dispose(); } catch { }
+                        try { s.Link.Dispose(); } catch { }
+                    }
                 }
                 else if (!handedOff) tcp.Dispose();
                 Native.LeaveDesktop();
@@ -1310,8 +1319,13 @@ namespace TailRemote
                         if (!s.Paused) _audioNudge.Set(); // unmuted: the sound starts at once, not on the next check
                         break;
                     case Protocol.AudioQuality when m.Length == 2:
-                        s.Quality = Math.Min((int)m[1], Protocol.OpusSteps.Length - 1);
-                        DiagLog.Write("host: " + s.Address + " asked for quality step " + s.Quality);
+                        {
+                            int q = Math.Min((int)m[1], Protocol.OpusSteps.Length - 1);
+                            // Logged only when it changes: anyone logged in, even a listener, could otherwise send
+                            // thousands a second and push everything useful out of the size-capped log.
+                            if (q != s.Quality) DiagLog.Write("host: " + s.Address + " asked for quality step " + q);
+                            s.Quality = q;
+                        }
                         break;
                     case Protocol.FilePace when m.Length == 5:
                         Volatile.Write(ref s.Pace, Math.Max(16 << 10, BitConverter.ToUInt32(m, 1) * 1024.0));

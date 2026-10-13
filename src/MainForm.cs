@@ -80,7 +80,7 @@ namespace TailRemote
         private string? _expectUpdate; // the remote PC said it is updating TailRemote to this version: say when it is back
 
         // Host: this PC's addresses, to give the other PC. Enter copies the best one.
-        private readonly MenuItem _copyAddress = new();
+        private readonly MenuItem _copyAddress = new() { WhyNot = "This PC has no network address right now." };
         private string? _bestAddress;
         private readonly System.Collections.Generic.List<(string Id, string Name)> _devices = new();
         private static string NotConnected(string role) => "The " + role + " device chosen before (not connected now: Windows default until it is back)";
@@ -123,6 +123,9 @@ namespace TailRemote
             {
                 if (_client != null) _client.CancelTransfer();
                 else Client.ForgetTransfers(); // waiting for a reconnection: stopped for good
+                // PCs in the background keep their transfers going and the Files line counts them, so
+                // Stop must end theirs too: otherwise it stayed on and pressing it did nothing.
+                foreach (var p in _parked) p.Client.CancelTransfer();
                 _host?.CancelTransfer();
                 _serviceLink?.CancelTransfer();
             };
@@ -798,13 +801,19 @@ namespace TailRemote
             Say("Back to the main window. The remote screen stays on; Control Shift S turns it off.");
         }
 
+        private bool _infoAsking;
+
         private async void RemoteInfo()
         {
             if (!CanUseRemote(out var c)) return;
             Doing("asking for remote PC info");
+            // Pressed twice before the answer came, both got it and two info windows opened, one over the other.
+            if (_infoAsking) { Say("Still asking the remote PC for its info."); return; }
+            _infoAsking = true;
             string text;
             try { text = await c.RequestInfoAsync(); }
             catch { Say("The remote PC did not answer."); return; }
+            finally { _infoAsking = false; }
             if (_client != c) return;
             using var f = new RemoteInfoForm(() => _client, text, Say);
             f.ShowDialog(this);
@@ -907,6 +916,10 @@ namespace TailRemote
             if (_connecting && !_reconnecting) { Say("Still connecting. Try again in a moment."); return; }
             if ((_client != null || _reconnecting) && SamePc(FrontAddress, FrontPort, address, port)) { Say("Already on " + name + "."); return; }
             var target = FindParked(address, port);
+            // A restart or update asked of the PC being left is about that PC: kept, connecting to the
+            // next one said "The remote PC is back" instead of "Connected".
+            _expectRestart = false;
+            _expectUpdate = null;
             if (_client != null) Park(_client);
             else if (_reconnecting) { _attempt++; _reconnecting = false; _retryTimer.Stop(); _resumeRemote = false; _connecting = false; _go.Enabled = true; }
             _address.Text = address;
@@ -1551,7 +1564,9 @@ namespace TailRemote
                 _hostingByItself = true;
                 try { Go(); }
                 finally { _hostingByItself = false; }
-                BeginInvoke(() => HideToTray(announce: false)); // started with Windows: out of the way
+                // Started with Windows: out of the way. Only if hosting really started: when it could not
+                // (the port taken, say), the window hid anyway, its tray icon saying "hosting".
+                BeginInvoke(() => { if (_host != null) HideToTray(announce: false); });
             }
             else if (_autoConnect && !HostMode && _address.Text.Trim().Length > 0) Go();
             // Go said nothing (a setting needed fixing, say): "Updated to version" is said now, not glued to something later.

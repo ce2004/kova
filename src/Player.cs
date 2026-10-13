@@ -285,10 +285,15 @@ namespace TailRemote
 
             lock (_gate)
             {
+                // The device was reopened at another rate while this packet was being converted: it is
+                // made for the old rate and would play at the wrong pitch. The ring was emptied anyway.
+                if (_deviceRate != rate) return;
                 int cap = _ring.Length;
                 for (int i = 0; i < _scratchLen; i++)
                 {
-                    if (_count == cap) { _read = (_read + 2) % cap; _count -= 2; }
+                    // Full (the device stopped taking sound): the oldest goes. A jump under way would
+                    // land on the old read position and leave the count out of step with the ring.
+                    if (_count == cap) { _read = (_read + 2) % cap; _count -= 2; _xfLeft = 0; }
                     _ring[(_read + _count) % cap] = _scratch[i];
                     _count++;
                 }
@@ -436,6 +441,10 @@ namespace TailRemote
             Wasapi.IAudioRenderClient? render = null;
             AutoResetEvent? ev = null;
             IntPtr fmtPtr = IntPtr.Zero;
+            // This open already uses the newest choice: a SetDevice made while a failed open was waiting
+            // to retry must not close the device again as soon as it opens. Cleared before _deviceId is
+            // read, so a choice made from here on still reopens.
+            _deviceChanged = false;
             try
             {
                 en = Wasapi.Enumerator();
@@ -467,6 +476,9 @@ namespace TailRemote
                 lock (_gate)
                 {
                     _read = 0; _count = 0; _playing = false; _ff = 0; _xfLeft = 0;
+                    // The new device starts from silence: fade the sound in, and no glide-out of the old
+                    // device's last sample. A gain left at full started mid-waveform: a click.
+                    _gain = 0; _fadeOut = 0;
                     _periodMs = periodMs;
                 }
                 _deviceRate = fmt.Rate;

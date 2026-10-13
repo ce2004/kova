@@ -212,7 +212,9 @@ namespace TailRemote
                 // can answer from another, and a connected socket silently threw that sound away.
                 // Every audio packet is encrypted and checked, so nothing false gets in.
 
-                player.Reset();
+                // Done by the next Push on its own thread: the player is shared, and another connection's
+                // receive thread may still be pushing into it, while Reset clears Push's state unlocked.
+                player.ResetSoon();
                 var c = new Client(tcp, stream, udp, token, player, new SecureLink(key, hostNonce, myNonce, isHost: false))
                 {
                     ListenOnly = role[0] == Protocol.RoleListen,
@@ -575,9 +577,12 @@ namespace TailRemote
                 if (_closed) return;
                 if (!_urgent.TryDequeue(out var m)) continue;
                 try { _link.Send(_stream, m); }
-                catch
+                catch (Exception e)
                 {
-                    Close("Disconnected: the host stopped taking data.");
+                    // Only a send that timed out means the host stopped taking data; a reset or a dropped
+                    // network found by a send first was said as that too, unlike the same break found by a read.
+                    Close("Disconnected: " + (e is System.IO.IOException { InnerException: SocketException { SocketErrorCode: SocketError.TimedOut } }
+                        ? "the host stopped taking data." : Plain(e)));
                     return;
                 }
             }
@@ -1329,7 +1334,7 @@ namespace TailRemote
                     _udpBlocked = blocked;
                     DiagLog.Write("client: UDP " + (blocked ? "gets no answer" : "answers again"));
                     Status?.Invoke(blocked
-                        ? "No sound: UDP port " + _hostUdp.Port + " is blocked between the PCs, though keys still work. On the remote PC, open the port with Port editor, or check its firewall and the network's."
+                        ? "No sound: UDP port " + _hostUdp.Port + " is blocked between the PCs, though " + (ListenOnly ? "the connection still works" : "keys still work") + ". On the remote PC, open the port with Port editor, or check its firewall and the network's."
                         : "Sound is getting through again.");
                 }
                 // The UDP hello (and its pong, the audio ping): once a second, or ten times a second

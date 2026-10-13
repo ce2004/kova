@@ -998,6 +998,7 @@ namespace TailRemote
         public long Bytes;
         private readonly Func<(TcpClient, SecureLink)?> _dial;
         private volatile bool _stop;
+        private int _disposedOnce;
         private volatile TcpClient? _tcp;
         private volatile SecureLink? _link;
         private readonly object _sendGate = new();
@@ -1151,7 +1152,9 @@ namespace TailRemote
 
         public void Dispose()
         {
-            if (_stop) return;
+            // Once only, even from two threads at once: Stopped running twice would count the client's
+            // open screens below zero.
+            if (Interlocked.Exchange(ref _disposedOnce, 1) == 1) return;
             _stop = true;
             try { _tcp?.Dispose(); } catch { }
             Canvas.Dispose();

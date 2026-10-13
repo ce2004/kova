@@ -246,7 +246,9 @@ namespace TailRemote
             }
             // Silence: passed on for the first second, so the sound fades out
             // properly; after that, nothing at all.
-            if (_silentRun++ < 200) _onPacket(seq, null);
+            // Counted only up to the limit: a program holding a silent stream open for months ran the
+            // count past what an int holds, and it went negative and sent silence again for months.
+            if (_silentRun < 200) { _silentRun++; _onPacket(seq, null); }
         }
 
         private int _silentRun;

@@ -89,8 +89,10 @@ namespace TailRemote
             // off, and quietly removed the sign-in task or closed the port.
             // --startup on DOMAIN\user: the account signed in where it was asked, which may not be the
             // administrator whose password was typed.
-            if ((args.Length == 2 || args.Length == 3) && args[0] == "--startup")
-                return OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn, args.Length == 3 ? args[2] : null) : 2;
+            // A wrong number of words is refused too: it used to fall through and open the whole Kova
+            // window, as administrator, in the elevated copy.
+            if (args.Length >= 1 && args[0] == "--startup")
+                return (args.Length == 2 || args.Length == 3) && OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn, args.Length == 3 ? args[2] : null) : 2;
 
             if (args.Length == 1 && args[0] == "--setup-audio")
             {
@@ -104,8 +106,8 @@ namespace TailRemote
                 return setup!.Result;
             }
 
-            if (args.Length == 3 && args[0] == "--firewall" && int.TryParse(args[2], out int fwPort))
-                return OnOff(args[1], "open", "close") is bool fwOpen ? Firewall.Apply(fwOpen, fwPort) : 2;
+            if (args.Length >= 1 && args[0] == "--firewall")
+                return args.Length == 3 && int.TryParse(args[2], out int fwPort) && OnOff(args[1], "open", "close") is bool fwOpen ? Firewall.Apply(fwOpen, fwPort) : 2;
 
             if ((args.Length == 2 || args.Length == 3) && args[0] == "--service" && args[1] is "install" or "remove")
             {

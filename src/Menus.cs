@@ -184,8 +184,11 @@ namespace TailRemote
             item.Click += (_, _) =>
             {
                 if (!Menu.Usable) { Speech.Speak(Menu.WhyNot); return; }
-                Speech.Speak("checked");
+                // As in Check: the choice's own handlers often speak (interrupting), and "checked" said
+                // first was cut off by them (Capture sound from said only "Now sending ..."). Queued after
+                // them without interrupting, both are heard.
                 SelectedIndex = i;
+                Speech.Speak("checked", interrupt: false);
             };
             Menu.DropDownItems.Add(item);
             return item;

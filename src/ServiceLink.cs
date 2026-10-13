@@ -168,6 +168,9 @@ namespace TailRemote
                 using (var me = WindowsIdentity.GetCurrent()) asSystem = me.IsSystem;
                 if (asSystem) sec.SetOwner(system);
                 bool first = true, warned = false, warnedOwner = false;
+                // The session last refused, said once: a window left open in a session switched away from asks
+                // again every 2 seconds, and each refusal used to be written down, filling the log within hours.
+                uint refused = uint.MaxValue;
                 while (true)
                 {
                     // Claimed before the attempt, win or lose (as AgentLink does): if something squats on the
@@ -176,12 +179,13 @@ namespace TailRemote
                     // is owned by SYSTEM, so a squatter can never pose as the service.
                     bool useFirst = first;
                     first = false;
+                    NamedPipeServerStream? pipe = null;
                     try
                     {
                         // Asynchronous: one thread reads while another writes. On a plain pipe Windows makes a
                         // waiting read hold up every write, and nothing ever reached the window. The first
                         // one must be the first of its name: if another program made it first, it is not ours.
-                        var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 16, PipeTransmissionMode.Byte,
+                        pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 16, PipeTransmissionMode.Byte,
                             PipeOptions.Asynchronous | (useFirst ? PipeOptions.FirstPipeInstance : 0), 0, 0, sec);
                         // A later instance takes the rules of the name's first one, whoever made it. Not ours
                         // (a program squatted on the name first): its maker could connect here posing as a
@@ -200,15 +204,22 @@ namespace TailRemote
                         // that is also signed in, which would otherwise hear what arrives for the clipboard.
                         if (!GetNamedPipeClientSessionId(pipe.SafePipeHandle, out uint session) || session != _session())
                         {
-                            ServiceHost.Log("Service link: refused a Kova window from another session (" + session + ").");
+                            if (session != refused) ServiceHost.Log("Service link: refused a Kova window from another session (" + session + ").");
+                            refused = session;
                             pipe.Dispose();
                             continue;
                         }
+                        refused = uint.MaxValue;
                         var window = new Window(pipe, session);
                         new Thread(() => Serve(window)) { IsBackground = true, Name = "Kova service link window" }.Start();
+                        pipe = null; // Serve's now: it lets it go
                     }
                     catch (Exception e)
                     {
+                        // A pipe that never got its window (one that connected and went at once makes the wait
+                        // throw) is let go: kept, each held one of the name's 16 places for good, and once they
+                        // were all held no Kova window could link up until the service restarted.
+                        try { pipe?.Dispose(); } catch { }
                         if (!warned) ServiceHost.Log("Service link: " + e.Message + (useFirst ? " Another program may hold the pipe " + PipeName + "." : ""));
                         warned = true; // said once, not every second
                         Thread.Sleep(1000);

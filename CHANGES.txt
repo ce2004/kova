@@ -1,3 +1,36 @@
+4.1.3
+Bug fixed: if the PC lost power just after Kova saved its settings, Kova could start with every saved PC and password gone. Settings are now fully written to the disk before they replace the old ones.
+Bug fixed: if you were watching a remote PC's second screen and the connection dropped and came back, the remote screen window went back to the main screen. Now it stays on the screen you chose.
+Bug fixed: if you restarted or updated a remote PC and then switched to another PC, Kova said "The remote PC is back" when the other PC connected. Now it says Connected.
+Bug fixed: if a PC waiting in the background was sending or receiving files, Stop the file transfer did not stop it. Now it stops every transfer.
+Bug fixed: if Kova could not start hosting when Windows started, it still hid in the notification area and said it was hosting. Now the window stays open so you hear what went wrong.
+Bug fixed: if you pressed Remote PC info twice quickly, two identical info windows opened. Now only one opens.
+Bug fixed: Copy this PC's IP address said only "That cannot be used right now" when the PC had no network address. Now it says why.
+Bug fixed: if you picked a device under Capture sound from while hosting, NVDA said what Kova was now sending but not "checked". Now you hear both.
+Bug fixed: if the connection dropped while you were pressing Control Alt End, the next End key you pressed on the remote PC stayed held down there. Now it is let go properly.
+Bug fixed: if you connected to another PC while sound from a PC was still coming in, the sound could break up. Now the new connection starts its sound cleanly.
+Bug fixed: if you switched output devices or unplugged headphones while the other PC's sound was playing, you could hear a click when the sound came back. Now it fades back in smoothly.
+Bug fixed: if you switched to an output device with a different sample rate while sound was playing, a split second could play at the wrong pitch. Now the pitch never changes.
+Bug fixed: if you chose a new output device while the old one wasn't working, the sound could stop and start again once more after it came back. Now it opens once.
+Bug fixed: if a sound device stalled and then recovered, the remote sound could briefly repeat or garble. Now it goes straight back to live.
+Bug fixed: if a PC hosted for months with a program holding its sound open in silence, it could start sending silence over the network again. Now a quiet PC keeps costing nothing.
+Bug fixed: if the remote PC's Kova closed suddenly or your network dropped while you were typing, Kova sometimes said the remote PC had stopped taking data. Now it says what really happened.
+Bug fixed: if you were connected with the listen-only password and the sound was blocked, Kova said keys still work, though listening never sends keys. Now it says the connection still works.
+Bug fixed: if you stopped a transfer or sent something new while files were moving, one of the file connections could drop for no reason and briefly slow the next transfer. Now it stays open.
+Bug fixed: if a connection closed at the very moment a file connection was opening, that file connection could stay open in the background for good. Now it is always closed.
+Bug fixed: if Kova ran a long time on an unreliable connection, small amounts of memory from closed connections built up. Now they are freed at once.
+Bug fixed: if many PCs tried to log in at once, a login could slip past the limit on how many may be under way at a time. Now the limit always holds.
+Bug fixed: if a connected PC kept asking for the same sound quality over and over, the host's log filled up and lost useful entries. Now only real changes are logged.
+Bug fixed: if the Kova service's helper at the screen stopped at just the wrong moment, keys and the remote screen could stop working until the service was restarted. Now it always reconnects.
+Bug fixed: if the Kova window's link to the service kept dropping at the wrong moment, the window could stop linking to the service until the service restarted. Now it always links again.
+Bug fixed: if you were watching the remote screen of a PC running the Kova service while someone signed in or switched user there, the picture quality dropped for no reason. Now it waits for the new screen without dropping.
+Bug fixed: if you copied more than 64 MB of text to a PC running the Kova service with no Kova window open, it never arrived and keys stopped for a moment. Now it lands on the clipboard.
+Bug fixed: if two people were signed in on a PC running the Kova service, its log filled with the same line every 2 seconds. Now it is said once.
+Bug fixed: some lines in the Kova service's log could go missing when several things happened at once. Now every line is written.
+Bug fixed: if turning on the Kova service failed the first time, Kova waited a whole minute before saying why. Now it says at once.
+Bug fixed: if Kova was started with a mistyped firewall or start-at-sign-in command, it opened its main window as administrator instead of refusing. Now it refuses and changes nothing.
+Bug fixed: Set up audio device put its download in a Program Files folder still named TailRemote. It is now called Kova-vbcable.
+
 4.1.2
 Changed: Kova is now built to run for months and years without a restart. A new soak test repeats connecting, sending files, watching the screen and rebuilding menus round after round, and checks that memory, handles and threads stay flat.
 Bug fixed: Kova's memory slowly grew every time a transfer finished, a menu was rebuilt or you switched between PCs. Old menu items are now let go properly.

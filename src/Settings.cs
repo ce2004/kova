@@ -187,7 +187,14 @@ namespace TailRemote
             {
                 Directory.CreateDirectory(Dir);
                 string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(TempPath, json);
+                // Written all the way to the disk before the swap: Windows can keep the new text in memory
+                // for seconds after the rename itself is on disk, and a power cut in that gap left a
+                // settings.json of zeros, so every saved PC and password was gone at the next start.
+                using (var fs = new FileStream(TempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(new UTF8Encoding(false).GetBytes(json));
+                    fs.Flush(flushToDisk: true);
+                }
                 // Atomic: the live settings file is either the old complete one or the new complete
                 // one, never a half-written mix, even if this process is killed partway through.
                 if (File.Exists(FilePath)) File.Replace(TempPath, FilePath, null);
