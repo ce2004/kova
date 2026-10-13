@@ -47,6 +47,11 @@ namespace TailRemote
         private const byte Stop = 0x66;     // u32 id, u8 outcome, UTF-8 why (for the receiver to show; empty: just stopped): the sender stopped it, or could not go on
         private const byte Ask = 0x67;      // u32 id: how did it end? (the answer was lost with a lane)
         private const byte NotSent = 0x68;  // u32 id, u8 kind, u8 outcome, u16 what bytes, UTF-8 what, UTF-8 why: the sender could not even start (nothing there any more, too much), so the receiver is not left waiting
+        // u32 id: the receiver, hearing nothing for a while, asks whether the sender still has this transfer. A sender
+        // that does stays quiet; one that does not (Kova there restarted, or crashed) answers with a Stop, so the
+        // receiver does not wait a week holding its files open. (Added in 4.1.4; older copies never answer.)
+        private const byte Have = 0x69;
+        private const byte Note = 0x6A;     // u32 id, UTF-8 text: what the sender had to leave out (folders it could not open, links), for the receiver's result
         private const byte KindFiles = 1, KindText = 2, KindDownloads = 3; // clipboard files, clipboard text, Send files
         private const byte KindTo = 4; // Send files into a folder the controller chose in Get files (the offer carries it)
         private const byte EndedWell = 0, EndedBadly = 1, EndedStopped = 2;
@@ -60,7 +65,8 @@ namespace TailRemote
         public const long MaxText = 512L << 20;
         /// <summary>The most files and folders in one batch (the receiver keeps a slot for each).</summary>
         public const int MaxEntries = 1_000_000;
-        private const int GiveUpMs = 60_000, StallMs = 10_000, QuietMs = 12_000, PingMs = 3_000, OfferPartBytes = 1 << 20;
+        private const int GiveUpMs = 60_000, StallMs = 10_000, QuietMs = 12_000, PingMs = 3_000, OfferPartBytes = 1 << 20, HaveMs = 5_000;
+        private long _haveAt; // when this side last asked its sender whether it still has the transfer (WatchLoop only)
 
         private static long Now => Environment.TickCount64;
 
@@ -179,7 +185,7 @@ namespace TailRemote
         /// <summary>The controlling PC only: opens one more lane to the host, or returns null.</summary>
         public Func<(TcpClient Tcp, SecureLink Link)?>? Dial
         {
-            set { _dial = value; Interlocked.Exchange(ref _detachedAt, 0); _dialWake.Set(); }
+            set { _dial = value; Interlocked.Exchange(ref _detachedAt, 0); if (value != null) _out?.Unpark(); _dialWake.Set(); }
         }
 
         /// <summary>
@@ -204,7 +210,23 @@ namespace TailRemote
         {
             Detach();
             foreach (var l in _lanes) Kill(l);
+            // The files being sent are let go while paused: an editor saving one (by writing a new copy and
+            // moving it over the old) was refused while Kova held it. Reopened, and checked, on the way back.
+            _out?.Park();
         }
+
+        /// <summary>
+        /// The PC that was sending here is gone for good (it came back as a new Kova, with a new channel):
+        /// whatever was arriving from it ends now, kept as it is, instead of waiting a week with its files open.
+        /// For the host to call on a kept channel; the controlling PC finds this out by itself (Have).
+        /// </summary>
+        public void SenderGone()
+        {
+            if (_in is In b)
+                ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedBadly, NoLongerHas, NoLongerHas, null, tell: false));
+        }
+
+        private const string NoLongerHas = "The other PC no longer has this transfer (Kova there was probably restarted), so it cannot carry on. Send it again.";
 
         /// <summary>Closed on purpose: whatever is going is stopped, and the other PC told so.</summary>
         public void Dispose()
@@ -257,6 +279,7 @@ namespace TailRemote
                 _lanes = list.OrderBy(l => l.Slot).ToArray();
             }
             if (extra != null) Kill(extra);
+            _out?.Unpark(); // a lane joined: the send goes on, and may open its files again
             // _detachedAt is not cleared here: a lane arriving just after Detach would make a kept channel think it
             // was attached again, and it never closed. Reattaching is the Dial setter (controller) or Reattached (host).
             // Stops that may not have reached the other PC yet (sent while it was unreachable).
@@ -364,6 +387,14 @@ namespace TailRemote
                 {
                     bool waiting = now - b.LastActivity > 10_000;
                     if (waiting != b.T.Waiting) { b.T.Waiting = waiting; try { Progress?.Invoke(b.T); } catch { } }
+                }
+                // Lanes are up but nothing arrives: the sending PC may have restarted (lost power, crashed) and
+                // come back without this transfer, and then only the receiver knows it exists. Asked every few
+                // seconds; a sender that still has it says nothing, one that does not answers with a Stop.
+                if (_in is In w && !w.Ended && now - w.LastActivity > HaveMs && now - _haveAt > HaveMs && _lanes is { Length: > 0 } up)
+                {
+                    _haveAt = now;
+                    Tell(up[0], IdMessage(Have, w.Id));
                 }
                 // Detached with nothing going: nothing to carry on with, so closed after a minute.
                 long d = Interlocked.Read(ref _detachedAt);
@@ -479,7 +510,27 @@ namespace TailRemote
                 case Stop when m.Length >= 6: OnStop(BitConverter.ToUInt32(m, 1), m[5], Said(m, 6, m.Length - 6)); break;
                 case Ask when m.Length == 5: OnAsk(lane, BitConverter.ToUInt32(m, 1)); break;
                 case NotSent when m.Length >= 9: OnNotSent(m); break;
+                case Have when m.Length == 5: OnHave(lane, BitConverter.ToUInt32(m, 1)); break;
+                case Note when m.Length >= 5:
+                    lock (_inGate)
+                    {
+                        uint noteId = BitConverter.ToUInt32(m, 1);
+                        string said = Said(m, 5, m.Length - 5);
+                        if (_in is In b && b.Id == noteId) b.Note = said;
+                        else _note = (noteId, said); // comes just before its list: kept for the batch it belongs to
+                    }
+                    break;
             }
+        }
+
+        /// <summary>The receiver asks whether this side still sends that transfer: quiet if so, otherwise a Stop.</summary>
+        private void OnHave(Lane lane, uint id)
+        {
+            if (_out is Out o && o.Id == id) return; // still going (or ending right now, and saying so itself)
+            lock (_stops)
+                foreach (var (_, stop) in _stops)
+                    if (stop[0] == Stop && BitConverter.ToUInt32(stop, 1) == id) { Tell(lane, stop); return; } // how it really ended
+            Tell(lane, OutcomeMessage(Stop, id, EndedBadly, NoLongerHas));
         }
 
         private static byte[] IdMessage(byte type, uint id)
@@ -547,26 +598,106 @@ namespace TailRemote
             public readonly Dictionary<Lane, long> LaneUnacked = new(), LaneHeard = new();
             public long Acked;
             public long[] EntryAcked = Array.Empty<long>();
+            public string? Note; // what the list had to leave out, said with the result on both PCs
             // Under Handles:
             public SafeFileHandle?[] Handles = Array.Empty<SafeFileHandle?>();
+            public FileMeta?[] Seen = Array.Empty<FileMeta?>(); // per file: which file it was, and when last written, as first opened here
+            private int _reading; // reads under way right now (a paused send closes its files only once none is)
+            private volatile bool _parked;
 
             public void Read(int i, long offset, Span<byte> into)
             {
                 var e = Entries[i];
                 if (e.Data != null) { e.Data.AsSpan((int)offset, into.Length).CopyTo(into); return; }
-                SafeFileHandle h;
+                SafeFileHandle? h;
                 lock (Handles)
                 {
                     if (Ended) throw new OperationCanceledException();
-                    h = Handles[i] ??= AsUser == null ? OpenRead(e.Full!)
-                        : System.Security.Principal.WindowsIdentity.RunImpersonated(AsUser.AccessToken, () => OpenRead(e.Full!));
+                    // A lane that took its piece just before the pause cut it: the piece already went back to be
+                    // sent again, and the file is not opened again until the send really goes on.
+                    if (_parked) throw new ParkedException();
+                    h = Handles[i];
+                    if (h != null) _reading++;
                 }
-                for (int got = 0; got < into.Length;)
+                if (h == null)
                 {
-                    int n = RandomAccess.Read(h, into[got..], offset + got);
-                    if (n <= 0) throw new IOException(Path.GetFileName(e.Full) + " got shorter while it was being sent.");
-                    got += n;
+                    // Opened outside the lock: a file on a share that stopped answering must hold up only this lane.
+                    var open = AsUser == null ? OpenRead(e.Full!)
+                        : System.Security.Principal.WindowsIdentity.RunImpersonated(AsUser.AccessToken, () => OpenRead(e.Full!));
+                    // Opened again after a pause: what an editor saved meanwhile (often a whole new file put in its
+                    // place) must not be sent on from the middle, after the start of the old one.
+                    if (Edited(i, open) is string why) { open.Dispose(); throw new IOException(Path.GetFileName(e.Full) + why); }
+                    lock (Handles)
+                    {
+                        if (Ended || _parked) { open.Dispose(); throw Ended ? new OperationCanceledException() : new ParkedException(); }
+                        if (Handles[i] is SafeFileHandle other) { open.Dispose(); h = other; } // another lane opened it meanwhile
+                        else Handles[i] = h = open;
+                        _reading++;
+                    }
                 }
+                try
+                {
+                    for (int got = 0; got < into.Length;)
+                    {
+                        int n = RandomAccess.Read(h, into[got..], offset + got);
+                        if (n <= 0) throw new IOException(Path.GetFileName(e.Full) + " got shorter while it was being sent.");
+                        got += n;
+                    }
+                    // Checked after every read: a file edited part-way (while the send was paused, say) arrived as
+                    // a mix of the old and the new, and both PCs called it sent. A file that was not changed until
+                    // all of it had been read went whole, as it was, and is fine.
+                    if (Edited(i, h) is string changed) throw new IOException(Path.GetFileName(e.Full) + changed);
+                }
+                finally
+                {
+                    lock (Handles) { _reading--; if (_parked && _reading == 0) CloseHandles(); }
+                }
+            }
+
+            /// <summary>
+            /// Why the file can no longer be sent as listed (the words after its name), or null. Shorter than listed: cut.
+            /// Another file than the one first opened (an editor saves by putting a new file in its place): changed,
+            /// whatever its length. The same file at the listed length, written to since: saved over in place, and
+            /// what was already sent is the old file. The same file, longer: only added to (a log still being
+            /// written), so the listed length is still the same start of it, sent as it was. A file Windows will
+            /// not describe is taken as it is (the reads say if it is gone).
+            /// </summary>
+            private string? Edited(int i, SafeFileHandle h)
+            {
+                if (Describe(h) is not FileMeta now) return null; // asked outside the lock: only the record below needs it
+                FileMeta first;
+                lock (Handles)
+                {
+                    if (i >= Seen.Length) return null; // the send ended and let go of its list
+                    Seen[i] ??= now;
+                    first = Seen[i]!.Value;
+                }
+                long listed;
+                try { listed = Entries[i].Length; } catch { return null; }
+                const string Changed = " was changed while it was being sent, so it was not sent. Send it again.";
+                if (now.Length < listed) return " got shorter while it was being sent, so it was not sent. Send it again.";
+                if (!now.SameFile(first)) return Changed;
+                if (now.Length > listed) return null;
+                return now.Written != first.Written ? Changed : null;
+            }
+
+            /// <summary>
+            /// Paused: no file is opened again until it goes on (Unpark), and the open ones are closed, once no read is
+            /// under way, off the caller's thread: Disconnect is pressed on the window's, and a lane can be holding
+            /// the lock while it opens a file on a share that stopped answering.
+            /// </summary>
+            public void Park()
+            {
+                _parked = true;
+                ThreadPool.QueueUserWorkItem(_ => { lock (Handles) if (_parked && _reading == 0) CloseHandles(); });
+            }
+
+            /// <summary>The send goes on: files may be opened again (and are checked when they are).</summary>
+            public void Unpark() => _parked = false;
+
+            private void CloseHandles()
+            {
+                for (int i = 0; i < Handles.Length; i++) { Handles[i]?.Dispose(); Handles[i] = null; }
             }
 
             private static SafeFileHandle OpenRead(string path) => File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -636,13 +767,13 @@ namespace TailRemote
             // The service's agent runs as SYSTEM: it lists and opens what the window's user asked for
             // as that user, so nothing they could not open themselves can be sent.
             List<Entry>? listed = null;
-            string? problem = null;
+            string? problem = null, note = null;
             try
             {
-                if (asUser != null) System.Security.Principal.WindowsIdentity.RunImpersonated(asUser.AccessToken, () => { listed = List(items); });
-                else listed = List(items);
+                if (asUser != null) System.Security.Principal.WindowsIdentity.RunImpersonated(asUser.AccessToken, () => { (listed, note) = List(items); });
+                else (listed, note) = List(items);
             }
-            catch (Exception e) { problem = e.Message; }
+            catch (Exception e) { problem = Plain(e.Message); }
             // Something newer was asked for, or Stop pressed, while a big folder was being listed: this one is not wanted.
             if (Interlocked.Read(ref _requests) != ticket) { Dropped(kind, what, ticket); return; }
             if (problem != null) { NotSending(kind, what, "Could not send " + what + ": " + problem, "The other PC could not send " + what + ": " + problem); return; }
@@ -653,7 +784,7 @@ namespace TailRemote
                 NotSending(kind, what, "Nothing to send: " + gone + ".", "Nothing to get: " + gone + " on the other PC.");
                 return;
             }
-            SendBatch(kind, what, listed, ticket, asUser, into);
+            SendBatch(kind, what, listed, ticket, asUser, into, note: note);
         }
 
         /// <summary>
@@ -733,37 +864,153 @@ namespace TailRemote
             try { Progress?.Invoke(new Transfer { What = what, Clipboard = kind is KindFiles or KindText, Peer = PeerName, Finished = true, Failed = true, Cancelled = outcome == EndedStopped, Result = why }); } catch { }
         }
 
-        private static List<Entry> List(IReadOnlyList<string> items)
+        /// <summary>
+        /// Everything to send, and a sentence for what had to be left out (null if nothing was). Paths are used
+        /// in their \\?\ form throughout: names a Mac or WSL made ("IMG.jpg.", "notes ") are otherwise quietly
+        /// cut short by Windows to a name that is not there, and were left out, or sent under another name.
+        /// </summary>
+        private static (List<Entry> Entries, string? Note) List(IReadOnlyList<string> items)
         {
             var entries = new List<Entry>();
             var tops = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var left = new LeftOut();
             foreach (string item in items)
             {
-                bool dir = Directory.Exists(item);
-                if (!dir && !File.Exists(item)) continue;
+                string full = Long(item);
+                bool dir = Directory.Exists(full);
+                if (!dir && !File.Exists(full)) continue;
                 // Two things with the same name (from different folders): the second becomes "name (2)".
                 string name = TopName(item); // a whole drive's own name is blank, which no PC could make
                 string root = name;
-                for (int n = 2; !tops.Add(root); n++) root = Path.GetFileNameWithoutExtension(name) + " (" + n + ")" + Path.GetExtension(name);
+                for (int n = 2; !tops.Add(root); n++) root = Marked(name, " (" + n + ")");
                 if (dir)
                 {
-                    entries.Add(new Entry(root, -1, item, null));
-                    foreach (string d in SafeEnumerate(item, true)) entries.Add(new Entry(Path.Combine(root, Path.GetRelativePath(item, d)), -1, d, null));
-                    foreach (string f in SafeEnumerate(item, false))
-                    {
-                        long length;
-                        try { length = new FileInfo(f).Length; } catch { continue; } // gone, or not readable: left out
-                        entries.Add(new Entry(Path.Combine(root, Path.GetRelativePath(item, f)), length, f, null));
-                    }
+                    entries.Add(new Entry(root, -1, full, null));
+                    // A folder chosen itself that cannot be opened fails the send, as a locked file does: sent
+                    // empty, it looked as if it had arrived.
+                    if (Walk(full, root, entries, left) is Exception why)
+                        throw new IOException(name + " could not be opened: " + (why is UnauthorizedAccessException ? "Windows did not allow this PC's user to look inside it."
+                            : why is DirectoryNotFoundException ? "it is not there any more, or is a link to a place that is not there." : Plain(why.Message)));
                 }
                 else
                 {
                     long length;
-                    try { length = new FileInfo(item).Length; } catch { tops.Remove(root); continue; } // gone since it was looked at: left out, like one in a folder
-                    entries.Add(new Entry(root, length, item, null));
+                    try
+                    {
+                        var info = new FileInfo(full);
+                        length = (info.Attributes & FileAttributes.ReparsePoint) != 0 ? LinkedLength(full) : info.Length;
+                    }
+                    catch { tops.Remove(root); continue; } // gone since it was looked at: left out, like one in a folder
+                    entries.Add(new Entry(root, length, full, null));
                 }
             }
-            return entries;
+            var said = new List<string>();
+            int n1 = left.Unopened, n2 = left.Links, n3 = left.Broken;
+            if (n1 > 0) said.Add(n1 + (n1 == 1 ? " folder" : " folders") + " could not be opened (Windows did not allow it), so " + (n1 == 1 ? "it was" : "they were") + " left out.");
+            if (n2 > 0) said.Add(n2 + (n2 == 1 ? " folder that is only a link to another place was" : " folders that are only links to other places were") + " left out, not followed.");
+            if (n3 > 0) said.Add(n3 + (n3 == 1 ? " link to a file that is not there any more was" : " links to files that are not there any more were") + " left out.");
+            return (entries, said.Count > 0 ? string.Join(" ", said) : null);
+        }
+
+        /// <summary>
+        /// Adds everything inside a folder, folders before what is in them. Never follows a folder that is a link
+        /// (a junction or symbolic link: it could lead anywhere, even back up into itself): counted too.
+        /// Every file is taken whatever its marks, OneDrive's and other cloud files included (whole on this PC
+        /// or not: reading one fetches it). A folder inside that cannot be opened is left out, counted. If the folder itself cannot be opened, why.
+        /// </summary>
+        private static Exception? Walk(string top, string topRel, List<Entry> entries, LeftOut left)
+        {
+            // By hand, one folder at a time, not Windows' own recursion: that skipped what it could not open in
+            // silence. A stack, not recursion: a folder tree can be thousands deep.
+            var todo = new Stack<(string Full, string Rel, int At)>();
+            todo.Push((top, topRel, -1));
+            var gone = new HashSet<int>(); // folders listed, then found not to open
+            var opts = new EnumerationOptions { RecurseSubdirectories = false, IgnoreInaccessible = false, AttributesToSkip = 0, ReturnSpecialDirectories = false };
+            while (todo.Count > 0)
+            {
+                var (dir, rel, at) = todo.Pop();
+                List<(string Name, FileAttributes Attributes, long Length)> inside;
+                try
+                {
+                    inside = new System.IO.Enumeration.FileSystemEnumerable<(string, FileAttributes, long)>(dir,
+                        (ref System.IO.Enumeration.FileSystemEntry f) => (f.FileName.ToString(), f.Attributes, f.Length), opts).ToList();
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+                {
+                    if (at < 0) return e;
+                    left.Unopened++;
+                    gone.Add(at);
+                    continue;
+                }
+                foreach (var (name, attributes, length) in inside)
+                {
+                    string full = Path.Join(dir, name), r = rel + "\\" + name;
+                    if ((attributes & FileAttributes.Directory) != 0)
+                    {
+                        if ((attributes & FileAttributes.ReparsePoint) != 0)
+                        {
+                            bool? link = IsLink(full, true);
+                            if (link == true) { left.Links++; continue; }
+                            if (link == null) { left.Unopened++; continue; } // cannot even tell what it is: never followed
+                        }
+                        todo.Push((full, r, entries.Count));
+                        entries.Add(new Entry(r, -1, full, null));
+                    }
+                    else
+                    {
+                        long size = length;
+                        // A link to a file: its listed size is the link's own (nothing), not the file's.
+                        if ((attributes & FileAttributes.ReparsePoint) != 0 && IsLink(full, false) == true)
+                            try { size = LinkedLength(full); } catch { left.Broken++; continue; } // leads nowhere: left out, and said
+                        entries.Add(new Entry(r, size, full, null));
+                    }
+                }
+            }
+            if (gone.Count > 0)
+            {
+                // A folder that could not be opened goes from the list too: sent, it arrived empty, as if it were.
+                var keep = new List<Entry>(entries.Count);
+                for (int i = 0; i < entries.Count; i++) if (!gone.Contains(i)) keep.Add(entries[i]);
+                entries.Clear();
+                entries.AddRange(keep);
+            }
+            return null;
+        }
+
+        private sealed class LeftOut { public int Unopened, Links, Broken; }
+
+        /// <summary>Windows' words about a path without the \\?\ in front that this side reads files by (said aloud, it is noise).</summary>
+        private static string Plain(string said) => said.Replace(@"\\?\UNC\", @"\\").Replace(@"\\?\", "");
+
+        /// <summary>A junction or symbolic link (not a cloud file's or deduplication's own marks, which are real files and folders).</summary>
+        private static bool? IsLink(string path, bool folder)
+        {
+            try { return (folder ? new DirectoryInfo(path) : (FileSystemInfo)new FileInfo(path)).LinkTarget != null; }
+            catch { return null; } // cannot tell: a folder is then left out as one that could not be opened, never followed
+        }
+
+        /// <summary>The size of what a link to a file leads to.</summary>
+        private static long LinkedLength(string path)
+        {
+            using var h = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return RandomAccess.GetLength(h);
+        }
+
+        /// <summary>
+        /// The \\?\ form of a path, which Windows takes exactly as it is: no dot or space at the end of a name
+        /// cut off, and no 260-character limit. One that is not a plain full path is made one first.
+        /// </summary>
+        private static string Long(string path)
+        {
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal)) return path;
+            string p = path.Replace('/', '\\');
+            if (p.Length > 3) p = p.TrimEnd('\\');
+            string rest = p.StartsWith(@"\\", StringComparison.Ordinal) ? p[2..] : p;
+            // "." or ".." or a doubled separator would be taken literally after \\?\: tidied the usual way first
+            // (which a name ending in a dot cannot be in, but such a path comes from Explorer already tidy).
+            if (!Path.IsPathFullyQualified(p) || rest.Split('\\').Any(s => s.Length == 0 || s == "." || s == ".."))
+                p = Path.GetFullPath(p);
+            return p.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + p[2..] : @"\\?\" + p;
         }
 
         /// <summary>Sends clipboard text. Blocking. Replaces any batch still going.</summary>
@@ -771,13 +1018,6 @@ namespace TailRemote
         {
             long ticket = Interlocked.Increment(ref _requests);
             SendBatch(KindText, "clipboard text", new List<Entry> { new("", 0, null, Encoding.UTF8.GetBytes(text)) }, ticket);
-        }
-
-        private static IEnumerable<string> SafeEnumerate(string dir, bool dirs)
-        {
-            var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
-            try { return dirs ? Directory.EnumerateDirectories(dir, "*", opts).ToList() : Directory.EnumerateFiles(dir, "*", opts).ToList(); }
-            catch { return Array.Empty<string>(); }
         }
 
         /// <summary>Test only (--chaostest): sends a batch with any paths at all, as a hostile PC could.</summary>
@@ -795,7 +1035,7 @@ namespace TailRemote
             if (_in is In b) ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ".", "The other PC stopped receiving " + b.T.What + ".", null, tell: true));
         }
 
-        private void SendBatch(byte kind, string what, List<Entry> entries, long ticket, System.Security.Principal.WindowsIdentity? asUser = null, string? into = null, bool checkCount = true)
+        private void SendBatch(byte kind, string what, List<Entry> entries, long ticket, System.Security.Principal.WindowsIdentity? asUser = null, string? into = null, bool checkCount = true, string? note = null)
         {
             // Refused here, before anything is offered: the other PC would refuse it anyway, and a name too
             // long for the list's two-byte length would arrive as a different, damaged list.
@@ -822,6 +1062,8 @@ namespace TailRemote
             o.EntryAcked = new long[entries.Count];
             o.Next = new long[entries.Count];
             o.Handles = new SafeFileHandle?[entries.Count];
+            o.Seen = new FileMeta?[entries.Count];
+            o.Note = note;
             // Sending something new replaces what is still going; unless something newer still (or Stop) came
             // while this one was being got ready.
             bool replaced;
@@ -879,6 +1121,17 @@ namespace TailRemote
                     if (lanes.Length > 0 && (offeredOn == null || offeredOn.Dead))
                     {
                         offeredOn = lanes[0];
+                        // Just ahead of the list, on the same lane: a batch with nothing in its files ends the moment
+                        // its list arrives, and must already know what to say.
+                        if (o.Note != null)
+                        {
+                            byte[] note = Encoding.UTF8.GetBytes(o.Note.Length > 1000 ? o.Note[..1000] : o.Note);
+                            byte[] nm = new byte[5 + note.Length];
+                            nm[0] = Note;
+                            BitConverter.TryWriteBytes(nm.AsSpan(1), o.Id);
+                            note.CopyTo(nm, 5);
+                            offeredOn.Control.Enqueue(nm);
+                        }
                         foreach (var part in o.OfferParts()) offeredOn.Control.Enqueue(part);
                         offeredOn.Wake.Set();
                     }
@@ -920,7 +1173,7 @@ namespace TailRemote
             t.Waiting = false;
             t.Files = Array.Empty<(string, long, long)>();
             if (o.Outcome == EndedWell)
-                t.Result = "Sent " + o.What + (o.Kind == KindText ? "" : Summary(o.Entries.Select(e => (e.Rel, e.Length)))) + At(t) + ".";
+                t.Result = "Sent " + o.What + (o.Kind == KindText ? "" : Summary(o.Entries.Select(e => (e.Rel, e.Length)))) + At(t) + "." + (o.Note != null ? " " + o.Note : "");
             else { t.Failed = true; t.Cancelled = o.Outcome == EndedStopped; t.Result = o.Why; }
             // Last: the window may be reading this transfer from an earlier report, and must never see it
             // finished without its result.
@@ -1028,10 +1281,12 @@ namespace TailRemote
             BitConverter.TryWriteBytes(m.AsSpan(5), p.Entry);
             BitConverter.TryWriteBytes(m.AsSpan(9), p.Offset);
             try { o.Read(p.Entry, p.Offset, m.AsSpan(17, p.Length)); }
+            catch (ParkedException) { return; } // paused: this lane was cut, and its piece already went back to be sent again
             catch (Exception e)
             {
                 // A file locked, deleted or not allowed: the receiver is told it failed and why, not that it was stopped.
-                if (!o.Ended) EndOut(o, EndedBadly, "Could not send " + o.What + ": " + e.Message, tell: true, "The other PC could not send " + o.What + ": " + e.Message);
+                string why = Plain(e.Message);
+                if (!o.Ended) EndOut(o, EndedBadly, "Could not send " + o.What + ": " + why, tell: true, "The other PC could not send " + o.What + ": " + why);
                 return;
             }
             // Paced: never faster than the controlling PC says the sound can bear. Short waits, so
@@ -1134,6 +1389,24 @@ namespace TailRemote
             public double LastReport, Speed, Moving; // speed lately, and the time data was really arriving
             public long LastDone;
             public long NameBytes; // the list's names so far, capped (MaxNameBytes) as they arrive
+            public volatile string? Note; // from the sender: what it had to leave out
+            public int Fixed; // names changed to ones Windows allows (Validate)
+            public string? FixedFrom; // the first of them, to say
+            public int FixedAt = -1; // and its entry, whose name in the end (Finals) is said: a clash can make it "name (2)"
+
+            /// <summary>What the result adds: names changed here, and what the sender left out. Empty if nothing.</summary>
+            public string Notes()
+            {
+                string s = "";
+                if (Fixed > 0)
+                {
+                    string given = FixedAt >= 0 && FixedAt < Finals.Length && Finals[FixedAt] is string f ? Path.GetFileName(f)
+                        : FixedAt >= 0 && Entries[FixedAt]?.Rel is string rel ? rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..] : "";
+                    s += " Some names had to change to suit Windows: \"" + FixedFrom + "\" is now \"" + given + "\"" + (Fixed > 1 ? ", and " + (Fixed - 1) + " more" : "") + ".";
+                }
+                if (Note is { Length: > 0 } n) s +=" On the other PC, " + char.ToLowerInvariant(n[0]) + n[1..];
+                return s;
+            }
 
             public long Length(int i) => Entries[i]!.Value.Length;
         }
@@ -1142,6 +1415,7 @@ namespace TailRemote
         private volatile In? _in;
         private readonly Dictionary<uint, (byte Outcome, string Why)> _results = new();
         private readonly Queue<uint> _resultOrder = new();
+        private (uint Id, string Text)? _note; // a Note whose list has not arrived yet (under _inGate)
 
         /// <summary>How a batch ended, kept so a sender that missed the answer can ask again. Under _inGate.</summary>
         private void Remember(uint id, byte outcome, string why)
@@ -1225,6 +1499,7 @@ namespace TailRemote
                     b.T.Clipboard = kind is KindFiles or KindText;
                     b.T.Peer = PeerName;
                     if (kind == KindText) b.T.What = "clipboard text";
+                    if (_note is var (noteId, said) && noteId == id) { b.Note = said; _note = null; }
                     _in = b;
                 }
             }
@@ -1365,6 +1640,17 @@ namespace TailRemote
                 var (rel, length) = b.Entries[i]!.Value;
                 // The list's total size is capped as it arrives (MaxNameBytes); here, each path's own.
                 if (rel.Length > MaxPathChars) throw new InvalidDataException("a list of files far too long to be real");
+                // A path that names a drive or a share ("C:\Windows\x", "C:x", "\\server\x") is an escape attempt,
+                // refused before any renaming below could turn "C:" into a harmless-looking "C_".
+                if (Path.IsPathRooted(rel) || rel.StartsWith('\\') || rel.StartsWith('/')) throw new InvalidDataException("a path that leaves the folder");
+                // A name a Mac or Linux made that Windows cannot ("IMG.jpg.", "notes ", "con", "a:b") is changed a
+                // little and said, rather than refusing the whole batch for one name.
+                if (Suited(rel) is string suited)
+                {
+                    string was = rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..], now = suited[(suited.LastIndexOf('\\') + 1)..];
+                    if (was != now && b.Fixed++ == 0) { b.FixedFrom = was; b.FixedAt = i; } // counted once each, not again for what is inside a renamed folder
+                    b.Entries[i] = (rel = suited, length);
+                }
                 // Said plainly: a name Windows cannot make (CON, NUL.txt, one ending in a dot) is not an escape attempt.
                 foreach (string part in rel.Split('\\', '/')) if (BadName(part) is string bad) throw new InvalidDataException(bad);
                 string path = SafePath(folder, rel) ?? throw new InvalidDataException("a path that leaves the folder");
@@ -1380,10 +1666,9 @@ namespace TailRemote
                 if (files.Add(path) && !folders.Contains(path)) continue;
                 int cut = Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1;
                 string parent = rel[..cut], name = rel[cut..];
-                string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
                 for (int n = 2; ; n++)
                 {
-                    string fresh = parent + stem + " (" + n + ")" + ext;
+                    string fresh = parent + Marked(name, " (" + n + ")");
                     string freshPath = SafePath(folder, fresh) ?? throw new InvalidDataException("a path that leaves the folder");
                     if (folders.Contains(freshPath) || !files.Add(freshPath)) continue;
                     b.Entries[i] = (fresh, length);
@@ -1421,14 +1706,31 @@ namespace TailRemote
         /// "name (incomplete).ext" (then "name (incomplete 2).ext"...), shortened if need be so it still fits
         /// Windows' 255 characters for one name: a long name that fitted must not fail only for the mark.
         /// </summary>
-        private static string PartialName(string name, int n)
+        private static string PartialName(string name, int n) => Marked(name, n == 1 ? " (incomplete)" : " (incomplete " + n + ")");
+
+        /// <summary>
+        /// The name with mark put before its extension ("photo (2).jpg"), shortened if need be to fit Windows'
+        /// 255 characters (an absurdly long "extension", from a long name with an early dot, once left a name too
+        /// long to make), never between the two halves of one character. A name that is all extension
+        /// (".gitignore") is all name: ".gitignore (2)", not " (2).gitignore".
+        /// </summary>
+        private static string Marked(string name, string mark)
         {
-            string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
-            string mark = n == 1 ? " (incomplete)" : " (incomplete " + n + ")";
+            string ext = Path.GetExtension(name), stem = name[..^ext.Length];
+            // All extension (".gitignore"), or an "extension" too long to keep whole (a long name with an early
+            // dot, "Dr. Smith's notes..."): all of it is the name, and the mark goes at its end.
+            if (stem.Length == 0 || mark.Length + ext.Length > 254) { stem = name; ext = ""; }
             int room = 255 - mark.Length - ext.Length;
-            if (room <= 0) { ext = ext[..Math.Max(1, ext.Length + room - 1)]; room = 1; } // an absurdly long extension gives way too
-            if (stem.Length > room) stem = stem[..room];
+            if (stem.Length > room) stem = Cut(stem, room);
             return stem + mark + ext;
+        }
+
+        /// <summary>The first n characters, one fewer if that would split a character made of two (an emoji, say) in half.</summary>
+        private static string Cut(string s, int n)
+        {
+            if (n >= s.Length) return s;
+            if (n > 0 && char.IsHighSurrogate(s[n - 1])) n--;
+            return s[..n];
         }
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
@@ -1545,7 +1847,7 @@ namespace TailRemote
                         : FinishedMessage(id, EndedBadly, "The other PC no longer had this transfer. Send it again."));
                 return;
             }
-            SafeFileHandle? h = null;
+            SafeFileHandle? h = null, closing = null;
             bool repeat = false, busy = false, whole = false, report = false, complete = false;
             Exception? failed = null;
             try
@@ -1599,7 +1901,7 @@ namespace TailRemote
                     {
                         if ((b.Got[e] += n) == b.Length(e))
                         {
-                            b.Handles[e]?.Dispose();
+                            closing = b.Handles[e]; // looked at, then closed, outside this lock
                             b.Handles[e] = null;
                             b.Claimed[e] = null;
                             b.Active.Remove(e);
@@ -1626,11 +1928,24 @@ namespace TailRemote
                         if (b.Done == b.Total && !b.Completing) complete = b.Completing = true;
                     }
                 }
+                if (closing != null)
+                {
+                    // Deleted or renamed by someone here while it arrived (it is open so that they can): all of it
+                    // went into a file that is gone, or has another name. Said as a failure; it used to be called
+                    // received, with a puzzling "could not be given its own name".
+                    bool lost = Lost(b, closing, b.Paths[e]);
+                    closing.Dispose();
+                    if (lost) throw new IOException(Path.GetFileName(b.Finals[e]) + " was deleted (or renamed) on the receiving PC before all of it had arrived.");
+                }
                 // All of this file is here: from its "(incomplete)" name to its own, before it is confirmed.
                 if (whole) try { Finish(b, e); } catch { } // held by something for now: Complete tries again, and says so if it must
             }
             catch (Exception ex) { failed = ex; }
-            finally { if (busy) lock (b.Gate) b.Busy--; } // before any end below, which waits for this count to reach nothing
+            finally
+            {
+                closing?.Dispose(); // already, unless something failed first
+                if (busy) lock (b.Gate) b.Busy--; // before any end below, which waits for this count to reach nothing
+            }
             if (failed != null)
             {
                 if (!b.Ended) EndIn(b, EndedBadly, "Could not receive " + b.T.What + ": " + failed.Message, "The other PC could not receive " + b.T.What + ": " + failed.Message, lane, tell: true);
@@ -1643,6 +1958,84 @@ namespace TailRemote
             Tell(lane, got);
             if (report) Progress?.Invoke(b.T);
             if (complete) Complete(b, lane);
+        }
+
+        /// <summary>Thrown by Out.Read while a send is paused: not a failure, the piece goes again once it goes on.</summary>
+        private sealed class ParkedException : Exception { }
+
+        /// <summary>Which file a handle is (its drive and number there), how long, and when it was last written.</summary>
+        private readonly record struct FileMeta(uint Volume, ulong Index, long Length, long Written)
+        {
+            // Some network drives and NAS shares give no file number (0), or a new one each time the file is
+            // opened: unknown counts as the same file, so a good transfer is never failed as "changed" for that.
+            public bool SameFile(FileMeta o) => Volume == 0 || o.Volume == 0 || Index == 0 || o.Index == 0 || (Volume == o.Volume && Index == o.Index);
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct ByHandleInfo
+        {
+            public uint Attributes, CreatedLow, CreatedHigh, AccessedLow, AccessedHigh, WrittenLow, WrittenHigh;
+            public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle file, out ByHandleInfo info);
+
+        /// <summary>One question to Windows for all of it; null if it will not say (or the handle was let go).</summary>
+        private static FileMeta? Describe(SafeFileHandle h)
+        {
+            try
+            {
+                if (h.IsClosed || !GetFileInformationByHandle(h, out var i)) return null;
+                return new FileMeta(i.Volume, ((ulong)i.IndexHigh << 32) | i.IndexLow, (long)(((ulong)i.SizeHigh << 32) | i.SizeLow), (long)(((ulong)i.WrittenHigh << 32) | i.WrittenLow));
+            }
+            catch { return null; }
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct FileStandardInfo { public long AllocationSize, EndOfFile; public uint NumberOfLinks; public byte DeletePending, Directory; }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int infoClass, out FileStandardInfo info, int size);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+        private static extern int GetFinalPathNameByHandleW(SafeFileHandle file, [System.Runtime.InteropServices.Out] char[] path, int size, int flags);
+
+        /// <summary>
+        /// True if the file open as h is no longer where it was made: deleted (waiting to go once closed) or given
+        /// another name. Only sure answers count; unsure is false, and the rename after says if it cannot be done.
+        /// Only "delete pending" is trusted from Windows' own description: drives run by programs (Dokan, some cloud
+        /// drives) say a file has no names at all when it is fine. Its own name first: the folders above can be
+        /// reached by other paths (a junction, OneDrive). A name that reads differently (a NAS can give back
+        /// accented letters in another form) is settled by opening the file where it was made: gone, or another
+        /// file there, and it is lost.
+        /// </summary>
+        private static bool Lost(In b, SafeFileHandle h, string path)
+        {
+            try
+            {
+                if (GetFileInformationByHandleEx(h, 1 /* FileStandardInfo */, out var info, System.Runtime.InteropServices.Marshal.SizeOf<FileStandardInfo>())
+                    && info.DeletePending != 0) return true;
+                char[] buf = new char[1024];
+                int n = GetFinalPathNameByHandleW(h, buf, buf.Length, 0);
+                if (n >= buf.Length) n = GetFinalPathNameByHandleW(h, buf = new char[n + 1], n + 1, 0); // a long path: it said how long
+                if (n > 0 && n < buf.Length)
+                {
+                    string now = Path.GetFileName(new string(buf, 0, n)), was = Path.GetFileName(path);
+                    if (string.Equals(now, was, StringComparison.OrdinalIgnoreCase)) return false;
+                    if (string.Equals(now.Normalize(), was.Normalize(), StringComparison.OrdinalIgnoreCase)) return false;
+                }
+                // Its name could not be read, or reads differently: looked for where it was made.
+                if (Describe(h) is not FileMeta mine) return false;
+                try
+                {
+                    using var there = b.As(() => File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+                    return Describe(there) is FileMeta other && !other.SameFile(mine);
+                }
+                catch (FileNotFoundException) { return true; }
+                catch { return false; }
+            }
+            catch { return false; }
         }
 
         /// <summary>Everything arrived: onto the clipboard, or announced in Downloads.</summary>
@@ -1688,7 +2081,8 @@ namespace TailRemote
                 b.Text = null;
                 t.Result = "Received the clipboard text.";
             }
-            if (unnamed > 0) t.Result += " " + unnamed + (unnamed == 1 ? " file arrived whole but could not be given its own name, so it is still" : " files arrived whole but could not be given their own names, so they are still") + " called incomplete.";
+            t.Result += b.Notes();
+            if (unnamed > 0) t.Result +=" " + unnamed + (unnamed == 1 ? " file arrived whole but could not be given its own name, so it is still" : " files arrived whole but could not be given their own names, so they are still") + " called incomplete.";
             Volatile.Write(ref t.Finished, true); // last, as in Run: never seen finished without its result
             lock (_inGate)
             {
@@ -1799,6 +2193,7 @@ namespace TailRemote
                 why += " What had arrived was kept: " + whole + " of " + files + (files == 1 ? " file" : " files") +
                     (part > 0 ? ", and " + part + " only partly, marked incomplete" : "") +
                     (b.Kind == KindFiles && !replaced ? ", on your clipboard." : ", in " + Where(b.Folder!) + ".");
+            if (b.Prepared) why += b.Notes();
             lock (_inGate)
             {
                 if (_in == b) _in = null;
@@ -1910,13 +2305,9 @@ namespace TailRemote
         {
             bool Free(string n) => !File.Exists(Path.Combine(folder, n)) && !Directory.Exists(Path.Combine(folder, n)) && (taken == null || !taken.Contains(n));
             if (Free(name)) return name;
-            string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
             for (int i = 2; ; i++)
             {
-                string mark = " (" + i + ")", s = stem;
-                int room = 255 - mark.Length - ext.Length;
-                if (s.Length > room && room > 0) s = s[..room];
-                string n = s + mark + ext;
+                string n = Marked(name, " (" + i + ")");
                 if (Free(n)) return n;
             }
         }
@@ -1926,7 +2317,7 @@ namespace TailRemote
         {
             if (rel.Length == 0 || Path.IsPathRooted(rel)) return null;
             foreach (string part in rel.Split('\\', '/'))
-                if (part.Length == 0 || part == "." || part == ".." || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || BadName(part) != null) return null;
+                if (part.Length == 0 || part == "." || part == ".." || BadName(part) != null) return null;
             string full = Path.GetFullPath(Path.Combine(folder, rel));
             // Trimmed first: a drive's root ("D:\") already ends in the separator.
             return full.StartsWith(Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ? full : null;
@@ -1947,10 +2338,37 @@ namespace TailRemote
         private static string? BadName(string part)
         {
             if (part.Length == 0 || part == "." || part == "..") return null;
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return "the name \"" + part + "\" contains a character Windows does not allow in names";
             if (part.EndsWith('.') || part.EndsWith(' ')) return "the name \"" + part + "\" ends in a dot or a space, which Windows does not allow";
             string stem = part.Split('.')[0].TrimEnd(' ');
             if (Reserved.Contains(stem, StringComparer.OrdinalIgnoreCase)) return "the name \"" + part + "\" is one Windows keeps for itself (like CON or NUL), so no file can have it";
             return null;
+        }
+
+        /// <summary>
+        /// The path with every name Windows cannot make changed a little (null if none needs it): a character it does
+        /// not allow becomes "_", a dot or space at the end goes, and a name it keeps for itself gets "_" ("con" is
+        /// "con_", "NUL.txt" is "NUL_.txt"). "." and ".." are left alone, for SafePath to refuse as escapes.
+        /// </summary>
+        private static string? Suited(string rel)
+        {
+            string[] parts = rel.Split('\\', '/');
+            bool changed = false;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string part = parts[i];
+                if (part.Length == 0 || part == "." || part == ".." || BadName(part) == null) continue;
+                char[] c = part.ToCharArray();
+                for (int j = 0; j < c.Length; j++) if (Array.IndexOf(Path.GetInvalidFileNameChars(), c[j]) >= 0) c[j] = '_';
+                string s = new string(c).TrimEnd('.', ' ');
+                if (s.Length == 0) s = "_";
+                int dot = s.IndexOf('.');
+                string stem = dot < 0 ? s : s[..dot];
+                if (Reserved.Contains(stem.TrimEnd(' '), StringComparer.OrdinalIgnoreCase)) s = stem + "_" + (dot < 0 ? "" : s[dot..]);
+                parts[i] = s;
+                changed = true;
+            }
+            return changed ? string.Join('\\', parts) : null;
         }
 
         /// <summary>
@@ -2011,7 +2429,9 @@ namespace TailRemote
                 foreach (var d in new[] { hold, hold.Parent })
                     if (d != null && d.Exists && (d.Attributes & FileAttributes.ReparsePoint) != 0) return;
                 var cutoff = DateTime.UtcNow.AddMinutes(-10);
-                foreach (var old in new DirectoryInfo(Staging).GetDirectories().OrderByDescending(d => d.Name).Skip(1))
+                // The newest by when it was made, not by its name: the name has the local time in it, which goes
+                // back an hour when summer time ends (or the PC moves west), and the newest batch was deleted.
+                foreach (var old in new DirectoryInfo(Staging).GetDirectories().OrderByDescending(d => d.CreationTimeUtc).ThenByDescending(d => d.Name).Skip(1))
                 {
                     if ((old.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                     if (old.CreationTimeUtc >= cutoff) continue;

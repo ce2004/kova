@@ -119,6 +119,15 @@ namespace TailRemote
         /// <summary>Buffered audio plus the output device, in ms; -1 while nothing plays.</summary>
         public int AudioDelayMs => _player.DelayMs;
 
+        /// <summary>
+        /// The host hung up before answering the login, after waiting as long as it waits for a login
+        /// (8 s from its start): the line is very slow or the host busy. Not damage, and maybe a wrong password.
+        /// </summary>
+        public const string LoginNotAwaited = "The remote PC stopped waiting for the login: the line is very slow, or Kova there is busy.";
+        // A damaged answer is hung up on within a round trip (seconds on the slowest lines); the host's own wait
+        // ends 8 s after it took the connection, a little after the hello reached this PC.
+        private const int LoginGaveUpMs = 6000;
+
         private Client(TcpClient tcp, NetworkStream stream, UdpClient udp, byte[] token, Player player, SecureLink link)
         {
             _tcp = tcp; _stream = stream; _udp = udp; _token = token; _player = player; _link = link;
@@ -141,6 +150,8 @@ namespace TailRemote
                 IPAddress[] addrs;
                 try { addrs = Dns.GetHostAddresses(address); }
                 catch (SocketException) { addrs = Array.Empty<IPAddress>(); }
+                // Over 255 characters (or otherwise not a name at all): .NET's own wording was read out.
+                catch (ArgumentException) { throw new InvalidOperationException("That address is too long, or is not a PC name or address. Check it."); }
                 if (addrs.Length == 0)
                     throw new InvalidOperationException(Protocol.LocalTailscaleUp()
                         ? "Could not find " + address + ". Check the name or address."
@@ -171,6 +182,7 @@ namespace TailRemote
                         ? "The other PC has a different Kova version, or the connection damaged its first message. Update both to the latest."
                         : "That is not a Kova host, or the connection damaged its first message.");
                 Protocol.ReadExactly(stream, hello.AsSpan(4));
+                var sinceHello = Stopwatch.StartNew(); // the host's patience for the answer runs from about now
                 if (!Protocol.CheckOk(hello)) throw new InvalidOperationException(Protocol.DamagedLogin);
                 byte[] hostNonce = hello[4..20];
                 byte[] passwordKey = Protocol.DeriveKey(password, hello.AsSpan(Protocol.HelloSaltAt, Protocol.SaltBytes));
@@ -194,6 +206,12 @@ namespace TailRemote
 
                 byte[] reply = new byte[Protocol.ReplyBytes];
                 try { Protocol.ReadExactly(stream, reply); }
+                // The host hangs up without a word in two cases. On a damaged answer it does so at once.
+                // On a login over 8 seconds in all (a very slow line, or a busy host), it gave up waiting: that is not damage, and may even be a wrong password, so
+                // it must not be reported as damage (the window keeps trying again on damage).
+                catch (System.IO.IOException e) when (sinceHello.ElapsedMilliseconds >= LoginGaveUpMs
+                    && (e is System.IO.EndOfStreamException || e.InnerException is SocketException { SocketErrorCode: not SocketError.TimedOut }))
+                { throw new InvalidOperationException(LoginNotAwaited); }
                 catch (System.IO.EndOfStreamException) { throw new InvalidOperationException(Protocol.DamagedLogin); } // the host hung up on a damaged answer
                 if (!Protocol.CheckOk(reply)) throw new InvalidOperationException(Protocol.DamagedLogin);
                 if (reply[0] != 1) throw new InvalidOperationException("Wrong password.");
@@ -1016,10 +1034,30 @@ namespace TailRemote
             if (TestFirstTicks == 0) TestFirstTicks = ticks; else if (ticks != TestFirstTicks) TestOtherTicks++;
             uint seq = BitConverter.ToUInt32(d, 1);
             double now = Player.Now;
-            if (_haveNext && (int)(seq - _next) < 0) { _player.CountLate(ticks); return; } // its moment has passed
+            if (_haveNext && (int)(seq - _next) < 0) { TooLate(seq, ticks); return; } // its moment has passed
             if (_haveNext && (int)(seq - _next) > 400) { _queue.Clear(); _haveNext = false; } // after a pause: start again from here
             _queue.TryAdd(seq, (d, now));
             Drain(now);
+        }
+
+        // Packets played for real over the last 512 ticks (2.5 s), by number. A bad Wi-Fi or mobile
+        // line can deliver the same packet twice; the copy arrives after its moment and was counted
+        // as a late packet, as sound trouble, and every one cut the file pace by 30 percent (a
+        // duplicate now and then held transfers at the 64 KB/s floor).
+        private const int PlayedWindow = 512;
+        private readonly long[] _played = NewPlayed();
+        private static long[] NewPlayed() { var p = new long[PlayedWindow]; Array.Fill(p, -1L); return p; }
+
+        /// <summary>
+        /// A packet whose moment has passed. A copy of one already played is dropped silently. Only
+        /// one whose place was filled in by Opus (or skipped) really came too late and is counted.
+        /// One from further back than the window is as good as a replay and counts for nothing.
+        /// </summary>
+        private void TooLate(uint seq, int ticks)
+        {
+            if (_played[seq % PlayedWindow] == seq) return;
+            if ((int)(_next - seq) > PlayedWindow) return;
+            _player.CountLate(ticks);
         }
 
         /// <summary>Decodes what is in order in the queue; what waits behind a gap waits up to ReorderWaitMs.</summary>
@@ -1057,7 +1095,7 @@ namespace TailRemote
             if (_haveNext)
             {
                 int gap = (int)(seq - _next);
-                if (gap < 0) { _player.CountLate(ticks); return; } // its moment has passed
+                if (gap < 0) { TooLate(seq, ticks); return; } // its moment has passed
                 if (gap > 0 && gap <= 24)
                 {
                     if (gap == ticks && ticks >= 8)
@@ -1081,6 +1119,7 @@ namespace TailRemote
             int frames = _decoder.Decode(opus, _pcm, _pcm.Length / 2, false);
             _next = seq + (uint)ticks;
             _haveNext = true;
+            _played[seq % PlayedWindow] = seq; // played for real: a copy of it arriving later is not lateness
             if (frames > 0) _player.Push(seq, _pcm.AsSpan(0, frames * 2), ticks, arrivedAt: arrivedAt);
         }
 

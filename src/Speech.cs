@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -17,9 +18,26 @@ namespace TailRemote
         private static delegate* unmanaged[Stdcall]<char*, int> _speakText;
         private static delegate* unmanaged[Stdcall]<int> _cancelSpeech;
 
+        // Interrupt: cut off whatever NVDA is saying (and anything waiting) before this is said.
         private readonly record struct Utterance(string Message, bool Interrupt);
         private static readonly Queue<Utterance> Pending = new();
         private static readonly object Gate = new();
+
+        // The one rule for who may cut whom off:
+        //  - An answer to something you pressed (interrupt: true) cuts off whatever is being said, as
+        //    you have moved on and want to hear the answer now.
+        //  - News that happened by itself (interrupt: false: a transfer ended, a health alert, the other
+        //    PC dropped or is updating) never cuts anything off: it waits its turn.
+        //  - But news less than a second old is never thrown away by an answer: the answer is said
+        //    right after it instead. In a burst (a health alert, then "Received ...", then a drop) only
+        //    the last line used to survive, each one cutting the one before after a few milliseconds.
+        //  - Only once per burst, and not behind long news: an answer then waited for the whole of a long
+        //    line, and on a line that kept dropping and coming back no answer ever cut anything off, so
+        //    NVDA's own queue only grew.
+        private const int FreshNewsMs = 1000;
+        private const int LongNews = 100; // characters: news longer than this is cut off by an answer as before
+        private static long _newsAt = long.MinValue / 2; // when the latest news was handed over (cleared once an answer waited for it)
+        private static bool _newsLong;
 
         public static void Init()
         {
@@ -36,7 +54,19 @@ namespace TailRemote
             if (_speakText == null || string.IsNullOrEmpty(message)) return;
             lock (Gate)
             {
-                if (interrupt) Pending.Clear();
+                long now = Environment.TickCount64;
+                if (!interrupt) { _newsAt = now; _newsLong = message.Length > LongNews; }
+                else if (now - _newsAt < FreshNewsMs && !_newsLong)
+                {
+                    _newsAt = long.MinValue / 2; // the next answer cuts in as usual, until new news comes
+                    // Fresh news is still being said (or waiting): the answer goes after it, cutting
+                    // nothing. Older answers still waiting are dropped: this one replaces them.
+                    var keep = Pending.Where(u => !u.Interrupt).ToList();
+                    Pending.Clear();
+                    foreach (var u in keep) Pending.Enqueue(u);
+                    interrupt = false;
+                }
+                else Pending.Clear();
                 while (Pending.Count >= 8) Pending.Dequeue();
                 Pending.Enqueue(new Utterance(message, interrupt));
                 Monitor.Pulse(Gate);

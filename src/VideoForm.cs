@@ -11,15 +11,16 @@ namespace TailRemote
     /// real size as this screen allows, which suits NVDA's OCR (NVDA+R) as well as anyone watching.
     /// Escape goes back to the main window and leaves it on; Control Shift S turns it off (closes it);
     /// F5 asks for a whole new picture; Control Shift Enter controls the remote PC; 1 to 9, Page Down and
-    /// Page Up choose which of the remote PC's screens is shown.
+    /// Page Up choose which of the remote PC's screens is shown; Control 1 to 9 switch to that saved PC.
     /// Minimized, it pauses: the remote PC takes no pictures while there is nothing to look at.
     /// After a dropped connection it carries on with the next one by itself.
     /// </summary>
     internal sealed class VideoForm : Form
     {
         private readonly Func<Client?> _client;
-        private readonly Action<string> _say;
+        private readonly Action<string> _say, _tell; // an answer (cuts off older speech); news (waits its turn)
         private readonly Action _controlRemote, _back;
+        private readonly Action<int> _switchTo; // Control 1 to 9: the main window's switch to saved PC 1 to 9
         private readonly ScreenView _view = new();
         private readonly Timer _follow = new() { Interval = 1000 };
         private Client? _watching;
@@ -27,10 +28,12 @@ namespace TailRemote
         private bool _saidShowing, _minimized;
         private string? _saidNote;
 
-        public VideoForm(Func<Client?> client, Action<string> say, Action controlRemote, Action back)
+        public VideoForm(Func<Client?> client, Action<string> say, Action<string> tell, Action controlRemote, Action back, Action<int> switchTo)
         {
             _client = client;
             _say = say;
+            _tell = tell;
+            _switchTo = switchTo;
             _controlRemote = controlRemote;
             _back = back;
             Text = "Kova - remote screen, " + Rate(0);
@@ -111,7 +114,7 @@ namespace TailRemote
             // Not asked for here: the host says the screen being shown was unplugged on the remote PC, and it
             // went back to the main one. Only the host's word counts: a new line first shows the main one
             // until our choice reaches it, and unplugging another screen renumbers this one.
-            if (c.Gone && !c.Refused) _say((before is int was && was != c.Shown ? "Screen " + (was + 1) : "The screen shown") + " is gone from the remote PC. " + c.Say());
+            if (c.Gone && !c.Refused) _tell((before is int was && was != c.Shown ? "Screen " + (was + 1) : "The screen shown") + " is gone from the remote PC. " + c.Say());
         }
 
         /// <summary>Watching whichever connection is in front now: a new one after a reconnect or a switch of PC.</summary>
@@ -179,14 +182,24 @@ namespace TailRemote
             _saidShowing = false;
             _view.Note = text;
             _view.Invalidate();
-            _say(text);
+            // News, queued: it comes by itself (the once-a-second follow, or the host), and cut off what
+            // had just been said, such as "Switched to ... Listen only." after Control 1 to 9.
+            _tell(text);
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
             if (e.KeyCode == Keys.Escape) { _back(); e.Handled = true; }
             else if (e.KeyCode == Keys.S && e.Control && e.Shift && !e.Alt) { Close(); _say("unchecked. Stopped showing the remote screen."); e.Handled = true; }
-            else if (e.KeyCode == Keys.F5) { _stream?.Refresh(); _say("A whole new picture."); e.Handled = true; }
+            else if (e.KeyCode == Keys.F5)
+            {
+                if (_stream is { } s) { s.Refresh(); _say("A whole new picture."); }
+                else _say("Not watching the remote screen right now" + (_view.Note is string why ? ": " + why : "."));
+                e.Handled = true;
+            }
+            // Control 1 to 9 switch PCs here too, as About, Keyboard shortcuts says they do anywhere; the
+            // screen then follows the PC switched to.
+            else if (e.Modifiers == Keys.Control && e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D9) { _switchTo(e.KeyCode - Keys.D0); e.Handled = true; }
             else if (e.KeyCode == Keys.Enter && e.Control && e.Shift) { _controlRemote(); e.Handled = true; }
             // The remote PC's screens: 1 to 9 pick one (on the number row or the number pad), Page Down and
             // Page Up go to the next and the previous.

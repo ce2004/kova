@@ -323,6 +323,48 @@ namespace TailRemote
             return all;
         }
 
+        /// <summary>
+        /// The single-file exe unpacks its native libraries (NVDA's speech among them) to a folder of
+        /// its own per build, %TEMP%\.net\Kova\(a code), and .NET never removes it: every update and
+        /// every build left another 8 MB there for good. Those of other builds go, but only when nothing
+        /// uses them (a running Kova window has NVDA's library from its folder loaded), and one unpacked
+        /// in the last ten minutes is left alone (a copy just starting may not have loaded it yet).
+        /// </summary>
+        public static void CleanUnpackedCopies()
+        {
+            try
+            {
+                // This copy's own folder is in its native library search list; a build that is not a
+                // single file has none there, and then nothing is touched.
+                if (AppContext.GetData("NATIVE_DLL_SEARCH_DIRECTORIES") is not string search) return;
+                string? mine = null;
+                foreach (string d in search.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string full = Path.GetFullPath(d).TrimEnd(Path.DirectorySeparatorChar);
+                    string? parent = Path.GetDirectoryName(full);
+                    if (parent != null && string.Equals(Path.GetFileName(Path.GetDirectoryName(parent)), ".net", StringComparison.OrdinalIgnoreCase)) { mine = full; break; }
+                }
+                if (mine == null) return;
+                string app = Path.GetDirectoryName(mine)!; // ...\.net\Kova: only this exe name's builds
+                foreach (string dir in Directory.GetDirectories(app))
+                {
+                    if (string.Equals(dir.TrimEnd(Path.DirectorySeparatorChar), mine, StringComparison.OrdinalIgnoreCase)) continue;
+                    try
+                    {
+                        var info = new DirectoryInfo(dir);
+                        if (DateTime.UtcNow - info.CreationTimeUtc < TimeSpan.FromMinutes(10) || DateTime.UtcNow - info.LastWriteTimeUtc < TimeSpan.FromMinutes(10)) continue;
+                        // NVDA's library first: every Kova window loads it as it starts, and Windows refuses to
+                        // delete a loaded library, so a folder in use stops here with nothing else gone.
+                        foreach (string lib in Directory.GetFiles(dir, "nvdaControllerClient*.dll")) { File.SetAttributes(lib, FileAttributes.Normal); File.Delete(lib); }
+                        foreach (string f in Directory.GetFiles(dir, "*", SearchOption.AllDirectories)) File.SetAttributes(f, FileAttributes.Normal);
+                        Directory.Delete(dir, true);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
         private static bool TryDelete(string path)
         {
             try

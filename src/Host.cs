@@ -99,9 +99,19 @@ namespace TailRemote
             public long LastMessage = Environment.TickCount64; // anything at all from it (it pings several times a second while holding keys)
             public bool WarnedNoUdp;
             public readonly HashSet<(ushort Vk, bool Ext)> Held = new();
+            // Modifiers KeySafety let go while the controller went quiet, whose key-up has not come since
+            // (under Held's lock): if the controller presses another key first, it was still holding them.
+            public readonly HashSet<(ushort Vk, bool Ext)> LetGo = new();
             public readonly byte[] Audio = new byte[5 + 1 + Protocol.MaxOpusBytes + SecureLink.TagSize];
             public uint SentUntil; // the tick after the last audio sent
+            public uint SentFirst; // the first tick ever sent to it: packet numbers are compared from here
             public bool SentAny;
+            public TcpClient? Video; // its newest screen connection (one per controller: a newer one closes the older)
+            // Remote tools under way for it (one of each at a time, so one PC cannot tie up the host's threads).
+            public int InfoBusy, ListBusy, Fetches; // ListBusy: under ListGate
+            public bool DrivesBusy; // under ListGate: the drive list, listed beside a slow folder
+            public readonly Queue<(byte[] Id, string Path)> ListQueue = new(); // folders asked for while one was being listed; under ListGate
+            public readonly object ListGate = new();
         }
 
         private string? _captureDevice;
@@ -109,6 +119,8 @@ namespace TailRemote
         /// <summary>captureDevice: the output whose sound is sent, or null for Windows' default.</summary>
         public Host(int port, string password, string? listenPassword, Action<string> status, string? captureDevice = null)
         {
+            // Checked here, with a message to show: TcpListener throws ArgumentOutOfRange, which nothing translated.
+            if (port < 1 || port > 65535) throw new InvalidOperationException("Port " + port + " is not a port number. Choose a port from 1 to 65535.");
             _captureDevice = captureDevice;
             _key = Protocol.DeriveKey(password, _salt);
             _listenKey = string.IsNullOrEmpty(listenPassword) ? null : Protocol.DeriveKey(listenPassword, _salt);
@@ -630,11 +642,12 @@ namespace TailRemote
                 // Refused at once, holding nothing: too many logins under way, or this address keeps guessing.
                 if (Blocked(remote) || !BeginHandshake(remote, tcp)) { tcp.Dispose(); return; }
                 counted = true;
-                using var deadline = new Timer(_ => { try { tcp.Dispose(); } catch { } }, null, LoginDeadlineMs, Timeout.Infinite);
+                // The deadline is kept by the reads themselves (ReadBefore): a timer on the thread pool fired
+                // late whenever the pool was busy, and a login trickled in a byte at a time stayed open 26 s.
+                long deadline = Environment.TickCount64 + LoginDeadlineMs;
                 tcp.NoDelay = true;
                 tcp.SendTimeout = 5000; // a PC that stops reading is dropped, never waited on forever
                 var stream = tcp.GetStream();
-                stream.ReadTimeout = 3_000; // a login that says nothing is dropped after 3 seconds
 
                 byte[] nonce = RandomNumberGenerator.GetBytes(16);
                 using var exchange = Protocol.NewExchange();
@@ -647,7 +660,9 @@ namespace TailRemote
                 stream.Write(hello);
 
                 byte[] answer = new byte[Protocol.AnswerBytes];
-                Protocol.ReadExactly(stream, answer);
+                // The whole login time for the answer, not 3 seconds: a line with a 3 second round trip could
+                // never log in, and the controller was told the login was damaged.
+                ReadBefore(stream, answer, deadline);
                 // Damaged on the way (or junk): hang up. Never counted as a wrong password, so
                 // a bad link cannot get a PC blocked, and the client simply tries again.
                 if (!Protocol.CheckOk(answer)) { tcp.Dispose(); return; }
@@ -664,7 +679,6 @@ namespace TailRemote
                     if (!CryptographicOperations.FixedTimeEquals(answer.AsSpan(Protocol.LaneProofAt, 32),
                             Protocol.LaneProof(owner.Key, nonce, answer.AsSpan(12, 16), answer.AsSpan(28, 16))))
                     { tcp.Dispose(); return; }
-                    deadline.Change(Timeout.Infinite, Timeout.Infinite);
                     EndHandshake(remote, tcp); counted = false; // a viewer must not hold a login's place
                     using var link = new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true,
                         Protocol.VideoPurpose(nonce, answer.AsSpan(28, 16)), maxReceive: 64 << 10, maxSend: SecureLink.MaxSend);
@@ -725,7 +739,6 @@ namespace TailRemote
                             files.PeerName = owner.Address.ToString();
                         }
                     }
-                    deadline.Change(Timeout.Infinite, Timeout.Infinite);
                     files.AddLane(tcp, new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true, FileChannel.LanePurpose(nonce, answer.AsSpan(28, 16))));
                     handedOff = true;
                     return;
@@ -783,7 +796,6 @@ namespace TailRemote
                 token.CopyTo(accept, 2);
                 Protocol.Proof(key, 'H', clientNonce, nonce).CopyTo(accept, 10);
                 Protocol.AddCheck(accept);
-                deadline.Change(Timeout.Infinite, Timeout.Infinite); // logged in: from here the 10 second read timeout watches it
                 stream.Write(accept);
                 // The client pings every 2 seconds; 10 silent seconds means it is gone,
                 // and ending the session lets go of any keys it was holding.
@@ -873,6 +885,21 @@ namespace TailRemote
             }
         }
 
+        /// <summary>Fills buffer, or throws once the login's deadline has passed, however the bytes trickle in.</summary>
+        private static void ReadBefore(NetworkStream stream, byte[] buffer, long deadline)
+        {
+            int got = 0;
+            while (got < buffer.Length)
+            {
+                long left = deadline - Environment.TickCount64;
+                if (left <= 0) throw new TimeoutException();
+                stream.ReadTimeout = (int)Math.Max(1, left);
+                int n = stream.Read(buffer, got, buffer.Length - got);
+                if (n <= 0) throw new System.IO.EndOfStreamException();
+                got += n;
+            }
+        }
+
         private bool IsController(Session s) { lock (_gate) return _controllers.Contains(s); }
 
         // ---- The remote screen ----
@@ -920,10 +947,21 @@ namespace TailRemote
                 body.CopyTo(m.AsSpan(1));
                 lock (sendGate) link.Send(stream, m);
             }
+            // One screen connection per controller: a viewer that reconnected after its line stalled would
+            // otherwise be counted against its own dead connections, which never end on their own (still
+            // pictures are small enough to keep buffering), until it was told 8 PCs were already watching.
+            var older = Interlocked.Exchange(ref owner.Video, tcp);
+            if (older != null)
+            {
+                try { older.Dispose(); } catch { }
+                // Its place is this one's: a moment for it to give it back (its thread ends once its line is closed).
+                for (int i = 0; i < 100 && Volatile.Read(ref _viewers) >= Protocol.MaxViewers; i++) Thread.Sleep(50);
+            }
             if (Interlocked.Increment(ref _viewers) > Protocol.MaxViewers)
             {
                 try { Send(Protocol.VideoNote, System.Text.Encoding.UTF8.GetBytes("No picture: " + Protocol.MaxViewers + " PCs are already watching this screen.")); } catch { }
                 Interlocked.Decrement(ref _viewers);
+                Interlocked.CompareExchange(ref owner.Video, null, tcp);
                 return;
             }
             int viewer = Interlocked.Increment(ref _nextViewer);
@@ -997,6 +1035,8 @@ namespace TailRemote
                 bool lastWasVideo = false;
                 bool resting = false; // the viewer is minimized and its copies of the screen and encoder were let go of
                 long lastSent = Environment.TickCount64;
+                uint ackSeen = 0;
+                long ackSeenAt = lastSent; // when a confirmation last came (or nothing was waiting for one)
                 string? said = null;
                 while (!_stop && Volatile.Read(ref closed) == 0 && IsController(owner))
                 {
@@ -1007,11 +1047,17 @@ namespace TailRemote
                         // Minimized: what is kept for this viewer (its copies of the screen, its H.264 encoder) goes
                         // until it looks again; it then starts with a whole picture (the unpause asks for one).
                         if (!resting) { resting = true; try { VideoForget(viewer); } catch { } }
+                        ackSeenAt = now; // minimized: nothing is waited for meanwhile
                         if (now - lastSent > 5000) { Send(Protocol.VideoStill, default); lastSent = now; }
                         got.WaitOne(1000);
                         continue;
                     }
                     resting = false;
+                    // Pictures on their way and not one confirmed for a minute: the line is dead (a stalled
+                    // connection still takes small pictures into its buffers), so it ends and gives its place back.
+                    uint ackNow = Volatile.Read(ref acked);
+                    if (ackNow != ackSeen || number == ackNow) { ackSeen = ackNow; ackSeenAt = now; }
+                    else if (now - ackSeenAt > 60_000) break;
                     // H.264's share of the line while things move: most of the pace, less on the lower steps.
                     double linePace = Math.Max(16 << 10, Math.Min(TestPaceCap, Volatile.Read(ref owner.Pace)));
                     int kbps = (int)Math.Clamp(linePace * 8 / 1000 * 0.7 * Math.Pow(0.7, Math.Max(0, step - VideoSettings.Start)), 250, 40_000);
@@ -1148,12 +1194,15 @@ namespace TailRemote
             {
                 owner.VideoStep = step;
                 Volatile.Write(ref closed, 1);
+                Interlocked.CompareExchange(ref owner.Video, null, tcp);
                 try { tcp.Dispose(); } catch { }
+                // Its place is given back at once, before the slower tidying below (the agent, the reader): a
+                // replacing connection from the same PC waits for it and must not be told the screen is full.
+                Interlocked.Decrement(ref _viewers);
                 try { VideoForget(viewer); } catch { }
                 // The reader ends with the line closed above; only then are the event and keys let go
                 // (a handle each per screen opened, otherwise left to the collector).
                 if (reader.Join(2000)) { got.Dispose(); try { link.Dispose(); } catch { } }
-                Interlocked.Decrement(ref _viewers);
                 Thread.CurrentThread.Priority = priority;
             }
         }
@@ -1178,6 +1227,20 @@ namespace TailRemote
                             if (!_controllers.Contains(s)) break;
                             lock (s.Held)
                             {
+                                if (s.LetGo.Count > 0)
+                                {
+                                    // KeySafety let go of modifiers while this PC was quiet. Its key-up for one means the
+                                    // user really let go (TCP keeps the order, so it comes before any later key); any other
+                                    // key pressed first means they were held all along: pressed again before it, so
+                                    // Ctrl+A stays Ctrl+A and never becomes a plain A.
+                                    if (up) s.LetGo.Remove((vk, ext));
+                                    else
+                                    {
+                                        foreach (var k in s.LetGo)
+                                            if (k != (vk, ext) && s.Held.Add(k)) Native.SendKey(k.Vk, 0, false, k.Ext);
+                                        s.LetGo.Clear();
+                                    }
+                                }
                                 if (up) s.Held.Remove((vk, ext)); else s.Held.Add((vk, ext));
                                 Native.SendKey(vk, scan, up, ext);
                             }
@@ -1199,6 +1262,14 @@ namespace TailRemote
                         lock (_gate)
                         {
                             if (!_controllers.Contains(s)) break; // only controllers move the pointer, like keys
+                            // A wheel turn after a stall: modifiers KeySafety let go are pressed again first, so
+                            // Ctrl+wheel stays a zoom (as for keys in the Key case above).
+                            if (m[1] is Protocol.MouseWheel or Protocol.MouseSideWheel)
+                                lock (s.Held)
+                                {
+                                    foreach (var k in s.LetGo) if (s.Held.Add(k)) Native.SendKey(k.Vk, 0, false, k.Ext);
+                                    s.LetGo.Clear();
+                                }
                             Native.SendMouse(m[1], BitConverter.ToInt16(m, 2), BitConverter.ToInt16(m, 4));
                         }
                         break;
@@ -1225,27 +1296,23 @@ namespace TailRemote
                         {
                             byte[] id = m[1..5];
                             string path = System.Text.Encoding.UTF8.GetString(m, 5, m.Length - 5);
-                            // Off this thread: a slow drive must not hold up the keys behind it.
-                            ThreadPool.QueueUserWorkItem(_ =>
+                            // One listing at a time per PC: a flood of them (each waits up to a second and a
+                            // half on the drives) tied up the host's pool threads, and every other PC's
+                            // clipboard and Get files waited minutes behind it. Asked again while one is being
+                            // listed: a few wait their turn, in order; past that, the PC is told to wait.
+                            bool start = false, full = false, drives = false;
+                            lock (s.ListGate)
                             {
-                                // Never let a problem here end the host (or the service): it is said instead.
-                                string listing;
-                                System.Security.Principal.WindowsIdentity? user = null;
-                                try
-                                {
-                                    if (FileUser == null) listing = RemoteTools.ListFolder(path);
-                                    else if ((user = FileUser()) == null) listing = "E\t" + FileChannel.NobodySignedIn;
-                                    else listing = System.Security.Principal.WindowsIdentity.RunImpersonated(user.AccessToken, () => RemoteTools.ListFolder(path));
-                                }
-                                catch (Exception e) { listing = "E\t" + e.Message; }
-                                finally { user?.Dispose(); }
-                                byte[] body = System.Text.Encoding.UTF8.GetBytes(listing);
-                                byte[] r = new byte[5 + body.Length];
-                                r[0] = Protocol.FolderList;
-                                id.CopyTo(r, 1);
-                                body.CopyTo(r, 5);
-                                try { s.Link.Send(s.Stream, r); } catch { }
-                            });
+                                if (s.ListBusy == 0) { s.ListBusy = 1; start = true; }
+                                // The list of drives never waits behind a folder on a dead network share or a
+                                // sleeping disk (which can take a minute): going back to This PC always works. One at a time.
+                                else if (path.Length == 0 && !s.DrivesBusy) { s.DrivesBusy = true; drives = true; }
+                                else if (s.ListQueue.Count < 4) s.ListQueue.Enqueue((id, path));
+                                else full = true;
+                            }
+                            if (full) SendListing(s, id, "E\tThe remote PC is still busy with the folders asked for before. Try again in a moment.\n");
+                            if (start) ThreadPool.QueueUserWorkItem(_ => ListFolders(s, id, path)); // off this thread: a slow drive must not hold up the keys behind it
+                            if (drives) ThreadPool.QueueUserWorkItem(_ => { try { ListOne(s, id, ""); } finally { lock (s.ListGate) s.DrivesBusy = false; } });
                         }
                         break;
                     case Protocol.Fetch when IsController(s):
@@ -1254,35 +1321,62 @@ namespace TailRemote
                             FileChannel? files;
                             lock (_gate) files = s.Files;
                             if (files == null) Protocol.SendMessage(s.Link, s.Stream, "The file connection is not open yet. Try again in a moment.");
-                            else if (paths.Length > 0) ThreadPool.QueueUserWorkItem(_ =>
+                            else if (paths.Length > 0)
                             {
-                                // Read as the signed-in user when this is the service (FileUser); the batch keeps the
-                                // identity to open each file, so it is let go only once the batch has ended (SendFiles
-                                // returns then).
-                                System.Security.Principal.WindowsIdentity? user = null;
+                                // A thread of its own, not the pool's (a batch holds it until it has been sent), and a
+                                // few at a time per PC: a flood of them starved every other PC's clipboard and folder
+                                // lists. A newer batch replaces one still going (SendFiles), so a few is plenty.
+                                if (Interlocked.Increment(ref s.Fetches) > 3)
+                                {
+                                    Interlocked.Decrement(ref s.Fetches);
+                                    // Off this thread: Refuse can wait up to 10 s for file lanes, and keys are read here.
+                                    ThreadPool.QueueUserWorkItem(_ => { try { files.Refuse(paths, "The remote PC is still starting the files asked for before. Try again in a moment."); } catch { } });
+                                    break;
+                                }
                                 try
                                 {
-                                    // Every way this ends reaches the controller as the end of a transfer: a message
-                                    // alone left its Get files saying "getting" for good.
-                                    if (FileUser != null && (user = FileUser()) == null) { files.Refuse(paths, FileChannel.NobodySignedIn); return; }
-                                    files.SendFiles(paths, toClipboard: false, asUser: user);
+                                    new Thread(() =>
+                                    {
+                                        // Read as the signed-in user when this is the service (FileUser); the batch keeps the
+                                        // identity to open each file, so it is let go only once the batch has ended (SendFiles
+                                        // returns then).
+                                        System.Security.Principal.WindowsIdentity? user = null;
+                                        try
+                                        {
+                                            // Every way this ends reaches the controller as the end of a transfer: a message
+                                            // alone left its Get files saying "getting" for good.
+                                            if (FileUser != null && (user = FileUser()) == null) { files.Refuse(paths, FileChannel.NobodySignedIn); return; }
+                                            files.SendFiles(paths, toClipboard: false, asUser: user);
+                                        }
+                                        catch (Exception e) { try { files.Refuse(paths, "The remote PC could not send them: " + e.Message); } catch { } }
+                                        finally { user?.Dispose(); Interlocked.Decrement(ref s.Fetches); }
+                                    }) { IsBackground = true, Name = "Kova get files" }.Start();
                                 }
-                                catch (Exception e) { try { files.Refuse(paths, "The remote PC could not send them: " + e.Message); } catch { } }
-                                finally { user?.Dispose(); }
-                            });
+                                catch (Exception e)
+                                {
+                                    Interlocked.Decrement(ref s.Fetches);
+                                    try { files.Refuse(paths, "The remote PC could not send them: " + e.Message); } catch { }
+                                }
+                            }
                         }
                         break;
                     case Protocol.InfoRequest when IsController(s):
+                        // One at a time per PC; asked again meanwhile, the answer on its way does for both
+                        // (the controlling PC waits for one answer, whichever request it was).
+                        if (Interlocked.CompareExchange(ref s.InfoBusy, 1, 0) != 0) break;
                         ThreadPool.QueueUserWorkItem(_ =>
                         {
                             string text;
                             try
                             {
                                 var (controlling, listening) = Connected;
-                                text = RemoteTools.Info(Updater.Current + (SecureAttention != null ? ", running as the Windows service" : "")) +
+                                // The processor reading of the health watch (the last 10 seconds), if it has one yet.
+                                int cpu = Volatile.Read(ref _healthReads) > 1 && Volatile.Read(ref _lastHealth) is HealthSample h ? h.CpuPercent : -1;
+                                text = RemoteTools.Info(Updater.Current + (SecureAttention != null ? ", running as the Windows service" : ""), cpu) +
                                     "\nConnected: " + controlling + " controlling" + (listening > 0 ? ", " + listening + " listening" : "");
                             }
                             catch (Exception e) { text = "Problem: could not gather this PC's information: " + e.Message; } // never ends the host
+                            finally { Volatile.Write(ref s.InfoBusy, 0); }
                             try { s.Link.Send(s.Stream, Protocol.TextMessage(Protocol.Info, text)); } catch { }
                         });
                         break;
@@ -1340,12 +1434,60 @@ namespace TailRemote
             }
         }
 
+        /// <summary>Lists this folder, then each one asked for meanwhile (ListFolder: one at a time per PC).</summary>
+        private void ListFolders(Session s, byte[] id, string path)
+        {
+            while (true)
+            {
+                ListOne(s, id, path);
+                lock (s.ListGate)
+                {
+                    if (s.ListQueue.Count == 0) { s.ListBusy = 0; return; }
+                    (id, path) = s.ListQueue.Dequeue();
+                }
+            }
+        }
+
+        private void ListOne(Session s, byte[] id, string path)
+        {
+            // Never let a problem here end the host (or the service): it is said instead.
+            string listing;
+            System.Security.Principal.WindowsIdentity? user = null;
+            try
+            {
+                if (FileUser == null) listing = RemoteTools.ListFolder(path);
+                else if ((user = FileUser()) == null) listing = "E\t" + FileChannel.NobodySignedIn;
+                else listing = System.Security.Principal.WindowsIdentity.RunImpersonated(user.AccessToken, () => RemoteTools.ListFolder(path));
+            }
+            catch (Exception e) { listing = "E\t" + e.Message; }
+            finally { user?.Dispose(); }
+            SendListing(s, id, listing);
+        }
+
+        private static void SendListing(Session s, byte[] id, string listing)
+        {
+            byte[] body = System.Text.Encoding.UTF8.GetBytes(listing);
+            byte[] r = new byte[5 + body.Length];
+            r[0] = Protocol.FolderList;
+            id.CopyTo(r, 1);
+            body.CopyTo(r, 5);
+            try { s.Link.Send(s.Stream, r); }
+            catch (Exception e)
+            {
+                // Said, never dropped in silence: Get files on the other PC would wait for it and then say
+                // "did not answer". A connection that has closed simply fails this too.
+                DiagLog.Write("host: could not send " + s.Address + " a folder list of " + r.Length + " bytes: " + e.Message);
+                if (r.Length > 4096) SendListing(s, id, "E\tThe list of that folder was too big to send.\n");
+            }
+        }
+
         // ---- How this PC is doing (HealthWatch): said to every connected PC when something changes ----
 
         /// <summary>Test only: readings instead of this PC's, and how often they are taken.</summary>
         public static Func<HealthSample>? TestHealth;
         public static int HealthEveryMs = HealthWatch.EveryMs;
         private object? _lastHealth; // the last HealthSample (boxed, so it can be read whole from another thread)
+        private int _healthReads;
         private readonly HealthWatch _health = new();
 
         private void HealthLoop()
@@ -1356,6 +1498,7 @@ namespace TailRemote
                 {
                     var sample = TestHealth?.Invoke() ?? HealthSample.Read();
                     Volatile.Write(ref _lastHealth, sample);
+                    if (_healthReads < 2) Volatile.Write(ref _healthReads, _healthReads + 1); // the first reading's processor figure is 0: nothing to compare with yet
                     var lines = _health.Next(sample, Environment.TickCount64);
                     foreach (string line in lines) DiagLog.Write("host health: " + line);
                     // In order, one thread per PC: a PC that has stopped reading holds up nobody else.
@@ -1395,22 +1538,44 @@ namespace TailRemote
                     {
                         // Looked at again under the lock: a key arriving at this very moment (the line came
                         // back) has already marked the session as heard from, and is not let go behind its back.
-                        if (s.Held.Count == 0 || Environment.TickCount64 - Volatile.Read(ref s.LastMessage) <= 1500) continue;
-                        ReleaseHeld(s);
+                        long quiet = Environment.TickCount64 - Volatile.Read(ref s.LastMessage);
+                        if (s.Held.Count == 0 || quiet <= 1500) continue;
+                        // Its messages are here, only not read yet (this PC busy, the reader a moment behind):
+                        // not quiet at all, so nothing is let go, unless that goes on for far too long.
+                        bool waiting;
+                        try { waiting = s.Tcp.Available > 0; } catch { waiting = false; }
+                        if (waiting && quiet <= 5000) continue;
+                        ReleaseHeld(s, remember: true);
                     }
                     DiagLog.Write("host: " + s.Address + " went quiet while holding keys; let them go");
                 }
             }
         }
 
-        private static void ReleaseHeld(Session s)
+        /// <summary>
+        /// Lets go of every key the session holds. remember (KeySafety only): the modifiers among them are
+        /// kept in LetGo, to press again if the controller turns out to be still holding them (ReadLoop).
+        /// Anything else (ReleaseAll, the session ending) forgets them for good.
+        /// </summary>
+        private static void ReleaseHeld(Session s, bool remember = false)
         {
             lock (s.Held)
             {
                 foreach (var (vk, ext) in s.Held) Native.SendKey(vk, 0, true, ext);
+                if (remember)
+                {
+                    // Only modifiers: pressing a held letter again would type it once more, and a mouse
+                    // button again would start a new drag wherever the pointer is now.
+                    foreach (var k in s.Held) if (IsModifier(k.Vk)) s.LetGo.Add(k);
+                }
+                else s.LetGo.Clear();
                 s.Held.Clear();
             }
         }
+
+        private static bool IsModifier(ushort vk) => vk is 0x10 or 0x11 or 0x12 // Shift, Ctrl, Alt
+            or >= 0xA0 and <= 0xA5 // left and right Shift, Ctrl, Alt
+            or 0x5B or 0x5C; // Windows keys
 
         /// <summary>
         /// Lets go of the session's keys at once, then says goodbye and closes it
@@ -1488,10 +1653,20 @@ namespace TailRemote
                 // The packet number is also the audio nonce: never send one at or before what
                 // this session already has (after a change of step, the new step's packet can
                 // start earlier). The player fills the gap.
-                if (s.SentAny && (int)(first - s.SentUntil) < 0) continue;
+                // A little behind (well under 2^20 ticks) is a change of step: skipped here, before the check
+                // below could take it for a connection worn out.
+                // Measured from the first number sent (which never moves), so a PC muted for months is never
+                // taken for "a little behind" and kept silent.
+                if (s.SentAny && first - s.SentFirst >= 0xFFF00000u) continue;
                 // Months into one connection: closing it ends its session as any drop does, and the
-                // PC reconnects with new keys, rather than the sound stopping for good.
+                // PC reconnects with new keys, rather than the sound stopping for good. Checked before the
+                // comparison below, so every number compared is within the connection's span.
                 if (s.Link.AudioWornOut(first)) { try { s.Tcp.Dispose(); } catch { } continue; }
+                // Compared from the first number sent, not as a signed difference: after 124 days of
+                // capture with nothing sent to this PC (muted while someone else listened), the next
+                // number looked like it was behind, and its sound never came back.
+                if (s.SentAny && first - s.SentFirst < s.SentUntil - s.SentFirst) continue;
+                if (!s.SentAny) s.SentFirst = first;
                 s.SentUntil = first + (uint)ticks;
                 s.SentAny = true;
                 byte[] a = s.Audio;

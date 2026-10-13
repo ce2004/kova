@@ -535,30 +535,45 @@ namespace TailRemote
         /// Starts a jump about 'want' floats ahead: it lands within 'search' frames of
         /// that, wherever the next 'xfLen' frames best match what is playing now
         /// (normalised cross-correlation), and crossfades over them. Call under _gate.
+        /// step: frames per 48 kHz frame (1 at 48 kHz and below). The search goes in those steps,
+        /// so it costs the same at any device rate: done in full it grew with the square of the rate
+        /// (20 to 30 ms at 192 kHz, 80 to 100 at 384 kHz, all under the lock), and the device ran dry
+        /// at the very jump meant to be seamless. Then the frames around the best are tried one by
+        /// one, so it lands as exactly as at 48 kHz. At 48 kHz this is the search it always was.
         /// </summary>
-        private bool StartJump(int want, int xfLen, int search)
+        private bool StartJump(int want, int xfLen, int search, int step)
         {
             if (_count < want + (xfLen + search) * 2 + 2) return false;
-            int best = want;
+            int bestD = 0;
             double bestScore = double.MinValue;
-            for (int d = -search; d <= search; d++)
+            for (int d = -search; d <= search; d += step)
+                if (JumpScore(want + d * 2, xfLen, 2 * step) is double s && s > bestScore) { bestScore = s; bestD = d; }
+            if (step > 1)
             {
-                int b = want + d * 2;
-                if (b < 2) continue;
-                double corr = 0, energy = 1e-12;
-                for (int k = 0; k < xfLen; k += 2) // every other frame is plenty
-                {
-                    float x = Mono(_read + k * 2), y = Mono(_read + b + k * 2);
-                    corr += x * y;
-                    energy += y * y;
-                }
-                double score = corr / Math.Sqrt(energy);
-                if (score > bestScore) { bestScore = score; best = b; }
+                int around = bestD;
+                bestScore = double.MinValue;
+                for (int d = Math.Max(-search, around - step + 1); d <= Math.Min(search, around + step - 1); d++)
+                    if (JumpScore(want + d * 2, xfLen, 2) is double s && s > bestScore) { bestScore = s; bestD = d; }
             }
+            int best = bestScore == double.MinValue ? want : want + bestD * 2;
             _xfJump = best;
             _xfFrom = (_read + best) % _ring.Length;
             _xfLen = _xfLeft = xfLen;
             return true;
+        }
+
+        /// <summary>How well the sound b floats ahead matches what plays now, over xfLen frames, every kStep'th frame; null where it cannot land.</summary>
+        private double? JumpScore(int b, int xfLen, int kStep)
+        {
+            if (b < 2) return null;
+            double corr = 0, energy = 1e-12;
+            for (int k = 0; k < xfLen; k += kStep) // every other frame (at 48 kHz) is plenty
+            {
+                float x = Mono(_read + k * 2), y = Mono(_read + b + k * 2);
+                corr += x * y;
+                energy += y * y;
+            }
+            return corr / Math.Sqrt(energy);
         }
 
         private unsafe void Fill(IntPtr data, int frames, Wasapi.Format fmt)
@@ -570,6 +585,7 @@ namespace TailRemote
             int grainLen = fmt.Rate * 3 / 100;          // 30 ms fast-forward pieces
             int xfLen = fmt.Rate / 100;                 // 10 ms crossfade at every jump
             int search = fmt.Rate / 200;                // the jump lands within 5 ms of its aim
+            int jumpStep = Math.Max(1, fmt.Rate / Protocol.AudioRate); // the search goes in 48 kHz frames: see StartJump
             lock (_gate)
             {
                 double target = _targetMs + _periodMs;
@@ -598,7 +614,7 @@ namespace TailRemote
                         // Skip straight back to the target, crossfaded.
                         _ff = 0;
                         int drop = Math.Min((int)(over * floatsPerMs), _count - (xfLen + search) * 2 - 2) & ~1;
-                        if (drop >= fadeLen * 2 && StartJump(drop, xfLen, search))
+                        if (drop >= fadeLen * 2 && StartJump(drop, xfLen, search, jumpStep))
                         {
                             _avgMs = target;
                             _diagSkips++;
@@ -631,7 +647,7 @@ namespace TailRemote
                             // never below the target.
                             _grainPos = 0;
                             int want = Math.Min((int)((_ff - 1) * grainLen) * 2, _count - keep - (xfLen + search) * 2) & ~1;
-                            if (want >= fadeLen * 2 && StartJump(want, xfLen, search))
+                            if (want >= fadeLen * 2 && StartJump(want, xfLen, search, jumpStep))
                             {
                                 _diagFastMs += _xfJump / floatsPerMs;
                                 _avgMs -= _xfJump / floatsPerMs; // the average knows at once what was cut

@@ -16,17 +16,37 @@ namespace TailRemote
             try
             {
                 string text = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  Kova " + Updater.Current + ": " + what + Environment.NewLine;
-                string path = System.IO.Path.Combine(AppContext.BaseDirectory, "Kova-crash.txt");
-                // Kept to about a megabyte (the one before it becomes Kova-crash.old.txt): a problem that keeps
-                // happening for months must never fill the drive.
-                var file = new System.IO.FileInfo(path);
-                if (file.Exists && file.Length > 1 << 20)
-                    try { System.IO.File.Move(path, System.IO.Path.Combine(AppContext.BaseDirectory, "Kova-crash.old.txt"), overwrite: true); }
-                    catch { } // the old one locked: this line is still written, to the big file
-                System.IO.File.AppendAllText(path, text);
+                // Next to Kova; where that can't be written (Program Files without administrator), in
+                // AppData\Local\Kova like the log, rather than nowhere.
+                if (!CrashAppend(AppContext.BaseDirectory, text)) CrashAppend(Names.LocalDir, text);
                 DiagLog.Write("problem: " + what);
+                // At once, with every line before it: a crash can end the process before the next timed write.
+                DiagLog.Flush();
             }
             catch { }
+        }
+
+        private static bool CrashAppend(string dir, string text)
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, "Kova-crash.txt"), old = Path.Combine(dir, "Kova-crash.old.txt");
+                // Kept to about a megabyte (the one before it becomes Kova-crash.old.txt): a problem that keeps
+                // happening for months must never fill the drive.
+                var file = new FileInfo(path);
+                if (file.Exists && file.Length > 1 << 20)
+                    try
+                    {
+                        // A read-only old file refused to be replaced, so the big one grew for ever.
+                        if (File.Exists(old)) File.SetAttributes(old, File.GetAttributes(old) & ~FileAttributes.ReadOnly);
+                        File.Move(path, old, overwrite: true);
+                    }
+                    catch { } // the old one locked: this line is still written, to the big file
+                File.AppendAllText(path, text);
+                return true;
+            }
+            catch { return false; }
         }
 
         // Main is not [STAThread] (a stray one sat on Crash above for a long time, doing nothing): the
@@ -79,7 +99,11 @@ namespace TailRemote
             SetErrorMode(0x0001 | 0x0002 | 0x8000); // SEM_FAILCRITICALERRORS, NOGPFAULTERRORBOX, NOOPENFILEERRORBOX
             try { WerSetFlags(0x20); } catch { } // WER_FAULT_REPORTING_NO_UI
             Native.FullSpeed(); // never on power-saving cores: that makes the sound run dry
-            System.Threading.ThreadPool.QueueUserWorkItem(_ => Updater.CleanLeftovers()); // old copies from earlier updates, once nothing holds them
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Updater.CleanLeftovers(); // old copies from earlier updates, once nothing holds them
+                Updater.CleanUnpackedCopies(); // and the libraries each build unpacked to the temp folder
+            });
             // Nothing may ever close TailRemote by surprise: a problem in the window is
             // written down and the app carries on.
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -222,10 +246,21 @@ namespace TailRemote
             // so right after an update NVDA heard nothing at all until the window appeared. Now it hears
             // "Finishing the update." if there is a wait. Settings are still read only after the wait:
             // the old copy may write them as it closes.
-            Speech.Init();
+            // One window per person: opening Kova again brings the open one forward instead. Not a copy
+            // started after an update or a rebuild (--after-update, --resume): the old one is still
+            // closing then, so it waits its turn below rather than giving up.
             int after = Array.IndexOf(args, "--after-update");
+            bool takingOver = after >= 0 || Array.IndexOf(args, "--resume") >= 0;
+            // --host (the sign-in task) with a window already open asks that window to host instead.
+            if (!takingOver && !TakeWindow(wait: false, host: Array.IndexOf(args, "--host") >= 0)) return 0;
+
+            Speech.Init();
             if (after >= 0 && after + 1 < args.Length && int.TryParse(args[after + 1], out int oldPid))
                 Updater.FinishUpdate(oldPid, () => Speech.Speak("Finishing the update."));
+            // Still not free after half a minute (the old one hung, or another copy of Kova is open): this
+            // one opens anyway, rather than leave nothing open after an update.
+            // If another window took the place meanwhile and answers, that is the one window: this copy ends.
+            if (takingOver && !TakeWindow(wait: true)) return 0;
 
             ClearOldCopies();
 
@@ -237,7 +272,158 @@ namespace TailRemote
                 autoHost: Array.IndexOf(args, "--host") >= 0 || resume == "host",
                 autoConnect: Array.IndexOf(args, "--connect") >= 0 || resume == "connect",
                 updated: after >= 0));
+            ReleaseWindow();
             return 0;
+        }
+
+        /// <summary>
+        /// Raised (on a background thread) when Kova is opened again while this window is open: the
+        /// window should come forward. Handlers must move to the window's own thread themselves, and return
+        /// true only once it has really done so (a hung window must not answer, so the new copy opens instead).
+        /// </summary>
+        public static event Func<bool>? ShowRequested;
+
+        /// <summary>
+        /// Raised (on a background thread) when Kova is started with --host (the sign-in task) while this
+        /// window is open: the window should start hosting if it is doing nothing else. Handlers must move
+        /// to the window's own thread themselves, and return true once it has taken the request.
+        /// </summary>
+        public static event Func<bool>? HostRequested;
+
+        private static volatile System.Threading.Mutex? _windowMutex;
+
+        // Per person (their account's SID), per session (Local\), per copy of Kova (a short hash of the
+        // exe's full path, so Documents\apps\Kova-x64.exe, a build in bin and Program Files\Kova each have
+        // their own window) and apart for test runs (TestPipes).
+        private static string WindowName(string what, string sid) =>
+            @"Local\Kova" + what + "-" + sid + "-" + ExeHash() + Names.TestPipes;
+
+        private static string ExeHash()
+        {
+            string path = (Environment.ProcessPath ?? AppContext.BaseDirectory).ToUpperInvariant();
+            byte[] hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(path));
+            return Convert.ToHexString(hash, 0, 6);
+        }
+
+        // Elevated and plain copies of the same person must open each other's lock and knocks: the sign-in
+        // task runs Kova with the highest rights, and an object it made with Windows' defaults (Administrators
+        // and SYSTEM only) could not be opened by a plain copy, which then opened a second window. So the
+        // person's own SID (the same in both) gets full rights; full, because opening an existing object asks for them.
+        private static System.Threading.Mutex MakeMutex(string name, System.Security.Principal.SecurityIdentifier me)
+        {
+            var acl = new System.Security.AccessControl.MutexSecurity();
+            acl.AddAccessRule(new System.Security.AccessControl.MutexAccessRule(me, System.Security.AccessControl.MutexRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+            return System.Threading.MutexAcl.Create(false, name, out _, acl);
+        }
+
+        private static System.Threading.EventWaitHandle MakeEvent(string name, System.Security.Principal.SecurityIdentifier me)
+        {
+            var acl = new System.Security.AccessControl.EventWaitHandleSecurity();
+            acl.AddAccessRule(new System.Security.AccessControl.EventWaitHandleAccessRule(me, System.Security.AccessControl.EventWaitHandleRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+            return System.Threading.EventWaitHandleAcl.Create(false, System.Threading.EventResetMode.AutoReset, name, out _, acl);
+        }
+
+        /// <summary>
+        /// Takes the one-window place. False only when another window has it and has answered that it came
+        /// forward (or, with host, took the request to host): this copy should just end. With wait, waits up
+        /// to 30 seconds for it, then knocks once, and goes ahead if nobody answers.
+        /// </summary>
+        private static bool TakeWindow(bool wait, bool host = false)
+        {
+            System.Threading.EventWaitHandle show, hostKnock, ack;
+            System.Threading.Mutex mutex;
+            try
+            {
+                using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+                var me = id.User!;
+                // The events first: a second copy can then always leave its knock, even before this one waits for it.
+                show = MakeEvent(WindowName("WindowShow", me.Value), me);
+                hostKnock = MakeEvent(WindowName("WindowHost", me.Value), me);
+                ack = MakeEvent(WindowName("WindowAck", me.Value), me);
+                mutex = MakeMutex(WindowName("Window", me.Value), me);
+            }
+            catch (Exception e)
+            {
+                // Something else holds the names, or the rights were refused: open as before rather than not at all.
+                DiagLog.Write("one window: could not take part (" + e.Message + ")");
+                return true;
+            }
+            void DropAll() { mutex.Dispose(); show.Dispose(); hostKnock.Dispose(); ack.Dispose(); }
+            bool Take(int ms)
+            {
+                try { return mutex.WaitOne(ms); }
+                catch (System.Threading.AbandonedMutexException) { return true; } // the last window ended without letting go: it is free
+            }
+
+            bool mine = Take(wait ? 30_000 : 0);
+            if (!mine && wait)
+            {
+                // Restarting after an update, but another window took the place meanwhile (opened while the
+                // update finished): if it answers, it is the one window, and this copy ends rather than make two.
+                try
+                {
+                    ack.Reset();
+                    show.Set();
+                    if (ack.WaitOne(2000)) { DropAll(); return false; }
+                }
+                catch { }
+            }
+            if (!mine && !wait)
+            {
+                // This copy was just started by the user, so it may hand the foreground on; without this Windows can
+                // refuse to let the running window come forward, and NVDA stays where it was.
+                try { AllowSetForegroundWindow(-1); } catch { }
+                // The open window answers only once it has really taken the knock. It may not: it may still be
+                // starting (not listening yet), or closing (no longer listening, but still holding the place). So
+                // the knock is repeated while the place is waited for, and exiting and at once opening Kova again
+                // always ends with a window.
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                while (!mine)
+                {
+                    try
+                    {
+                        ack.Reset(); // an answer left over from a knock nobody waited for is not this one's
+                        (host ? hostKnock : show).Set();
+                        if (ack.WaitOne(2000)) { DropAll(); return false; }
+                    }
+                    catch { break; }
+                    mine = Take(1000);
+                    if (clock.ElapsedMilliseconds > 30_000) break;
+                }
+            }
+            if (!mine)
+            {
+                // Still held after half a minute (that window hung, or will not answer): this one opens anyway.
+                DropAll();
+                return true;
+            }
+            // Knocks left by copies that gave up are not for this window.
+            try { show.Reset(); hostKnock.Reset(); ack.Reset(); } catch { }
+            _windowMutex = mutex;
+            new System.Threading.Thread(() =>
+            {
+                var knocks = new System.Threading.WaitHandle[] { show, hostKnock };
+                while (true)
+                {
+                    int which;
+                    try { which = System.Threading.WaitHandle.WaitAny(knocks); } catch { return; }
+                    // No window listening (still starting, or closing): no answer, so the new copy keeps knocking
+                    // and then waits for the place, rather than ending with no window at all.
+                    var handler = _windowMutex == null ? null : which == 0 ? ShowRequested : HostRequested;
+                    if (handler == null) continue;
+                    try { if (handler()) ack.Set(); } catch (Exception e) { Crash(e); }
+                }
+            }) { IsBackground = true, Name = "Kova show requests" }.Start();
+            return true;
+        }
+
+        /// <summary>Lets go of the one-window place, on the thread that took it, as the window closes.</summary>
+        private static void ReleaseWindow()
+        {
+            var mutex = _windowMutex;
+            _windowMutex = null; // the knock listener stops answering first
+            try { mutex?.ReleaseMutex(); } catch { }
+            mutex?.Dispose();
         }
 
         /// <summary>
@@ -489,6 +675,7 @@ namespace TailRemote
         [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern uint SetErrorMode(uint mode);
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern int WerSetFlags(uint flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool AllowSetForegroundWindow(int processId);
 
         /// <summary>Test only: plays a steady 440 Hz tone into one output.</summary>
         private sealed unsafe class ToneSource : IDisposable
@@ -671,6 +858,16 @@ namespace TailRemote
                     var fresh = Settings.Load();
                     if (fresh.Port != Protocol.DefaultPort || !File.Exists(Settings.FilePath + ".bad") || File.ReadAllText(Settings.FilePath + ".bad") != "{\"Port\":\"abc\"}")
                         return Fail("damaged settings were not kept as settings.json.bad");
+                    // Damaged again: the first copy stays as it was, the new one is kept beside it.
+                    File.WriteAllText(Settings.FilePath, "{\"Port\":\"xyz\"}");
+                    Settings.Load();
+                    if (File.ReadAllText(Settings.FilePath + ".bad") != "{\"Port\":\"abc\"}" || Directory.GetFiles(settingsDir, "settings.json.bad-*").Length != 1)
+                        return Fail("damaged settings wrote over the earlier settings.json.bad");
+                    // A read-only settings.json is still saved to.
+                    new Settings { Address = "first" }.Save();
+                    File.SetAttributes(Settings.FilePath, FileAttributes.ReadOnly);
+                    if (!new Settings { Address = "second" }.Save() || Settings.Load().Address != "second")
+                        return Fail("settings were not saved over a read-only settings.json");
                     byte[] exported = new Settings().Export("selftest password");
                     if (!Settings.LooksLikeBackup(exported) || Settings.LooksLikeBackup(new byte[60]) || Settings.LooksLikeBackup("TRBK1"u8.ToArray()))
                         return Fail("a settings backup was not told apart from other files");
@@ -1232,7 +1429,7 @@ namespace TailRemote
                 return Fail("a settings backup did not come back whole");
             if (System.Text.Encoding.UTF8.GetString(backup).Contains("secret")) return Fail("a settings backup has a password in plain sight");
             try { Settings.Import(backup, "wrong password"); return Fail("a settings backup opened with the wrong password"); }
-            catch (InvalidDataException) { }
+            catch (WrongBackupPasswordException) { }
             lossless += " | settings backup";
 
             // The real Windows clipboard, as when clipboard text and files arrive. Trimmed too far, the

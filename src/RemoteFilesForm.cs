@@ -17,6 +17,7 @@ namespace TailRemote
     {
         private readonly Func<Client?> _client; // the connection now: a reconnect makes a new one
         private readonly Action<string> _say;
+        private readonly Action<string> _tell; // news, said after whatever is being said (see Speech)
         private readonly TextBox _where = new() { ReadOnly = true, Width = 640, AccessibleName = "Folder on the remote PC" };
         private readonly ListView _list = new()
         {
@@ -49,10 +50,11 @@ namespace TailRemote
 
         private sealed record Entry(bool Folder, string Path, string Name, long Bytes, long Ticks);
 
-        public RemoteFilesForm(Func<Client?> client, Action<string> say)
+        public RemoteFilesForm(Func<Client?> client, Action<string> say, Action<string> tell)
         {
             _client = client;
             _say = say;
+            _tell = tell;
             Text = "Get files from the remote PC";
             Font = new System.Drawing.Font("Segoe UI", 10f);
             StartPosition = FormStartPosition.CenterParent;
@@ -182,7 +184,8 @@ namespace TailRemote
         {
             if (IsDisposed || _sentInto is not string into || t.Serial <= _sentAfter || !string.Equals(t.What, _sentWhat, StringComparison.OrdinalIgnoreCase)) return;
             _sentInto = null;
-            if (t.Result != null) _say(t.Result);
+            // News, queued: it ends by itself, often while something else is being said.
+            if (t.Result != null) _tell(t.Result);
             if (!t.Failed && string.Equals(_path, into, StringComparison.OrdinalIgnoreCase)) await LoadFolder(_path, Current?.Path);
         }
 
@@ -211,7 +214,10 @@ namespace TailRemote
                 _path = path;
                 _where.Text = path.Length == 0 ? "Drives and usual folders" : path;
                 // T: the remote PC had more than it listed (it lists at most RemoteTools.MaxEntries).
-                bool more = text.Split('\n').Any(l => l.StartsWith("T\t"));
+                // Its count is how many it really listed: fewer than MaxEntries when a long listing was cut short by size.
+                string? tLine = text.Split('\n').FirstOrDefault(l => l.StartsWith("T\t"));
+                bool more = tLine != null;
+                int listed = tLine != null && int.TryParse(tLine[2..].Trim(), out int count) && count > 0 ? count : RemoteTools.MaxEntries;
                 _list.BeginUpdate();
                 // EndUpdate in finally: a problem while filling must not leave the list frozen, never redrawn.
                 try
@@ -223,7 +229,7 @@ namespace TailRemote
                         // "Desktop, folder", not the Size column saying "folder"; then how getting it went.
                         var item = new ListViewItem(Label(e)) { Tag = e, Checked = _chosen.ContainsKey(e.Path) };
                         item.SubItems.Add(e.Folder ? "" : FileChannel.Size(e.Bytes));
-                        item.SubItems.Add(e.Ticks > 0 ? new DateTime(e.Ticks, DateTimeKind.Utc).ToLocalTime().ToString("g") : "");
+                        item.SubItems.Add(e.Ticks > 0 ? new DateTime(e.Ticks, DateTimeKind.Utc).ToLocalTime().ToString(MainForm.DateWords, System.Globalization.CultureInfo.InvariantCulture) : "");
                         _list.Items.Add(item);
                     }
                 }
@@ -238,7 +244,7 @@ namespace TailRemote
                 land.Selected = land.Focused = true;
                 land.EnsureVisible();
                 _list.Focus();
-                if (more) _say("Only the first " + RemoteTools.MaxEntries + " are shown.");
+                if (more) _say("Only the first " + listed + " are shown.");
             }
             catch (TimeoutException) { if (!IsDisposed) _say("The remote PC did not answer. Try again."); }
             catch (System.IO.IOException e) { if (!IsDisposed) _say("Could not list the folder: " + e.Message); }

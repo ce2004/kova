@@ -124,6 +124,7 @@ namespace TailRemote
                 client = Wasapi.Activate(dev);
                 client.GetMixFormat(out fmtPtr);
                 var fmt = Wasapi.ReadFormat(fmtPtr);
+                var mix = Downmix.For(fmt.Channels, ChannelMask(fmtPtr));
                 DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
                 DiagLog.Write("host capture: opened " + DeviceInfo + (followDefault ? " (Windows default)" : " (chosen device)"));
                 client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -182,7 +183,7 @@ namespace TailRemote
                         expectedPos = devPos + frames;
                         havePos = true;
                         if (stereo.Length < frames * 2) stereo = new float[frames * 4];
-                        ToStereo(data, (int)frames, fmt, (flags & Wasapi.AUDCLNT_BUFFERFLAGS_SILENT) != 0, stereo);
+                        ToStereo(data, (int)frames, fmt, (flags & Wasapi.AUDCLNT_BUFFERFLAGS_SILENT) != 0, stereo, mix);
                         cap.ReleaseBuffer(frames);
                         Convert(rs, stereo.AsSpan(0, (int)frames * 2));
                         lastDataAt = Environment.TickCount64;
@@ -261,10 +262,80 @@ namespace TailRemote
             return (short)MathF.Round(v);
         }
 
-        private static unsafe void ToStereo(IntPtr data, int frames, Wasapi.Format fmt, bool silent, float[] dst)
+        /// <summary>Which speakers the device's channels are for (WAVEFORMATEXTENSIBLE's dwChannelMask), or 0 when the format does not say.</summary>
+        private static uint ChannelMask(IntPtr wfx)
+        {
+            if ((ushort)Marshal.ReadInt16(wfx, 0) != 0xFFFE || Marshal.ReadInt16(wfx, 16) < 22) return 0;
+            return (uint)Marshal.ReadInt32(wfx, 20);
+        }
+
+        /// <summary>
+        /// How a device with more than two channels (5.1, 7.1, four speakers) is heard in stereo: every
+        /// channel goes to the left, the right or both, as a stereo downmix does (centre and surround a
+        /// little quieter), so voices in the centre and sound from behind are not lost. The low-frequency
+        /// channel is left out, as usual. Null for mono and stereo, which are taken as they are.
+        /// </summary>
+        internal sealed class Downmix
+        {
+            public readonly float[] Left, Right;
+            private Downmix(float[] l, float[] r) { Left = l; Right = r; }
+
+            private const float Half = 0.7071f; // -3 dB
+
+            public static Downmix? For(int channels, uint mask)
+            {
+                if (channels <= 2) return null;
+                // The mask names each channel's speaker, lowest bit first; one that does not (or has too few
+                // speakers) gets the usual layout for that many channels.
+                if (mask == 0 || System.Numerics.BitOperations.PopCount(mask) < channels)
+                    mask = channels switch
+                    {
+                        3 => 0x7,     // front left, right, centre
+                        4 => 0x33,    // front left, right, back left, right
+                        5 => 0x37,    // and centre
+                        6 => 0x3F,    // 5.1
+                        7 => 0x70F,   // 6.1: back centre, side left, right
+                        _ => 0x63F,   // 7.1, and the first eight of anything bigger
+                    };
+                var l = new float[channels];
+                var r = new float[channels];
+                int c = 0;
+                for (int bit = 0; bit < 32 && c < channels; bit++)
+                {
+                    uint speaker = 1u << bit;
+                    if ((mask & speaker) == 0) continue;
+                    switch (speaker)
+                    {
+                        case 0x1: case 0x40: l[c] = 1; break;                       // front left, front left of centre
+                        case 0x2: case 0x80: r[c] = 1; break;                       // front right, front right of centre
+                        case 0x4: l[c] = r[c] = Half; break;                        // centre
+                        case 0x8: break;                                            // low frequencies: left out
+                        case 0x10: case 0x200: case 0x1000: case 0x8000: l[c] = Half; break; // back, side, top front, top back left
+                        case 0x20: case 0x400: case 0x4000: case 0x20000: r[c] = Half; break; // and right
+                        default: l[c] = r[c] = 0.5f; break;                         // back centre, the tops' centres
+                    }
+                    c++;
+                }
+                return new Downmix(l, r);
+            }
+
+            /// <summary>
+            /// All the channels added up can go past full scale where plain stereo would not: the loudest
+            /// part is bent down smoothly rather than clipped, and anything below 0.9 is left exactly as it is.
+            /// </summary>
+            public static float Limit(float x)
+            {
+                float a = MathF.Abs(x);
+                if (a <= 0.9f) return x;
+                return MathF.CopySign(0.9f + 0.1f * MathF.Tanh((a - 0.9f) / 0.1f), x);
+            }
+        }
+
+        private static unsafe void ToStereo(IntPtr data, int frames, Wasapi.Format fmt, bool silent, float[] dst, Downmix? mix)
         {
             if (silent) { Array.Clear(dst, 0, frames * 2); return; }
             int ch = fmt.Channels;
+            if (mix != null) { DownmixToStereo(data, frames, fmt, dst, mix); return; }
             for (int i = 0; i < frames; i++)
             {
                 float l, r;
@@ -283,9 +354,41 @@ namespace TailRemote
                     int* p = (int*)data + i * ch;
                     l = p[0] / 2147483648f; r = ch > 1 ? p[1] / 2147483648f : l;
                 }
+                else if (fmt.Bits == 24)
+                {
+                    byte* p = (byte*)data + i * ch * 3;
+                    l = Read24(p); r = ch > 1 ? Read24(p + 3) : l;
+                }
                 else throw new NotSupportedException("Unsupported audio format: " + fmt.Bits + " bit.");
                 dst[i * 2] = l;
                 dst[i * 2 + 1] = r;
+            }
+        }
+
+        // A packed 24-bit sample (three bytes, lowest first), -1 to 1.
+        private static unsafe float Read24(byte* p) => (p[0] | (p[1] << 8) | ((sbyte)p[2] << 16)) / 8388608f;
+
+        private static unsafe void DownmixToStereo(IntPtr data, int frames, Wasapi.Format fmt, float[] dst, Downmix mix)
+        {
+            int ch = fmt.Channels;
+            float[] gl = mix.Left, gr = mix.Right;
+            bool isFloat = fmt.IsFloat && fmt.Bits == 32;
+            if (!isFloat && fmt.Bits != 16 && fmt.Bits != 24 && fmt.Bits != 32) throw new NotSupportedException("Unsupported audio format: " + fmt.Bits + " bit.");
+            for (int i = 0; i < frames; i++)
+            {
+                float l = 0, r = 0;
+                for (int c = 0; c < ch; c++)
+                {
+                    int k = i * ch + c;
+                    float s = isFloat ? ((float*)data)[k]
+                        : fmt.Bits == 16 ? ((short*)data)[k] / 32768f
+                        : fmt.Bits == 32 ? ((int*)data)[k] / 2147483648f
+                        : Read24((byte*)data + k * 3);
+                    l += s * gl[c];
+                    r += s * gr[c];
+                }
+                dst[i * 2] = Downmix.Limit(l);
+                dst[i * 2 + 1] = Downmix.Limit(r);
             }
         }
     }

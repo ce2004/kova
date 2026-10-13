@@ -1,3 +1,49 @@
+4.1.4
+New feature: opening Kova again while it is already running brings the open window forward, even from the notification area, instead of starting a second copy. If it was started at sign-in and is sitting idle, it starts hosting. Copies of Kova kept in different folders still each have their own window.
+New feature: if Kova cannot read or save its settings, or some saved passwords cannot be read on this Windows account, it now tells you once, in plain words, instead of losing changes in silence. If the settings file was busy when Kova started, it tries again every half minute, says when it can read it again, and keeps what you changed meanwhile.
+Bug fixed: if antivirus, a backup program or a second copy of Kova held the settings file for a moment as Kova started, Kova could start with no saved PCs and then save that over all of them. Now it waits for the file, and never saves over settings it could not read.
+Bug fixed: if settings.json was read-only, Kova never saved your changes and didn't say so. Now it saves anyway, and tells you if it really can't.
+Bug fixed: if the connection stalled for a moment while you held Control, Alt or Shift, the remote PC let go of it and your next key arrived without it, so Control A became A and Alt F4 became F4. Now the key is held again before your next key or wheel turn arrives.
+Bug fixed: when several things happened at once (a health warning, a file arriving, the other PC dropping), each message cut off the one before and you only heard the last. Now news waits its turn, and what you press still answers at once.
+Bug fixed: if the remote PC was restarting or updating, Kova could stop trying to reconnect too early. Now it keeps trying until it is back.
+Bug fixed: if the settings folder could not be written, each settings change froze the window for about a second, and Port editor and Sounds never said the change was not saved. Now nothing freezes, and they tell you.
+Bug fixed: if you sent a small file while a big one was coming, you heard nothing until the big one finished, and then one message cut off the other. Now each transfer is announced as soon as it ends.
+Bug fixed: if you sent a folder holding OneDrive files, files that were on this PC could be left out without a word. Now every file is sent, and folders that are only links to other places are left out and the result says so.
+Bug fixed: if a file was edited or replaced while its send was paused or disconnected, the other PC got a mix of the old and new file and both PCs said it was sent. Now the send stops and says the file was changed while it was being sent. A file that is only being added to, like a log, still sends as it was when you sent it.
+Bug fixed: if a file still arriving was deleted or renamed on the receiving PC, Kova said it was received. Now both PCs say it was deleted or renamed before it finished.
+Bug fixed: if the PC sending files crashed or lost power part-way, the receiving PC waited for days with the file still open. Now it soon says the other PC no longer has the transfer, and keeps what arrived marked incomplete.
+Bug fixed: folders you were not allowed to open were sent as empty folders, or left out without a word. Now Kova says how many were left out, and a folder you chose that cannot be opened is not sent at all.
+Bug fixed: files and folders made on a Mac or in Linux with names ending in a dot or space were left out or renamed when sent, and one odd name like CON made the whole send fail. Now they are sent, and names Windows cannot use are changed a little and the result says so.
+Bug fixed: receiving a second copy of a file with a very long name could leave it called incomplete, and a second .gitignore was named " (2).gitignore". Now names always fit and read naturally.
+Bug fixed: while a send was paused, programs that save by replacing the file could not save it. Now Kova lets go of the files while paused.
+Bug fixed: after the clocks went back an hour, receiving clipboard files could delete the batch received just before. Now the newest batch is always kept.
+Bug fixed: on a patchy Wi-Fi or mobile connection that delivers some sound packets twice, file transfers and the remote screen slowed to a crawl. Repeated packets are now ignored.
+Bug fixed: if the host PC's sound was set to 5.1, 7.1 or four speakers, you heard only the front left and right, so voices in the centre and sound from behind were missing. Now every channel is mixed into stereo.
+Bug fixed: a host whose sound device ran in 24-bit mode sent no sound. Now it works.
+Bug fixed: with an output device set to 192 kHz or higher, catching up after a hiccup could cause a crackle or dropout in the sound. Now it is just as smooth at any sample rate.
+Bug fixed: if a PC got no sound for about four months while still connected, its sound never came back. Now it comes back as soon as it is wanted.
+Bug fixed: on a slow or far-away connection (a round trip of about 200 ms or more), moving pictures stayed as slow still pictures and never switched to smooth video. Now video starts there too.
+Bug fixed: after the remote screen reconnected a few times on a bad line, it said 8 PCs were already watching, counting its own dead connections. Now an old connection gives its place to the new one.
+Bug fixed: a damaged or hostile picture from the other PC could make the viewer set aside gigabytes of memory. Now pictures bigger than an 8K screen, and pieces that claim the wrong size, are refused.
+Bug fixed: in the remote screen, the text cursor and the cross pointer could not be seen on white, and very large pointers were cut off. Now they show properly.
+Bug fixed: after about 25 hours of continuous video, the moving picture could break. Now it keeps going.
+Bug fixed: on a connection with a round trip of 3 seconds or more, logging in always failed and said the login was damaged. Now logins work on such slow lines, and a remote PC that gives up waiting is reported as that.
+Bug fixed: if a controlling PC sent many Remote PC info or folder requests at once, other PCs' clipboard and Get files on that host waited for minutes. Now each PC gets one at a time and nobody else waits, and the list of drives never waits behind a slow folder.
+Bug fixed: in Get files, a folder holding one file with an impossible date could not be opened at all, a folder with a very large list said the remote PC did not answer, and file10 came before file2. Now all list properly, in the same order as File Explorer.
+Bug fixed: switching PCs while waiting for Remote PC info, Update the remote PC or a remote speed test said nothing, or announced the result as the new PC's. Now Kova says what happened and names the PC.
+Bug fixed: when switching PCs let go of the oldest PC in the background, or switched to a listen-only PC with the screen window open, part of what Kova said was cut off. Now you hear all of it.
+Bug fixed: Escape in the screen window said "Back to the main window" even when the main window was hidden in the notification area. Now it brings it back. Control 1 to 9 now switch PCs from the screen window too.
+Bug fixed: the History and Files menus could be rebuilt or emptied while you were in them, which could freeze NVDA. Now they update once you leave them.
+Bug fixed: after waking a PC that was already connected, a later failed connection said "Waiting for it to wake up" instead of the real problem.
+Bug fixed: Restart remote PC said the PC in front had changed when that same PC had only reconnected while the box was open. Now it restarts it.
+Bug fixed: restoring a backup made by a different Kova version could ask for its password forever, or read out a technical error. Now it says plainly that it can't be read here.
+Bug fixed: a password of three emoji counted as 6 characters. Now characters are counted as you see them.
+Bug fixed: if the remote PC kept giving up on a very slow login, Kova retried every second forever. Now it stops after three tries in a row and says why.
+Bug fixed: typing a very long address, or a port number out of range, read out a technical error. Now Kova says what is wrong.
+Changed: times and dates are now said as "3:05 PM" and "12 October 2026, 3:05 PM" instead of month-first numbers.
+Bug fixed: two copies of Kova writing to the same log lost each other's lines, a log viewer holding the log made logging slow and the log grow without limit, and crash notes could be lost. Now every line is kept and the logs stay a sensible size.
+Bug fixed: every Kova update left about 8 MB in the temp folder for good. Now old copies are cleared away once nothing uses them.
+
 4.1.3
 Bug fixed: if the PC lost power just after Kova saved its settings, Kova could start with every saved PC and password gone. Settings are now fully written to the disk before they replace the old ones.
 Bug fixed: if you were watching a remote PC's second screen and the connection dropped and came back, the remote screen window went back to the main screen. Now it stays on the screen you chose.

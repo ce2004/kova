@@ -120,7 +120,7 @@ namespace TailRemote
             try
             {
                 var s = Settings.Load();
-                if (s.Password.Length < MainForm.MinPasswordLength) return Fail("Set a password of at least " + MainForm.MinPasswordLength + " characters first.");
+                if (MainForm.Characters(s.Password) < MainForm.MinPasswordLength) return Fail("Set a password of at least " + MainForm.MinPasswordLength + " characters first.");
 
                 // The new copy goes in next to the old one first, while the service still runs: a full
                 // disk or a refused copy then fails here, with the service still up.

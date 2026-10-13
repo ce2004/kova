@@ -95,23 +95,57 @@ namespace TailRemote
                     : dir.EnumerateFiles().Where(f => (f.Attributes & hiddenSystem) != hiddenSystem).Take(MaxEntries + 1 - dirs.Count).ToList();
                 bool more = dirs.Count + files.Count > MaxEntries;
                 int n = 0;
-                foreach (var d in dirs.OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase))
+                // The answer must fit in one message (SecureLink: 8 MB): 5000 entries with very long paths
+                // can be more, and an answer too big to send never arrived ("did not answer"). So the list
+                // stops short of 7 MB and says how many it shows, like a folder of too many entries.
+                long bytes = 0;
+                bool Fits(string full, string name)
                 {
-                    if (++n > MaxEntries) break;
-                    Line('D', d.FullName, d.Name, 0, d.LastWriteTimeUtc.Ticks);
+                    bytes += Encoding.UTF8.GetByteCount(full) + Encoding.UTF8.GetByteCount(name) + 64;
+                    if (bytes <= MaxListingBytes) return true;
+                    more = true;
+                    return false;
                 }
-                foreach (var f in files.OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase))
+                // Sorted as Explorer sorts (file2 before file10, letters with accents among their own
+                // letter), whatever the culture settings of the process.
+                foreach (var d in dirs.OrderBy(d => d.Name, Natural))
                 {
-                    if (++n > MaxEntries) break;
-                    Line('F', f.FullName, f.Name, f.Length, f.LastWriteTimeUtc.Ticks);
+                    if (n >= MaxEntries || !Fits(d.FullName, d.Name)) break;
+                    n++;
+                    Line('D', d.FullName, d.Name, 0, Ticks(d));
                 }
-                // T: there were more than were listed. An older controlling PC skips lines it does not know.
-                if (more) sb.Append("T\t").Append(MaxEntries).Append('\n');
+                foreach (var f in files.OrderBy(f => f.Name, Natural))
+                {
+                    if (n >= MaxEntries || !Fits(f.FullName, f.Name)) break;
+                    n++;
+                    long length;
+                    try { length = f.Length; } catch { length = 0; }
+                    Line('F', f.FullName, f.Name, length, Ticks(f));
+                }
+                // T: there were more than were listed, and how many were. An older controlling PC skips lines it does not know.
+                if (more) sb.Append("T\t").Append(n).Append('\n');
                 return sb.ToString();
             }
             catch (UnauthorizedAccessException) { return "E\tKova on the remote PC is not allowed into that folder.\n"; }
             catch (Exception e) { return "E\t" + e.Message.Replace('\n', ' ').Replace('\t', ' ') + "\n"; }
         }
+
+        /// <summary>How big a folder listing may grow: under SecureLink's 8 MB message, with room to spare.</summary>
+        public const int MaxListingBytes = 7 << 20;
+
+        /// <summary>
+        /// When an entry was last changed, or 0 if it cannot say: a file stamped beyond the year 9999
+        /// (a broken copy tool, a damaged disk) threw for the whole folder, which then could not be listed.
+        /// </summary>
+        private static long Ticks(FileSystemInfo i)
+        {
+            try { return i.LastWriteTimeUtc.Ticks; } catch { return 0; }
+        }
+
+        /// <summary>Explorer's order: numbers in names by value, letters as the user's language orders them.</summary>
+        private static readonly IComparer<string> Natural = Comparer<string>.Create((a, b) => StrCmpLogicalW(a, b));
+
+        [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] private static extern int StrCmpLogicalW(string a, string b);
 
         /// <summary>A drive's label and space (", not ready" if it has no disk), as shown after its letter.</summary>
         private static string DriveDetails(DriveInfo d)
@@ -124,15 +158,16 @@ namespace TailRemote
             catch { return ""; }
         }
 
-        /// <summary>About this PC, one "Name: value" line each, for Remote PC info.</summary>
-        public static string Info(string tailRemote)
+        /// <summary>About this PC, one "Name: value" line each, for Remote PC info. recentCpu: the host's own processor reading, or -1.</summary>
+        public static string Info(string tailRemote, int recentCpu = -1)
         {
+            int cpu = CpuPercent(recentCpu);
             var lines = new List<string> { "Name: " + Environment.MachineName };
             lines.Add("Windows: " + WindowsName());
             string user = SignedInUser();
             lines.Add("Signed in: " + (user.Length == 0 ? "nobody (the sign-in screen)" : user));
             lines.Add("On for: " + MainForm.Duration(TimeSpan.FromMilliseconds(Environment.TickCount64)));
-            lines.Add("Processor busy: " + CpuPercent() + " percent, " + Environment.ProcessorCount + " cores");
+            lines.Add("Processor busy: " + (cpu >= 0 ? cpu + " percent" : "not measured yet, ask again in a moment") + ", " + Environment.ProcessorCount + " cores");
             var mem = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
             if (GlobalMemoryStatusEx(ref mem))
                 lines.Add("Memory: " + mem.dwMemoryLoad + " percent used, " + FileChannel.Size((long)mem.ullAvailPhys) + " free of " + FileChannel.Size((long)mem.ullTotalPhys));
@@ -186,14 +221,34 @@ namespace TailRemote
             catch { return ""; }
         }
 
-        /// <summary>How busy the processor is, measured over half a second.</summary>
-        private static int CpuPercent()
+        private static readonly object CpuGate = new();
+        private static long _cpuAt, _cpuIdle, _cpuKernel, _cpuUser; // the last reading (_cpuAt 0: none yet)
+        private static int _cpuLast = -1;
+
+        /// <summary>
+        /// How busy the processor is, since the last time this was asked (or, if that was too long ago or
+        /// never, the host's own reading of the last few seconds: recent, -1 if it has none), or -1 if
+        /// nothing is known yet. Never waits: it used to sleep half a second on a pool thread for every
+        /// request, and a flood of them starved everything else on the pool.
+        /// </summary>
+        private static int CpuPercent(int recent)
         {
-            if (!GetSystemTimes(out long idle1, out long kernel1, out long user1)) return 0;
-            System.Threading.Thread.Sleep(500);
-            if (!GetSystemTimes(out long idle2, out long kernel2, out long user2)) return 0;
-            long total = (kernel2 - kernel1) + (user2 - user1); // kernel time includes idle
-            return total <= 0 ? 0 : (int)Math.Clamp(100 - (idle2 - idle1) * 100 / total, 0, 100);
+            if (!GetSystemTimes(out long idle, out long kernel, out long user)) return recent;
+            long now = Environment.TickCount64;
+            lock (CpuGate)
+            {
+                long age = now - _cpuAt;
+                if (_cpuAt != 0 && age < 250) return _cpuLast >= 0 ? _cpuLast : recent; // asked again at once: too short to measure
+                int result;
+                long total = (kernel - _cpuKernel) + (user - _cpuUser); // kernel time includes idle
+                if (_cpuAt != 0 && age <= 30_000 && total > 0) result = (int)Math.Clamp(100 - (idle - _cpuIdle) * 100 / total, 0, 100);
+                else if (recent >= 0) result = recent;
+                else if (_cpuAt != 0 && total > 0) result = (int)Math.Clamp(100 - (idle - _cpuIdle) * 100 / total, 0, 100); // a long while, but still a measure
+                else result = -1;
+                _cpuAt = now; _cpuIdle = idle; _cpuKernel = kernel; _cpuUser = user;
+                _cpuLast = result;
+                return result;
+            }
         }
 
         [StructLayout(LayoutKind.Sequential)]

@@ -58,12 +58,46 @@ namespace TailRemote
         public static string Protect(string? value) =>
             string.IsNullOrEmpty(value) ? "" : Convert.ToBase64String(Native.Protect(Encoding.UTF8.GetBytes(value), true));
 
-        public static string Unprotect(string? enc)
+        public static string Unprotect(string? enc) => TryUnprotect(enc, out string plain) ? plain : "";
+
+        /// <summary>False when there is a password but it cannot be read here (settings copied from another account or PC).</summary>
+        private static bool TryUnprotect(string? enc, out string plain)
         {
-            if (string.IsNullOrEmpty(enc)) return "";
-            try { return Encoding.UTF8.GetString(Native.Protect(Convert.FromBase64String(enc), false)); }
-            catch { return ""; }
+            plain = "";
+            if (string.IsNullOrEmpty(enc)) return true;
+            try { plain = Encoding.UTF8.GetString(Native.Protect(Convert.FromBase64String(enc), false)); return true; }
+            catch { return false; }
         }
+
+        /// <summary>
+        /// How many saved passwords (the main one, the listen one, Saved PCs') are there but cannot be
+        /// read on this Windows account: they act as empty, and a backup would carry them empty. Counted
+        /// now, so a password typed in again stops counting.
+        /// </summary>
+        [JsonIgnore]
+        public int UnreadablePasswords
+        {
+            get
+            {
+                int n = 0;
+                if (!TryUnprotect(PasswordEnc, out _)) n++;
+                if (!TryUnprotect(ListenPasswordEnc, out _)) n++;
+                foreach (var pc in SavedPcs) if (!TryUnprotect(pc.PasswordEnc, out _)) n++;
+                return n;
+            }
+        }
+
+        /// <summary>
+        /// True when settings.json was there but could not be read (held by something for longer than a
+        /// couple of seconds, or access refused). These settings are then empty stand-ins, and Save does
+        /// nothing: writing them would wipe out every saved PC and password in the real file.
+        /// </summary>
+        [JsonIgnore]
+        public bool SavingDisabled { get; private set; }
+
+        /// <summary>Why the last Save did not reach the disk, in plain words; null when it did.</summary>
+        [JsonIgnore]
+        public string? SaveProblem { get; private set; }
         /// <summary>Every port TailRemote has used here, so Port editor can still close it later.</summary>
         public System.Collections.Generic.List<int> KnownPorts { get; set; } = new();
         /// <summary>What was running when TailRemote last closed: "host", "connect" or "". Used by --resume.</summary>
@@ -128,11 +162,18 @@ namespace TailRemote
                 using var gcm = new System.Security.Cryptography.AesGcm(BackupKey(password, salt), 16);
                 gcm.Decrypt(nonce, secret, tag, plain);
             }
-            catch (System.Security.Cryptography.CryptographicException) { throw new InvalidDataException("Wrong password for that backup, or the file is damaged."); }
-            var s = JsonSerializer.Deserialize<Settings>(plain)?.Tidy() ?? throw new InvalidDataException("The backup is empty.");
+            // Its own kind, so the window can ask for the password again (the two look the same to AES-GCM).
+            catch (System.Security.Cryptography.CryptographicException) { throw new WrongBackupPasswordException(); }
+            Settings s;
+            // It opened, so the password was right: settings it cannot read come from a Kova that kept them differently.
+            try { s = JsonSerializer.Deserialize<Settings>(plain)?.Tidy() ?? throw new InvalidDataException("The backup is empty."); }
+            catch (JsonException) { throw new InvalidDataException("That backup was made by a different Kova version and can't be read here."); }
             s.Password = s.PasswordEnc;
             s.ListenPassword = s.ListenPasswordEnc;
             foreach (var pc in s.SavedPcs) pc.PasswordEnc = Protect(pc.PasswordEnc);
+            // As Export leaves them out: another PC's firewall history and what it was doing as it closed.
+            s.KnownPorts = new();
+            s.ResumeState = "";
             return s;
         }
 
@@ -146,6 +187,34 @@ namespace TailRemote
             foreach (var p in typeof(Settings).GetProperties())
                 if (p.CanWrite && p.CanRead && !Attribute.IsDefined(p, typeof(JsonIgnoreAttribute))) p.SetValue(this, p.GetValue(other));
             foreach (int port in ports) if (!KnownPorts.Contains(port)) KnownPorts.Add(port);
+        }
+
+        /// <summary>
+        /// The real settings, read at last after they could not be at the start (SavingDisabled): they come in,
+        /// but whatever was changed here meanwhile (anything no longer as a fresh start has it) is kept over
+        /// them, and Saved PCs, sound choices and ports added meanwhile are added to theirs. Saving works again.
+        /// </summary>
+        public void RecoverFrom(Settings real)
+        {
+            var fresh = new Settings();
+            foreach (var p in typeof(Settings).GetProperties())
+            {
+                if (!p.CanWrite || !p.CanRead || Attribute.IsDefined(p, typeof(JsonIgnoreAttribute))) continue;
+                object? mine = p.GetValue(this);
+                if (mine is System.Collections.ICollection) continue; // the lists: below
+                if (Equals(mine, p.GetValue(fresh))) p.SetValue(this, p.GetValue(real));
+            }
+            static bool Same(SavedPc a, SavedPc b) => string.Equals(a.Address, b.Address, StringComparison.OrdinalIgnoreCase) && a.Port == b.Port;
+            var pcs = new System.Collections.Generic.List<SavedPc>();
+            foreach (var pc in real.SavedPcs) pcs.Add(SavedPcs.Find(m => Same(m, pc)) ?? pc); // saved again here meanwhile: that one
+            foreach (var pc in SavedPcs) if (!pcs.Contains(pc)) pcs.Add(pc);
+            SavedPcs = pcs;
+            var choices = new System.Collections.Generic.Dictionary<string, string>(real.SoundChoices);
+            foreach (var (k, v) in SoundChoices) choices[k] = v;
+            SoundChoices = choices;
+            foreach (int port in real.KnownPorts) if (!KnownPorts.Contains(port)) KnownPorts.Add(port);
+            SavingDisabled = false;
+            SaveProblem = null;
         }
 
         /// <summary>
@@ -164,43 +233,159 @@ namespace TailRemote
             return this;
         }
 
-        public static Settings Load()
+        private static Settings Parse(string text) => (JsonSerializer.Deserialize<Settings>(text) ?? new Settings()).Tidy();
+
+        /// <summary>The temp file a save left behind, if it is complete and newer than settings.json; else null.</summary>
+        private static Settings? NewerTemp()
         {
-            try { return (JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings()).Tidy(); }
-            catch
+            try
             {
+                if (!File.Exists(TempPath)) return null;
+                if (File.Exists(FilePath) && File.GetLastWriteTimeUtc(TempPath) <= File.GetLastWriteTimeUtc(FilePath)) return null;
+                return Parse(File.ReadAllText(TempPath));
+            }
+            catch { return null; } // half written, or another Kova is writing it right now
+        }
+
+        /// <summary>Reads settings.json. With note false (the window trying again later) a file still unreadable is not written down again.</summary>
+        public static Settings Load(bool note = true)
+        {
+            // Another Kova saving at this moment holds settings.json for a few milliseconds (File.Replace
+            // can even make it briefly not there). That used to count as damage: the settings came back
+            // empty, and the next Save wrote that over every saved PC and password. So a file that can't
+            // be opened is tried again for about two seconds; only text that isn't settings is damage.
+            string? text = null;
+            Exception? unreadable = null;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    text = File.Exists(FilePath) ? File.ReadAllText(FilePath) : null;
+                    // Missing can be another Kova's swap in progress: looked at a few more times (longer while
+                    // a save's temp file is there) before it counts as the very first start.
+                    if (text == null && (attempt < 3 || File.Exists(TempPath) && clock.ElapsedMilliseconds < 500)) { System.Threading.Thread.Sleep(20); continue; }
+                    unreadable = null;
+                    break;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    unreadable = e;
+                    if (clock.ElapsedMilliseconds > 2000) break;
+                    System.Threading.Thread.Sleep(Math.Min(200, 10 << Math.Min(attempt, 4)));
+                }
+            }
+
+            // A save that could not swap its temp file in (settings.json read-only, or held) left the
+            // newer settings there: they are the ones to use.
+            if (NewerTemp() is Settings fresher) return fresher;
+
+            if (unreadable != null)
+            {
+                // There, but not readable: empty stand-ins that are never saved over the real file.
+                if (note) Program.CrashNote("settings.json could not be read, so changes are not saved this time: " + unreadable.Message);
+                return new Settings { SavingDisabled = true, SaveProblem = "Kova could not read its settings file (" + unreadable.Message + "), so nothing is saved until it can. It tries again every half minute." };
+            }
+            if (text == null) return new Settings(); // the very first start
+
+            try { return Parse(text); }
+            catch (Exception e)
+            {
+                if (e is not JsonException)
+                {
+                    // Not damage that is understood: never risk saving empty settings over it.
+                    if (note) Program.CrashNote("settings.json could not be loaded: " + e);
+                    return new Settings { SavingDisabled = true, SaveProblem = "Kova could not load its settings file, so nothing is saved until it can. It tries again every half minute." };
+                }
                 // Damaged (not just missing): kept as settings.json.bad before anything else, so the
                 // next Save cannot wipe out every saved PC and password without a trace.
-                try { if (File.Exists(FilePath)) File.Copy(FilePath, FilePath + ".bad", true); } catch { }
-                // The main file is missing, empty or corrupt - possibly from a crash or power loss
-                // mid-write before Save() below wrote atomically. A temp file left over from such an
-                // interrupted save might still be a complete, valid settings file: try it once before
-                // giving up and starting fresh.
-                try { return (JsonSerializer.Deserialize<Settings>(File.ReadAllText(TempPath)) ?? new Settings()).Tidy(); }
+                KeepDamaged(text);
+                // A temp file left over from an interrupted save might still be complete: try it before
+                // starting fresh, even if it is older.
+                try { return Parse(File.ReadAllText(TempPath)); }
                 catch { return new Settings(); }
             }
         }
 
-        public void Save()
+        /// <summary>
+        /// A damaged settings.json, kept: the first as settings.json.bad, later ones as settings.json.bad-date-time,
+        /// never over an earlier copy (that one may be the only trace of the saved PCs). Only the newest few are kept.
+        /// </summary>
+        private static void KeepDamaged(string text)
         {
             try
             {
-                Directory.CreateDirectory(Dir);
-                string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-                // Written all the way to the disk before the swap: Windows can keep the new text in memory
-                // for seconds after the rename itself is on disk, and a power cut in that gap left a
-                // settings.json of zeros, so every saved PC and password was gone at the next start.
-                using (var fs = new FileStream(TempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    fs.Write(new UTF8Encoding(false).GetBytes(json));
-                    fs.Flush(flushToDisk: true);
-                }
-                // Atomic: the live settings file is either the old complete one or the new complete
-                // one, never a half-written mix, even if this process is killed partway through.
-                if (File.Exists(FilePath)) File.Replace(TempPath, FilePath, null);
-                else File.Move(TempPath, FilePath);
+                string first = FilePath + ".bad";
+                var copies = new System.Collections.Generic.List<string>(Directory.GetFiles(Dir, "settings.json.bad-*"));
+                if (File.Exists(first)) copies.Add(first);
+                foreach (string c in copies) { try { if (File.ReadAllText(c) == text) return; } catch { } } // the same damage seen again
+                string to = !File.Exists(first) ? first : FilePath + ".bad-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
+                File.WriteAllText(to, text, new UTF8Encoding(false));
+                // The first one stays; of the dated ones only the newest four.
+                var dated = new System.Collections.Generic.List<string>(Directory.GetFiles(Dir, "settings.json.bad-*"));
+                dated.Sort(StringComparer.Ordinal);
+                for (int i = 0; i < dated.Count - 4; i++) { try { File.SetAttributes(dated[i], FileAttributes.Normal); File.Delete(dated[i]); } catch { } }
             }
             catch { }
         }
+
+        /// <summary>
+        /// Writes the settings to disk. False, with SaveProblem saying why, if they could not be: a
+        /// window can say so, rather than lose every change from then on in silence. Retries: how many more
+        /// tries, 150 ms apart; the window's own thread uses few, so a folder that refuses does not freeze it.
+        /// </summary>
+        public bool Save(int retries = 5)
+        {
+            if (SavingDisabled) return false;
+            Exception? last = null;
+            for (int attempt = 0; attempt <= retries; attempt++)
+            {
+                if (attempt > 0) System.Threading.Thread.Sleep(150); // another Kova saving, or a virus scan: these clear by themselves
+                try
+                {
+                    Directory.CreateDirectory(Dir);
+                    string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+                    ClearReadOnly(TempPath);
+                    // Written all the way to the disk before the swap: Windows can keep the new text in memory
+                    // for seconds after the rename itself is on disk, and a power cut in that gap left a
+                    // settings.json of zeros, so every saved PC and password was gone at the next start.
+                    using (var fs = new FileStream(TempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        fs.Write(new UTF8Encoding(false).GetBytes(json));
+                        fs.Flush(flushToDisk: true);
+                    }
+                    // A read-only settings.json (copied from a CD or a zip, or set by hand) refused every
+                    // save, in silence, for good.
+                    ClearReadOnly(FilePath);
+                    // Atomic: the live settings file is either the old complete one or the new complete
+                    // one, never a half-written mix, even if this process is killed partway through.
+                    if (File.Exists(FilePath)) File.Replace(TempPath, FilePath, null);
+                    else File.Move(TempPath, FilePath);
+                    SaveProblem = null;
+                    return true;
+                }
+                catch (Exception e) { last = e; }
+            }
+            // A complete temp file may be left: Load takes it when it is newer, so these changes are not lost.
+            SaveProblem = "Kova could not save its settings (" + last?.Message + ").";
+            return false;
+        }
+
+        private static void ClearReadOnly(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                var a = File.GetAttributes(path);
+                if ((a & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, a & ~FileAttributes.ReadOnly);
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>A backup's password was wrong, or the file is damaged (AES-GCM can't tell the two apart): worth asking again.</summary>
+    internal sealed class WrongBackupPasswordException : System.Security.Cryptography.CryptographicException
+    {
+        public WrongBackupPasswordException() : base("Wrong password for that backup, or the file is damaged.") { }
     }
 }

@@ -97,6 +97,8 @@ namespace TailRemote
         private int _attempt; // bumped to abandon a connection attempt still under way
         private readonly Timer _titleTimer = new() { Interval = 1000 };
         private readonly Timer _retryTimer = new() { Interval = 1000 }; // Connect keeps trying every second until Disconnect (a PC coming back from a restart is caught at once)
+        // Every half minute while the settings could not be read (tries again) or a save failed (saves again).
+        private readonly Timer _settingsTimer = new() { Interval = 30_000 };
         private bool _resumeRemote;     // was controlling the remote PC when the connection dropped
         private bool _quietModeChange;  // the reconnect message already says it
 
@@ -119,6 +121,8 @@ namespace TailRemote
             _pickReceiveFolder.Click += (_, _) => Menus.AfterMenu(() => PickReceiveFolder());
             _transferStatus.Text = TransferIdle;
             FillHistory();
+            _history.DropDownClosed += (_, _) => { if (_historyStale) FillHistory(); };
+            _transferStatus.Item.DropDownClosed += (_, _) => { if (_barsStale) ShowFileBars(_barsWanted); };
             _transferStop.Click += (_, _) =>
             {
                 if (_client != null) _client.CancelTransfer();
@@ -277,6 +281,7 @@ namespace TailRemote
             _tray.ContextMenuStrip = trayMenu;
             _tray.Click += (_, e) => { if (e is not MouseEventArgs m || m.Button == MouseButtons.Left) RestoreFromTray(); };
             _retryTimer.Tick += (_, _) => { if (_client == null && !_connecting) Connect(quiet: true); };
+            _settingsTimer.Tick += (_, _) => SettingsTimerTick();
             UpdateMode();
         }
 
@@ -362,7 +367,7 @@ namespace TailRemote
                 item.Enabled = canUse;
                 item.WhyNot = why;
             }
-            if (_speedRemoteRunning) { _speedRemote.Enabled = false; _speedRemote.WhyNot = "A speed test is already running on the remote PC."; }
+            if (SpeedRunningOnFront) { _speedRemote.Enabled = false; _speedRemote.WhyNot = "A speed test is already running on the remote PC."; }
             _mode.Menu.WhyNot = "Disconnect, or stop hosting, first.";
             EnsureServiceLink();
             SaveResumeState();
@@ -403,7 +408,7 @@ namespace TailRemote
             string state = _host != null ? "host" : _client != null || _reconnecting || _connecting ? "connect" : "";
             if (state == _settings.ResumeState) return;
             _settings.ResumeState = state;
-            try { _settings.Save(); } catch { }
+            SaveNow();
         }
 
         private bool _shown;
@@ -742,6 +747,14 @@ namespace TailRemote
             return true;
         }
 
+        /// <summary>The connection in front now if it is still to this PC (the same one, or a reconnect to it); null once another PC is in front or none is.</summary>
+        private Client? FrontClient(string address, int port) =>
+            _client != null && SamePc(FrontAddress, FrontPort, address, port) ? _client : null;
+
+        /// <summary>"Not restarted: you switched to Office PC." or "...: the connection to Office PC closed."</summary>
+        private string NotAnymore(string what, string address, int port) =>
+            what + ": " + (_client != null ? "you switched to " + NameFor(FrontAddress, FrontPort) + ", away from " + NameFor(address, port) + "." : "the connection to " + NameFor(address, port) + " closed.");
+
         // The connection whose Update the remote PC is asking GitHub now: a second press meanwhile is
         // told so, rather than asking twice.
         private Client? _remoteUpdateAsking;
@@ -750,6 +763,7 @@ namespace TailRemote
         {
             if (!CanUseRemote(out var c)) return;
             if (_remoteUpdateAsking == c) { Say("Still checking GitHub for the newest Kova."); return; }
+            var (pcAddress, pcPort) = (FrontAddress, FrontPort);
             // Said first: asking GitHub can take a while, and silence sounded like nothing happened.
             Say("Checking GitHub for the newest Kova.");
             // The newest on GitHub, not just this PC's own version: a release that changes how the PCs
@@ -764,7 +778,10 @@ namespace TailRemote
             }
             catch { } // offline: this PC's own version, as before
             finally { if (_remoteUpdateAsking == c) _remoteUpdateAsking = null; }
-            if (_client != c) return;
+            // Another PC came to the front while GitHub was asked: the update was meant for the one before,
+            // and saying nothing at all sounded as if it had been asked. The same PC reconnected is fine.
+            if (FrontClient(pcAddress, pcPort) is not Client now) { Say(NotAnymore("Not asked to update", pcAddress, pcPort)); return; }
+            c = now;
             if (c.HostVersion is Version v && v >= want)
             {
                 Say("The remote PC already has Kova " + v + (v == want ? ", the newest." : ", newer than " + want + "."));
@@ -787,7 +804,7 @@ namespace TailRemote
             if (_client == null) { Say("Connect to a PC first."); return; }
             if (_client.ListenOnly) { Say("A listen-only connection cannot see the remote screen."); return; }
             if (!_client.CanWatch) { Say("The remote PC's Kova is too old to show its screen. Update it there."); return; }
-            _screen = new VideoForm(() => _client, Say, () => _keys?.Toggle(), BackFromScreen);
+            _screen = new VideoForm(() => _client, Say, Speak, () => _keys?.Toggle(), BackFromScreen, QuickConnect);
             _screen.FormClosed += (_, _) => { _screen = null; _watch.Checked = false; UpdateTitle(); };
             _watch.Checked = true;
             _screen.Show(this);
@@ -796,6 +813,11 @@ namespace TailRemote
         /// <summary>Escape in the screen window: back here, the screen still on (and its frames a second in this title).</summary>
         private void BackFromScreen()
         {
+            // Hidden in the notification area (its X was pressed while the screen stayed open): brought
+            // back, so "Back to the main window" is true. Escape asks for the main window, so showing
+            // it is what is expected; closing the screen when the window hides would turn off what
+            // you chose to keep on.
+            if (!Visible) RestoreFromTray();
             Activate();
             UpdateTitle();
             Say("Back to the main window. The remote screen stays on; Control Shift S turns it off.");
@@ -810,11 +832,14 @@ namespace TailRemote
             // Pressed twice before the answer came, both got it and two info windows opened, one over the other.
             if (_infoAsking) { Say("Still asking the remote PC for its info."); return; }
             _infoAsking = true;
+            var (pcAddress, pcPort) = (FrontAddress, FrontPort);
             string text;
             try { text = await c.RequestInfoAsync(); }
             catch { Say("The remote PC did not answer."); return; }
             finally { _infoAsking = false; }
-            if (_client != c) return;
+            // Switched PCs (or the connection closed) while waiting: said, never silence. The same PC
+            // reconnected still gets its info.
+            if (FrontClient(pcAddress, pcPort) == null) { Say(NotAnymore("Info not shown", pcAddress, pcPort)); return; }
             using var f = new RemoteInfoForm(() => _client, text, Say);
             f.ShowDialog(this);
         }
@@ -823,7 +848,7 @@ namespace TailRemote
         {
             if (!CanUseRemote(out var c)) return;
             Doing("getting files from the remote PC");
-            using var f = new RemoteFilesForm(() => _client, Say);
+            using var f = new RemoteFilesForm(() => _client, Say, Speak);
             f.ShowDialog(this);
         }
 
@@ -929,6 +954,8 @@ namespace TailRemote
             FillSaved();
             if (target != null) Unpark(target);
             else Connect(quiet: false);
+            // Connect stopped before trying (a box asks for the address or password): said now instead.
+            if (!_connecting && _droppedNote != null) Speak(DroppedNote().TrimStart());
         }
 
         private void Park(Client c)
@@ -940,13 +967,28 @@ namespace TailRemote
             _parked.Add(new Parked(NameFor(FrontAddress, FrontPort), FrontAddress, FrontPort, FrontPassword, c));
             while (_parked.Count > MaxParked)
             {
+                // Said at the end of "Switched to ..." or "Connected." (DroppedNote): queued after
+                // "Connecting to ...", the "Connected." that follows always cut it off.
                 string gone = _parked[0].Name + ", the longest in the background, was disconnected: at most " + MaxParked + " wait there.";
-                Later(() => Speak(gone)); // after "Connecting to ...", which would otherwise cut it off
-
+                _droppedNote = _droppedNote == null ? gone : _droppedNote + " " + gone;
                 _parked[0].Client.Dispose();
                 _parked.RemoveAt(0);
             }
             _client = null;
+        }
+
+        // Logins in a row the host stopped waiting for (Client.LoginNotAwaited): see Connect.
+        private int _loginNotAwaited;
+
+        // A PC let go from the background to make room (Park): said with the outcome of the switch.
+        private string? _droppedNote;
+
+        /// <summary>" " and the note about a PC let go from the background, once; "" when there is none.</summary>
+        private string DroppedNote()
+        {
+            string? note = _droppedNote;
+            _droppedNote = null;
+            return note == null ? "" : " " + note;
         }
 
         private void Unpark(Parked p)
@@ -962,7 +1004,7 @@ namespace TailRemote
             ApplyMute();
             if (!c.ListenOnly) _keys?.SetClient(c);
             Tone(Sounds.Tone.Connected);
-            Say("Switched to " + p.Name + "." + (c.ListenOnly ? " Listen only." : " Press Control Shift Enter to control it."));
+            Say("Switched to " + p.Name + "." + (c.ListenOnly ? " Listen only." : " Press Control Shift Enter to control it.") + DroppedNote());
             UpdateButtons();
             UpdateTitle();
         }
@@ -1011,7 +1053,7 @@ namespace TailRemote
             var pc = _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port));
             if (pc == null || pc.Wake == info) return;
             pc.Wake = info;
-            try { _settings.Save(); } catch { }
+            SaveNow();
         }
 
         /// <summary>File, Wake a saved PC and connect: every saved PC, and whether Kova knows how to wake it yet.</summary>
@@ -1050,6 +1092,9 @@ namespace TailRemote
             _waking = pc.ToString();
             _wakingSince = Environment.TickCount64;
             SwitchTo(pc.Address, pc.Port, Settings.Unprotect(pc.PasswordEnc), pc.ToString());
+            // Already in front or in the background (no connection is being made): it is awake, and
+            // keeping this made a real failure minutes later say "Waiting for it to wake up".
+            if (!_connecting && !_reconnecting) _waking = null;
             // After switching, queued: "Connecting to ..." used to cut this off.
             Speak("Sent the wake signal to " + pc + " from this PC" + (relays.Count == 0 ? "" : " and from " + relays.Count + (relays.Count == 1 ? " connected PC" : " connected PCs")) + ".");
         }
@@ -1112,28 +1157,39 @@ namespace TailRemote
             finally { _speedHere.Enabled = true; }
         }
 
-        private bool _speedRemoteRunning;
+        // The connections a speed test is running on, by PC: one per window used to say a test was
+        // running on a PC just switched to, and the result was announced as that PC's.
+        private readonly System.Collections.Generic.HashSet<string> _speedRemoteRunning = new(StringComparer.OrdinalIgnoreCase);
+        private bool SpeedRunningOnFront => _client != null && _speedRemoteRunning.Contains(PcKey(FrontAddress, FrontPort));
+        private static string PcKey(string address, int port) => address.Trim() + ":" + port;
 
         private async void SpeedTestRemote()
         {
             if (!CanUseRemote(out var c)) return;
             Doing("testing the remote PC's internet speed");
-            _speedRemoteRunning = true;
+            var (pcAddress, pcPort) = (FrontAddress, FrontPort);
+            string key = PcKey(pcAddress, pcPort);
+            if (!_speedRemoteRunning.Add(key)) { Say("A speed test is already running on the remote PC."); return; }
             UpdateButtons();
             Say("The remote PC is testing its internet speed. It takes about 20 seconds, and its sound may break up meanwhile.");
             string text;
             try { text = await c.RequestSpeedTestAsync(); }
             catch { text = "Problem: the remote PC did not answer."; }
-            finally { _speedRemoteRunning = false; UpdateButtons(); }
-            ShowSpeed("The remote PC's internet speed", text);
+            finally { _speedRemoteRunning.Remove(key); UpdateButtons(); }
+            // Still the PC in front: as before. Otherwise named, so it is never taken for the one in front now.
+            bool front = FrontClient(pcAddress, pcPort) != null;
+            string name = NameFor(pcAddress, pcPort);
+            if (!front && text.StartsWith("Problem: ")) text = "Problem: the speed test on " + name + " did not finish: " + text["Problem: ".Length..];
+            ShowSpeed(front ? "The remote PC's internet speed" : name + "'s internet speed", text);
         }
 
         /// <summary>The results in a list, read with the arrows, brought up in front.</summary>
         private void ShowSpeed(string title, string text)
         {
-            if (!Visible) RestoreFromTray();
             Speak(text.StartsWith("Problem: ") ? text["Problem: ".Length..] : title + ": the test is done.");
+            // Only a result to read brings the window back from the notification area: a problem is said, nothing more.
             if (text.StartsWith("Problem: ")) return;
+            if (!Visible) RestoreFromTray();
             Activate();
             using var f = new ListViewerForm(title, text.Split('\n'), _ => false);
             f.ShowDialog(this);
@@ -1173,8 +1229,9 @@ namespace TailRemote
             {
                 using var f = new TextForm("Backup password", problem == null ? prompt : problem + " " + prompt, "", secret: true);
                 if (f.ShowDialog(this) != DialogResult.OK) return null;
-                if (f.Value.Length >= minimum) return f.Value;
-                problem = "That has " + f.Value.Length + (f.Value.Length == 1 ? " character" : " characters") + ": it needs at least " + minimum + ".";
+                int n = Characters(f.Value);
+                if (n >= minimum) return f.Value;
+                problem = "That has " + n + (n == 1 ? " character" : " characters") + ": it needs at least " + minimum + ".";
             }
         }
 
@@ -1183,18 +1240,24 @@ namespace TailRemote
         private async void BackupSettings()
         {
             Doing("backing up settings");
+            // The settings in use are empty stand-ins then: a backup of them would have no saved PCs or passwords.
+            if (_settings.SavingDisabled) { Say("Not backed up: Kova could not read its settings file, so it does not have your saved PCs and passwords right now. It tries again every half minute and says when it can."); return; }
             SaveSettings();
             string? path;
             try { path = await PickBackupFile(save: true); }
             catch (Exception e) { Say("Could not open the save box: " + e.Message); return; }
             if (path == null) return;
-            string? pw = AskBackupPassword("A password for the backup, at least " + MinPasswordLength + " characters. It locks the saved PCs' passwords inside, and you need it to restore:");
+            // Told before the backup is made, not after: passwords this Windows account can't read go in empty.
+            int unreadable = _settings.UnreadablePasswords;
+            string warning = unreadable == 0 ? "" : unreadable + (unreadable == 1 ? " saved password" : " saved passwords") + " can't be read on this Windows account and will be saved empty; type " + (unreadable == 1 ? "it" : "them") + " again first if you need " + (unreadable == 1 ? "it" : "them") + ". ";
+            string? pw = AskBackupPassword(warning + "A password for the backup, at least " + MinPasswordLength + " characters. It locks the saved PCs' passwords inside, and you need it to restore:");
             if (pw == null) return;
             try
             {
                 System.IO.File.WriteAllBytes(path, _settings.Export(pw));
                 int n = _settings.SavedPcs.Count;
-                Say("Backed up every setting and " + (n == 0 ? "no" : n.ToString()) + (n == 1 ? " saved PC" : " saved PCs") + " to " + path + ".");
+                Say("Backed up every setting and " + (n == 0 ? "no" : n.ToString()) + (n == 1 ? " saved PC" : " saved PCs") + " to " + path + "." +
+                    (unreadable == 0 ? "" : " " + unreadable + (unreadable == 1 ? " password is" : " passwords are") + " empty in it."));
             }
             catch (Exception e) { Say("Could not write the backup: " + e.Message); }
         }
@@ -1223,10 +1286,25 @@ namespace TailRemote
             {
                 string? pw = AskBackupPassword((problem != null ? problem + " " : "") + "The backup's password:", minimum: 1);
                 if (pw == null) return;
+                // By kind, never by the words in the message: a damaged backup's message that happened to
+                // mention a password asked for the password again and again, for ever.
                 try { restored = Settings.Import(data, pw); }
-                catch (System.Security.Cryptography.CryptographicException) { problem = "That password is not the backup's."; }
-                catch (Exception e) when (e.Message.Contains("password", StringComparison.OrdinalIgnoreCase)) { problem = e.Message; }
-                catch (Exception e) { Say(e.Message); return; }
+                catch (WrongBackupPasswordException) { problem = "That password is not the backup's, or the file is damaged."; }
+                // Any other such problem (Windows refusing to lock the passwords to this account) asked for the
+                // password again and again, though no password could help.
+                catch (System.Security.Cryptography.CryptographicException e)
+                {
+                    DiagLog.Write("restore settings: " + e);
+                    Say("The backup opened, but Windows could not lock its passwords to this account: " + e.Message);
+                    return;
+                }
+                catch (System.IO.InvalidDataException e) { Say(e.Message); return; } // already in plain words
+                catch (Exception e)
+                {
+                    DiagLog.Write("restore settings: " + e);
+                    Say("That backup could not be read. It may be damaged, or made by a different Kova version.");
+                    return;
+                }
             }
             int n = restored.SavedPcs.Count;
             if (MessageBox.Show(this, "Replace Kova's settings on this PC with the backup's? It has " + n + (n == 1 ? " saved PC" : " saved PCs") + ".",
@@ -1234,9 +1312,12 @@ namespace TailRemote
             // Again: the window could be used while the boxes were open (a connection started meanwhile).
             if (Busy) { Say("Not restored: disconnect, or stop hosting, first."); return; }
             _settings.CopyFrom(restored);
-            _settings.Save();
+            bool saved = _settings.Save();
             LoadIntoWindow();
-            Say("Restored every setting and " + n + (n == 1 ? " saved PC." : " saved PCs.") + (_service.Checked ? " Use Apply settings to the service to give the service them too." : ""));
+            // Not saved: said with it, so "Restored" is not taken to mean it will still be there next time.
+            if (saved) _saveProblemSaid = null; else _saveProblemSaid = _settings.SaveProblem;
+            Say("Restored every setting and " + n + (n == 1 ? " saved PC." : " saved PCs.") + (_service.Checked ? " Use Apply settings to the service to give the service them too." : "") +
+                (saved ? "" : " But they are only in use until Kova closes: " + (_settings.SaveProblem ?? "Kova could not save its settings.")));
         }
 
         /// <summary>Puts the settings into the menus (a restored backup), saving nothing until it is all in.</summary>
@@ -1286,10 +1367,13 @@ namespace TailRemote
             var c = _client;
             if (c == null || c.ListenOnly) { Say("Connect first."); return; }
             if (!c.CanRestart) { Say("The remote PC's Kova is too old to restart it. Update it first."); return; }
+            var (pcAddress, pcPort) = (FrontAddress, FrontPort);
             // A checkbox must be ticked before Restart turns on, so a reflexive Enter cannot restart the remote PC.
             using (var dlg = new RestartConfirmForm())
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
-            if (_client != c) { Say("Not restarted: the PC in front changed meanwhile."); return; }
+            // By PC, not by connection: the same PC merely reconnecting while the box was open is still the one meant.
+            if (FrontClient(pcAddress, pcPort) is not Client now || now.ListenOnly) { Say(NotAnymore("Not restarted", pcAddress, pcPort)); return; }
+            c = now;
             _expectRestart = true;
             c.RestartHost();
             Say("Asked the remote PC to restart.");
@@ -1310,16 +1394,25 @@ namespace TailRemote
 
         private void Remember(string what)
         {
-            _historyLines.Insert(0, DateTime.Now.ToString("t") + ": " + what);
+            _historyLines.Insert(0, DateTime.Now.ToString(TimeWords, System.Globalization.CultureInfo.InvariantCulture) + ": " + what);
             if (_historyLines.Count > MaxHistory) _historyLines.RemoveAt(_historyLines.Count - 1);
             FillHistory();
         }
 
+        // A menu open right now is never rebuilt under you: emptied or replaced while NVDA is in it, the
+        // line it was on was disposed (and an empty menu froze NVDA). Done once it closes instead.
+        private bool _historyStale, _barsStale;
+        private System.Collections.Generic.IReadOnlyList<(string Name, long Done, long Total)> _barsWanted = Array.Empty<(string, long, long)>();
+
+        private static bool IsOpen(ToolStripMenuItem item) => item.HasDropDownItems && item.DropDown.Visible;
+
         private void FillHistory()
         {
+            _history.Text = "&History of transfers" + (_historyLines.Count > 0 ? " (" + _historyLines.Count + ")" : "");
+            if (IsOpen(_history)) { _historyStale = true; return; }
+            _historyStale = false;
             var items = _history.DropDownItems;
             Menus.ClearAndDispose(items); // rebuilt after every transfer: the old lines must really go
-            _history.Text = "&History of transfers" + (_historyLines.Count > 0 ? " (" + _historyLines.Count + ")" : "");
             // Never an empty menu: with nothing to land on, NVDA froze.
             if (_historyLines.Count == 0) { items.Add(new MenuStatus("Nothing has been sent or received yet.").Item); return; }
             foreach (var line in _historyLines) items.Add(new MenuStatus(line).Item);
@@ -1343,7 +1436,13 @@ namespace TailRemote
             int n = Math.Min(files.Count, 32);
             // One file alone is the Files line itself: no list to open.
             if (n < 2) n = 0;
-            while (items.Count > n) { var gone = items[items.Count - 1]; items.RemoveAt(items.Count - 1); gone.Dispose(); }
+            _barsWanted = files;
+            // Open now: lines are updated and added, never taken away (the list going empty under NVDA
+            // froze it); the ones left over go once it closes.
+            bool open = IsOpen(_transferStatus.Item);
+            _barsStale = open && items.Count > n;
+            if (!open && n == 0) Menus.ClearAndDispose(items);
+            else if (!open) while (items.Count > n) { var gone = items[items.Count - 1]; items.RemoveAt(items.Count - 1); gone.Dispose(); }
             while (items.Count < n) items.Add(new ToolStripMenuItem { Tag = Menus.KeepOpenTag });
             for (int i = 0; i < n; i++)
             {
@@ -1373,12 +1472,16 @@ namespace TailRemote
         private readonly System.Collections.Generic.List<FileChannel.Transfer> _ended = new();
         private readonly System.Collections.Generic.HashSet<FileChannel.Transfer> _endedBefore = new(System.Collections.Generic.ReferenceEqualityComparer.Instance); // ends already shown
 
-        /// <summary>How transfers are going, either way: the Files line and bars. Never spoken, so a lot of them cannot flood NVDA; the sounds say they started and ended.</summary>
         /// <summary>A transfer of files coming to this PC ended (RemoteFilesForm marks what it asked for).</summary>
         internal static event Action<FileChannel.Transfer>? IncomingFilesEnded;
         /// <summary>Files sent from this PC (not the clipboard) finished going (RemoteFilesForm shows what it sent into a folder).</summary>
         internal static event Action<FileChannel.Transfer>? OutgoingFilesEnded;
 
+        /// <summary>
+        /// How transfers are going, either way: the Files line and bars. Progress is never spoken, so a lot of
+        /// transfers cannot flood NVDA; files arriving here are said as each one ends (as news), and the sounds
+        /// mark the rest.
+        /// </summary>
         private void ShowTransfer(FileChannel.Transfer t)
         {
             if (t.Finished)
@@ -1389,30 +1492,29 @@ namespace TailRemote
                 if (_endedBefore.Count > 64) _endedBefore.Clear();
                 _endedBefore.Add(t);
                 _going.Remove(t.Serial); if (!_ended.Contains(t)) _ended.Add(t);
+                // Said as each one ends, not once all have: "Sent small.txt" waited for an unrelated 40
+                // megabyte Get to finish, then cut off "Received big.bin". Files coming here are said (you
+                // may be busy in another window, like Get files, when they arrive), queued as news.
+                if (!t.Outgoing && !t.Clipboard && t.Result != null) Speak(t.Result);
+                if (!t.Clipboard) (t.Outgoing ? OutgoingFilesEnded : IncomingFilesEnded)?.Invoke(t);
+                // The clipboard's own sounds play when it is sent and when it arrives; file sounds are
+                // for Send files only; and stopping (or replacing) on purpose is never an error.
+                if (t.Failed && !t.Cancelled) Tone(Sounds.Tone.Error);
+                else if (!t.Failed && !t.Clipboard) Tone(t.Outgoing ? Sounds.Tone.FileSent : Sounds.Tone.FileReceived);
             }
             else if (_endedBefore.Contains(t)) return;
             else _going[t.Serial] = t;
             _transferShown = _going.Values.FirstOrDefault();
             if (_going.Count == 0)
             {
-                // All ended: one line for all of them.
+                // All ended: one line for all of them on the Files line (each was said as it ended).
                 var ends = _ended.ToList();
                 _ended.Clear();
                 if (ends.Count == 0) return;
                 ShowFileBars(Array.Empty<(string, long, long)>());
                 _transferStatus.Text = Summary(ends);
-                // Files coming here (Get files, or Send files from the other PC): said, not only a sound,
-                // as you may be busy in another window (Get files) when they finish.
-                var arrived = ends.Where(e => !e.Outgoing && !e.Clipboard).ToList();
-                if (arrived.Count > 0) Say(Summary(arrived));
-                foreach (var e in arrived) IncomingFilesEnded?.Invoke(e);
-                foreach (var e in ends.Where(e => e.Outgoing && !e.Clipboard)) OutgoingFilesEnded?.Invoke(e);
                 Remember(_transferStatus.Text);
                 _transferStop.Enabled = false;
-                // The clipboard's own sounds play when it is sent and when it arrives; file sounds are
-                // for Send files only; and stopping (or replacing) on purpose is never an error.
-                if (ends.Any(e => e.Failed && !e.Cancelled)) Tone(Sounds.Tone.Error);
-                else if (ends.Any(e => !e.Failed && !e.Clipboard)) Tone(ends[0].Outgoing ? Sounds.Tone.FileSent : Sounds.Tone.FileReceived);
                 return;
             }
             var going = _going.Values.ToList();
@@ -1459,6 +1561,10 @@ namespace TailRemote
         private static string Summary(System.Collections.Generic.List<FileChannel.Transfer> ends)
         {
             if (ends.Count == 1) return ends[0].Result ?? TransferIdle;
+            // Some sent and some received (a Get while a Send went): each its own line, not "Received
+            // small.txt, big.bin from all 2 PCs".
+            if (ends.Any(e => e.Outgoing) && ends.Any(e => !e.Outgoing))
+                return string.Join(" ", ends.Select(e => e.Result).Where(r => !string.IsNullOrEmpty(r)).Take(5));
             var good = ends.Where(e => !e.Failed).ToList();
             var bad = ends.Where(e => e.Failed).ToList();
             string what = string.Join(", ", ends.Select(e => e.What).Distinct().Take(3));
@@ -1527,7 +1633,7 @@ namespace TailRemote
         {
             if (ChosenSaved() is not SavedPc pc) return;
             _settings.SavedPcs.Remove(pc);
-            _settings.Save();
+            SaveNow();
             FillSaved();
             Say("Forgot " + pc + ".");
         }
@@ -1536,6 +1642,8 @@ namespace TailRemote
         {
             base.OnShown(e);
             _shown = true;
+            Program.ShowRequested += ShowRequested;
+            Program.HostRequested += HostRequested;
             StartWatchdog();
             _keys = new KeyCapture(() => _handle);
             _keys.ModeChanged += remote => Later(() => ModeChanged(remote));
@@ -1557,6 +1665,12 @@ namespace TailRemote
                 if (goes) _sayFirst = updated; else Say(updated);
             }
             OfferServiceUpdate();
+            // Said once, at the start, after the window's name: settings that cannot be saved this time, and
+            // passwords that cannot be read on this Windows account (they act as empty until typed again).
+            if (_settings.SavingDisabled) { TellSaveProblem(); _settingsTimer.Start(); }
+            if (_settings.UnreadablePasswords is int unreadable and > 0)
+                Speak(unreadable + (unreadable == 1 ? " saved password" : " saved passwords") + " could not be read on this Windows account, so " + (unreadable == 1 ? "it counts" : "they count") +
+                    " as empty: the settings came from another account or PC. Type " + (unreadable == 1 ? "it" : "them") + " again where needed.");
             if (_autoHost && _service.Checked) Log("The Kova service is hosting this PC, so this window does not.");
             else if (_autoHost)
             {
@@ -1645,7 +1759,75 @@ namespace TailRemote
             if (_streaming.Text != st) _streaming.Text = st;
         }
 
-        private void SaveSettings()
+        // The save problem last said, so a setting changed again and again says it once, not each time.
+        private string? _saveProblemSaid;
+
+        /// <summary>
+        /// Writes the settings; if they could not be (settings.json unreadable at start, or the disk
+        /// refusing), says why once, in plain words: changes were lost in silence before.
+        /// </summary>
+        // A save failed: until one works or half a minute passes, changes wait for the settings timer. Each
+        // failing save on the window's thread froze it (on every tick of a checkbox).
+        private long _saveFailedAt = long.MinValue / 2;
+        private bool _savePending;
+
+        private void SaveNow(bool now = false, int retries = 1)
+        {
+            if (!now && !_settings.SavingDisabled && Environment.TickCount64 - _saveFailedAt < 30_000) { _savePending = true; return; }
+            bool saved;
+            try { saved = _settings.Save(retries); } catch { saved = false; }
+            if (saved) { _saveProblemSaid = null; _savePending = false; _saveFailedAt = long.MinValue / 2; return; }
+            if (!_settings.SavingDisabled) { _saveFailedAt = Environment.TickCount64; _savePending = true; }
+            if (!IsDisposed) _settingsTimer.Start();
+            TellSaveProblem();
+        }
+
+        private void SettingsTimerTick()
+        {
+            if (_settings.SavingDisabled) TryReadSettingsAgain();
+            else if (_savePending) SaveNow(now: true);
+            else _settingsTimer.Stop();
+        }
+
+        private bool _rereading;
+
+        /// <summary>
+        /// The settings could not be read at the start (held, or access refused), so the window runs on empty
+        /// stand-ins that are never saved. Kova runs for months: every half minute it tries again, and once they
+        /// read, takes them in (keeping what was changed meanwhile, Settings.RecoverFrom) and saves again.
+        /// </summary>
+        private void TryReadSettingsAgain()
+        {
+            if (_rereading) return;
+            _rereading = true;
+            // Off the window's thread: Load waits up to two seconds for a file that is held.
+            System.Threading.Tasks.Task.Run(() => Settings.Load(note: false)).ContinueWith(t => Later(() =>
+            {
+                _rereading = false;
+                if (t.IsFaulted || t.Result.SavingDisabled || !_settings.SavingDisabled) return;
+                // Not under a connection (the mode could change under it) or an open box: next time.
+                if (_client != null || _connecting || _reconnecting || _parked.Count > 0 || OwnedForms.Length > 0) return;
+                SaveSettings(); // what the window shows now, into the stand-ins (nothing is written yet)
+                _settings.RecoverFrom(t.Result);
+                LoadIntoWindow();
+                _saveProblemSaid = null;
+                Speak("Kova can read its settings again.");
+                SaveNow(now: true);
+            }));
+        }
+
+        private void TellSaveProblem()
+        {
+            string problem = _settings.SaveProblem ?? "Kova could not save its settings.";
+            if (!_shown || problem == _saveProblemSaid) return; // before the window is up: OnShown says it
+            _saveProblemSaid = problem;
+            Speak(problem + (_settings.SavingDisabled ? "" : " Changes you make may be lost when Kova closes."));
+        }
+
+        /// <summary>The window's settings, saved. Closing: saved now even after a recent failure, with every retry.</summary>
+        private void SaveSettings() => SaveSettings(closing: false);
+
+        private void SaveSettings(bool closing)
         {
             if (_loadingSettings) return;
             _settings.HostMode = HostMode;
@@ -1662,7 +1844,7 @@ namespace TailRemote
             _settings.MuteWhenNotControlling = _muteLocal.Checked;
             _settings.RideOutStalls = _rideOut.Checked;
             _settings.SoundQuality = _quality.SelectedIndex - 1;
-            _settings.Save();
+            SaveNow(now: closing, retries: closing ? 5 : 1);
         }
 
         // ---- Hang watchdog ----
@@ -1721,7 +1903,7 @@ namespace TailRemote
             if (!CheckListenPassword()) return;
             string listen = _listenPassword.Text;
             if (!CheckPort(out int port)) return;
-            PortEditorForm.Remember(_settings, port);
+            if (!PortEditorForm.Remember(_settings, port)) TellSaveProblem();
             try
             {
                 _host = new Host(port, _password.Text, listen, msg => Later(() => Log(msg)),
@@ -1767,6 +1949,18 @@ namespace TailRemote
 
         public const int MinPasswordLength = 6;
 
+        /// <summary>
+        /// Characters as a person counts them: an emoji or an accented letter typed as two parts is one.
+        /// Length counts UTF-16 units, so three emoji passed as a 6-character password.
+        /// </summary>
+        internal static int Characters(string s) => new System.Globalization.StringInfo(s).LengthInTextElements;
+
+        // Times and dates as they are said, the same for everyone: Kova runs with invariant globalization,
+        // so "t" and "g" came out month first and 24-hour ("10/12/2026 14:05"), which reads wrongly to
+        // half the world. Spelled out, the month as a word, nothing can be misread.
+        internal const string TimeWords = "h:mm tt";
+        internal const string DateWords = "d MMMM yyyy, h:mm tt";
+
         // Hosting started by itself (at sign-in, or the new copy after an update): nobody is there to
         // type a longer password, and refusing would leave the PC unreachable, so a short one still hosts.
         private bool _hostingByItself;
@@ -1778,7 +1972,7 @@ namespace TailRemote
         /// </summary>
         private bool CheckPassword(bool hosting = true)
         {
-            int n = _password.Text.Length;
+            int n = Characters(_password.Text);
             if (n >= MinPasswordLength || (n > 0 && !hosting)) return true;
             if (n > 0 && _hostingByItself)
             {
@@ -1800,11 +1994,11 @@ namespace TailRemote
         private bool CheckListenPassword()
         {
             string listen = _listenPassword.Text;
-            if (listen.Length == 0 || (listen.Length >= MinPasswordLength && listen != _password.Text)) return true;
+            if (listen.Length == 0 || (Characters(listen) >= MinPasswordLength && listen != _password.Text)) return true;
             if (_hostingByItself && listen != _password.Text)
             {
                 // As with the main password: refusing here would leave a PC that hosts by itself unreachable.
-                Speak("The listen-only password has only " + listen.Length + " characters. Choose one of at least " + MinPasswordLength + ".");
+                Speak("The listen-only password has only " + Characters(listen) + " characters. Choose one of at least " + MinPasswordLength + ".");
                 return true;
             }
             string why = listen == _password.Text
@@ -1840,7 +2034,7 @@ namespace TailRemote
         /// <summary>Connects with the saved settings. Quiet attempts are reconnects: only success is spoken.</summary>
         private async void Connect(bool quiet)
         {
-            if (HostMode) { if (_reconnecting) StopReconnecting("Stopped trying to reconnect: this PC is hosting now."); return; }
+            if (HostMode) { if (_reconnecting) StopReconnecting("Stopped trying to reconnect: this PC is hosting now.", news: quiet); return; }
             string address;
             int port;
             string pw;
@@ -1856,7 +2050,7 @@ namespace TailRemote
                 pw = _password.Text;
                 if (address.Length == 0 || pw.Length == 0 || !int.TryParse(_port.Text.Trim(), out port) || port is <= 0 or > 65535)
                 {
-                    StopReconnecting("Stopped trying: the address, port or password is empty or not valid. Fix it, then press Connect.");
+                    StopReconnecting("Stopped trying: the address, port or password is empty or not valid. Fix it, then press Connect.", news: true);
                     return;
                 }
             }
@@ -1888,7 +2082,7 @@ namespace TailRemote
                 if (_player == null || _playerDevice != device)
                 {
                     _player?.Dispose();
-                    _player = new Player(device, msg => Later(() => Say(msg)));
+                    _player = new Player(device, msg => Later(() => Speak(msg))); // news: never cuts off what you asked for
                     _playerDevice = device;
                 }
                 _player.SpeedUp = _speedUp.Checked;
@@ -1901,7 +2095,7 @@ namespace TailRemote
                 Client? made = null;
                 // What a PC says while it waits in the background is said with its name: "Host audio is not
                 // available" from a background PC sounded as if it came from the one in front.
-                void Told(string msg) => Later(() => Say(_parked.Find(x => x.Client == made) is Parked bg ? bg.Name + ", in the background: " + msg : msg));
+                void Told(string msg) => Later(() => Speak(_parked.Find(x => x.Client == made) is Parked bg ? bg.Name + ", in the background: " + msg : msg));
                 var c = await System.Threading.Tasks.Task.Run(() =>
                     Client.Connect(address, port, pw, player, Told, locked, answerMs));
                 made = c;
@@ -1924,6 +2118,7 @@ namespace TailRemote
                 bool wasReconnecting = _reconnecting;
                 _reconnecting = false;
                 _waking = null; // awake now: a later drop is a real error again
+                _loginNotAwaited = 0;
                 _retryTimer.Stop();
                 string start = _expectUpdate != null ? "The remote PC is back" + (_expectUpdate.Length > 0 ? ", updated to " + _expectUpdate : "") + "."
                     : _expectRestart ? "The remote PC is back." : wasReconnecting ? "Reconnected." : "Connected.";
@@ -1937,9 +2132,11 @@ namespace TailRemote
                     _keys?.Toggle(); // straight back to controlling the remote PC
                 }
                 Tone(Sounds.Tone.Connected);
-                Say(c.ListenOnly ? start + " Listen only: you hear the remote PC, but cannot control it."
+                string connected = (c.ListenOnly ? start + " Listen only: you hear the remote PC, but cannot control it."
                     : resume ? start + " Controlling the remote PC."
-                    : start + " Press Control Shift Enter to control the remote PC.");
+                    : start + " Press Control Shift Enter to control the remote PC.") + DroppedNote();
+                // Connect pressed: the answer to it. Back by itself after a drop or a restart: news.
+                if (quiet) Speak(connected); else Say(connected);
             }
             catch (Exception e) when (attempt == _attempt)
             {
@@ -1947,17 +2144,22 @@ namespace TailRemote
                 // cannot help (and a wrong password tried again gets this PC blocked).
                 // Only a wrong password stops it: the login is checked for damage, so that is real. A
                 // "different version" can also be a damaged first message, so it keeps trying.
-                bool hopeless = e.Message.StartsWith("Wrong password");
-                if (hopeless) { if (_reconnecting) StopReconnecting("Stopped trying: " + e.Message); else Say("Could not connect: " + e.Message); }
+                // The host giving up on a slow login, again and again, can be hiding a wrong password that
+                // uses up its budget for strangers: after 3 in a row it stops too. Any other error starts the count again.
+                // Not counted while the other PC restarts or updates: its Kova coming up can drop slow logins for a while.
+                _loginNotAwaited = e.Message != Client.LoginNotAwaited ? 0 : _expectUpdate != null || _expectRestart ? _loginNotAwaited : _loginNotAwaited + 1;
+                bool hopeless = e.Message.StartsWith("Wrong password") || _loginNotAwaited >= 3;
+                if (hopeless) _loginNotAwaited = 0;
+                if (hopeless) { if (_reconnecting) StopReconnecting("Stopped trying: " + e.Message + DroppedNote(), news: quiet); else Say("Could not connect: " + e.Message + DroppedNote()); }
                 else if (!_reconnecting)
                 {
                     _reconnecting = true;
                     _retryTimer.Start();
-                    if (WakingUp(address, port)) Say("Waiting for " + _waking + " to wake up. Kova connects as soon as it answers; press Disconnect to stop.");
+                    if (WakingUp(address, port)) Say("Waiting for " + _waking + " to wake up. Kova connects as soon as it answers; press Disconnect to stop." + DroppedNote());
                     else
                     {
                         Tone(Sounds.Tone.Error);
-                        Say("Could not connect: " + e.Message + " Trying again every second until you press Disconnect.");
+                        Say("Could not connect: " + e.Message + " Trying again every second until you press Disconnect." + DroppedNote());
                     }
                 }
             }
@@ -1970,6 +2172,7 @@ namespace TailRemote
                 {
                     _connecting = false;
                     _go.Enabled = true;
+                    if (_droppedNote != null) Speak(DroppedNote().TrimStart()); // nothing above said it
                 }
                 UpdateButtons();
                 UpdateTitle();
@@ -1999,37 +2202,40 @@ namespace TailRemote
                 _frontAddress = _frontPassword = null; // the next Connect goes wherever Address says
                 _expectRestart = false;
                 _expectUpdate = null;
+                _waking = null; // a later failure to connect is a real error, not "waiting for it to wake up"
                 Say(why);
                 if (_parked.Count > 0) Speak("Still connected in the background to " + string.Join(", ", _parked.Select(x => x.Name)) + ". File, Switch to PC brings one to the front.");
             }
+            // Below, the connection ended by itself: news (Speak), which waits for a line being said
+            // (a transfer that just ended, a health alert) instead of cutting it off.
             else if (leaving == Protocol.LeavingUpdating)
             {
                 // The host said it is updating: no error, just wait for it to come back.
                 _expectUpdate = leavingDetail;
                 _reconnecting = true;
                 _retryTimer.Start();
-                Say(why + " Kova reconnects as soon as it is back.");
+                Speak(why + " Kova reconnects as soon as it is back.");
             }
             else if (_expectRestart)
             {
                 // Expected: keep trying until it is back, however long the restart takes.
                 _reconnecting = true;
                 _retryTimer.Start();
-                Say(leaving == Protocol.LeavingShutdown ? why + " Kova reconnects if it comes back."
+                Speak(leaving == Protocol.LeavingShutdown ? why + " Kova reconnects if it comes back."
                     : "The remote PC is restarting. Kova reconnects as soon as it is back.");
             }
             else if (leaving == Protocol.LeavingStopped)
             {
                 _reconnecting = true;
                 _retryTimer.Start();
-                Say(why + " Trying again every second until you press Disconnect.");
+                Speak(why + " Trying again every second until you press Disconnect.");
             }
             else
             {
                 // Dropped, or the host restarted after an update: try at once, then every second.
                 _reconnecting = true;
                 _retryTimer.Start();
-                Say(why + " Reconnecting.");
+                Speak(why + " Reconnecting.");
                 Connect(quiet: true);
             }
             UpdateButtons();
@@ -2042,7 +2248,8 @@ namespace TailRemote
             if (!HostMode) Sounds.Play(t);
         }
 
-        private void StopReconnecting(string why)
+        /// <summary>news: it stopped by itself (a reconnect found nothing it could use), not because you pressed Disconnect.</summary>
+        private void StopReconnecting(string why, bool news = false)
         {
             Tone(why.StartsWith("Disconnected") ? Sounds.Tone.Disconnected : Sounds.Tone.Error);
             _resumeRemote = false;
@@ -2051,11 +2258,12 @@ namespace TailRemote
             _attempt++;
             _reconnecting = false;
             _waking = null;
+            _loginNotAwaited = 0;
             _connecting = false; // the abandoned attempt's own finally no longer counts, so it is cleared here
             _frontAddress = _frontPassword = null;
             _go.Enabled = true;
             _retryTimer.Stop();
-            Say(why);
+            if (news) Speak(why); else Say(why);
             UpdateButtons();
             UpdateTitle();
         }
@@ -2322,16 +2530,35 @@ namespace TailRemote
             try { if (IsHandleCreated && !IsDisposed) BeginInvoke(a); } catch { }
         }
 
+        /// <summary>
+        /// Runs on the window's thread and waits (up to 1.5 s) until it has: true only if it really ran. A hung
+        /// window then gives no answer to a second copy of Kova, which opens instead of leaving nothing.
+        /// A box open over the window still lets this through (boxes keep the window's messages moving).
+        /// </summary>
+        private bool RunNow(Action a)
+        {
+            try
+            {
+                if (!IsHandleCreated || IsDisposed) return false;
+                var done = BeginInvoke(a);
+                return done.AsyncWaitHandle.WaitOne(1500) && done.IsCompleted;
+            }
+            catch { return false; }
+        }
+
         private string? _sayFirst; // said at the start of the next Say, rather than cut off by it
 
-        /// <summary>Logs a line and speaks it after whatever is being said, without cutting it off.</summary>
+        /// <summary>
+        /// News nobody pressed anything for just now (a transfer ended, a health alert, the connection
+        /// dropped): logged, and said after whatever is being said, never cutting it off (see Speech).
+        /// </summary>
         private void Speak(string line)
         {
             Log(line);
             Speech.Speak(line, interrupt: false);
         }
 
-        /// <summary>Logs a line and speaks it.</summary>
+        /// <summary>An answer to something just pressed: logged, and said at once, cutting off older speech (see Speech).</summary>
         private void Say(string line)
         {
             if (_sayFirst != null) { line = _sayFirst + " " + line; _sayFirst = null; }
@@ -2371,6 +2598,40 @@ namespace TailRemote
             Close();
         }
 
+        /// <summary>
+        /// Kova was opened again while this window runs (Program.ShowRequested, on a background thread):
+        /// this window comes forward, out of the notification area if it is there, as if just opened.
+        /// </summary>
+        private bool ShowRequested() => RunNow(() =>
+        {
+            Doing("coming forward for a second copy");
+            RestoreFromTray();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            // A box open over the window (a question, Get files): that is where the keys belong.
+            var top = Application.OpenForms.Cast<Form>().LastOrDefault(f => f != this && !f.InvokeRequired && f.Visible && f.Modal);
+            if (top != null) { top.BringToFront(); top.Activate(); return; }
+            BringToFront();
+            Activate();
+            // As when it opens: the window is blank, so NVDA has nothing of its own to say.
+            Speech.Speak(Text + ". Alt opens the menus.", interrupt: false);
+        });
+
+        /// <summary>
+        /// The sign-in task started Kova with --host while this window runs (Program.HostRequested, on a
+        /// background thread): it hosts, as that copy would have, but only if it is doing nothing else.
+        /// Hosting, connected or connecting already: left alone.
+        /// </summary>
+        private bool HostRequested() => RunNow(() =>
+        {
+            if (Busy) return;
+            if (_service.Checked) { Log("The Kova service is hosting this PC, so this window does not."); return; }
+            Doing("hosting for the sign-in task");
+            _mode.SelectedIndex = 1;
+            _hostingByItself = true;
+            try { Go(); }
+            finally { _hostingByItself = false; }
+        });
+
         private void RestoreFromTray()
         {
             Show();
@@ -2388,8 +2649,12 @@ namespace TailRemote
                 return;
             }
             _tray.Visible = false;
+            Program.ShowRequested -= ShowRequested;
+            Program.HostRequested -= HostRequested;
             _settings.ResumeState = _host != null ? "host" : _client != null || _reconnecting ? "connect" : "";
-            SaveSettings();
+            SaveSettings(closing: true);
+            _settingsTimer.Stop();
+            _settingsTimer.Dispose();
             _retryTimer.Stop();
             _retryTimer.Dispose();
             _titleTimer.Stop();

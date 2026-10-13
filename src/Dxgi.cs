@@ -276,6 +276,9 @@ namespace TailRemote
         /// <summary>
         /// The mouse pointer, drawn into a copy of the picture (duplication leaves it out). Each pointer
         /// shape is turned into colours with see-through edges once, by drawing it on black and on white.
+        /// Pixels that turn the screen under them inside out (the text I-beam, the cross, old black and
+        /// white pointers) come out white on black and black on white: those are marked (alpha 1, a value
+        /// no real pointer edge is given here) and drawn the same way, so they show on any background.
         /// </summary>
         private static class Cursor
         {
@@ -283,6 +286,7 @@ namespace TailRemote
             private static IntPtr _shape;
             private static int _x = int.MinValue, _y;
             private static readonly Dictionary<IntPtr, (int Hx, int Hy, int W, int H, byte[] Bgra)> Shapes = new();
+            private const byte Invert = 1; // the alpha that marks a pixel which turns the screen under it inside out
 
             /// <summary>
             /// Counts each change of where the pointer is or what it looks like. Shared by every screen's
@@ -330,6 +334,7 @@ namespace TailRemote
                         int si = (y * w + x) * 4, di = (ty * f.Width + tx) * 4;
                         int a = src[si + 3];
                         if (a == 0) continue;
+                        if (a == Invert) { for (int c = 0; c < 3; c++) f.Pixels[di + c] = (byte)(255 - f.Pixels[di + c]); continue; }
                         for (int c = 0; c < 3; c++) f.Pixels[di + c] = (byte)((src[si + c] * a + f.Pixels[di + c] * (255 - a)) / 255);
                     }
                 }
@@ -338,41 +343,51 @@ namespace TailRemote
 
             private static (int, int, int, int, byte[]) Render(IntPtr cursor)
             {
-                int hx = 0, hy = 0;
+                int hx = 0, hy = 0, w = 0, h = 0;
                 if (GetIconInfo(cursor, out var ii))
                 {
                     hx = ii.xHotspot; hy = ii.yHotspot;
+                    // Its real size, from its own bitmaps: a black and white pointer's mask holds two
+                    // pictures one above the other (what to keep, what to turn inside out).
+                    if (ii.hbmColor != IntPtr.Zero && GetObject(ii.hbmColor, Marshal.SizeOf<BITMAP>(), out var bc) != 0) { w = bc.bmWidth; h = bc.bmHeight; }
+                    else if (ii.hbmMask != IntPtr.Zero && GetObject(ii.hbmMask, Marshal.SizeOf<BITMAP>(), out var bm) != 0) { w = bm.bmWidth; h = bm.bmHeight / 2; }
                     if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask);
                     if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor);
                 }
-                const int size = 128; // big pointers too (accessibility sizes)
-                byte[]? black = DrawOn(cursor, 0x000000, size), white = DrawOn(cursor, 0xFFFFFF, size);
+                // Big pointers too (accessibility sizes go to 256), but not without limit; 128 if the size
+                // could not be read, as before.
+                if (w <= 0 || h <= 0) w = h = 128;
+                w = Math.Min(w, 256); h = Math.Min(h, 256);
+                byte[]? black = DrawOn(cursor, 0x000000, w, h), white = DrawOn(cursor, 0xFFFFFF, w, h);
                 if (black == null || white == null) return (0, 0, 0, 0, Array.Empty<byte>());
-                var bgra = new byte[size * size * 4];
-                for (int i = 0; i < size * size; i++)
+                var bgra = new byte[w * h * 4];
+                for (int i = 0; i < w * h; i++)
                 {
+                    // Lighter on black than on white: the pixel turns what is under it inside out.
+                    if (black[i * 4 + 1] - white[i * 4 + 1] > 128) { bgra[i * 4 + 3] = Invert; continue; }
                     int alpha = 255 - Math.Clamp((white[i * 4 + 1] - black[i * 4 + 1]), 0, 255);
+                    if (alpha == Invert) alpha = 0; // nearly see-through anyway; Invert means something else here
                     bgra[i * 4 + 3] = (byte)alpha;
                     for (int c = 0; c < 3; c++) bgra[i * 4 + c] = alpha == 0 ? (byte)0 : (byte)Math.Min(255, black[i * 4 + c] * 255 / alpha);
                 }
-                return (hx, hy, size, size, bgra);
+                return (hx, hy, w, h, bgra);
             }
 
-            private static byte[]? DrawOn(IntPtr cursor, int background, int size)
+            private static byte[]? DrawOn(IntPtr cursor, int background, int w, int h)
             {
-                IntPtr screen = GetDC(IntPtr.Zero), dc = CreateCompatibleDC(screen), bmp = CreateCompatibleBitmap(screen, size, size);
+                IntPtr screen = GetDC(IntPtr.Zero), dc = CreateCompatibleDC(screen), bmp = CreateCompatibleBitmap(screen, w, h);
                 try
                 {
                     IntPtr was = SelectObject(dc, bmp);
                     IntPtr brush = CreateSolidBrush(background);
-                    var r = new RECT { Right = size, Bottom = size };
+                    var r = new RECT { Right = w, Bottom = h };
                     FillRect(dc, ref r, brush);
                     DeleteObject(brush);
-                    DrawIconEx(dc, 0, 0, cursor, 0, 0, 0, IntPtr.Zero, 3);
+                    DrawIconEx(dc, 0, 0, cursor, 0, 0, 0, IntPtr.Zero, 3); // its own size: a bigger one is cut off rather than squeezed, so the hotspot stays right
                     SelectObject(dc, was);
-                    var info = new BITMAPINFOHEADER { biSize = 40, biWidth = size, biHeight = -size, biPlanes = 1, biBitCount = 32 };
-                    byte[] px = new byte[size * size * 4];
-                    return GetDIBits(dc, bmp, 0, (uint)size, px, ref info, 0) == size ? px : null;
+                    var info = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };
+                    byte[] px = new byte[w * h * 4];
+                    return GetDIBits(dc, bmp, 0, (uint)h, px, ref info, 0) == h ? px : null;
                 }
                 finally { DeleteObject(bmp); DeleteDC(dc); ReleaseDC(IntPtr.Zero, screen); }
             }
@@ -380,6 +395,7 @@ namespace TailRemote
             [StructLayout(LayoutKind.Sequential)] private struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public int x, y; }
             [StructLayout(LayoutKind.Sequential)] private struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
             [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+            [StructLayout(LayoutKind.Sequential)] private struct BITMAP { public int bmType, bmWidth, bmHeight, bmWidthBytes; public short bmPlanes, bmBitsPixel; public IntPtr bmBits; }
             [StructLayout(LayoutKind.Sequential)] private struct BITMAPINFOHEADER { public int biSize, biWidth, biHeight; public short biPlanes, biBitCount; public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant; }
             [DllImport("user32.dll")] private static extern bool GetCursorInfo(ref CURSORINFO info);
             [DllImport("user32.dll")] private static extern bool GetIconInfo(IntPtr icon, out ICONINFO info);
@@ -392,6 +408,7 @@ namespace TailRemote
             [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int h);
             [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
             [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
+            [DllImport("gdi32.dll", EntryPoint = "GetObjectW")] private static extern int GetObject(IntPtr obj, int size, out BITMAP bitmap);
             [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr dc);
             [DllImport("gdi32.dll")] private static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFOHEADER info, uint usage);
         }

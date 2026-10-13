@@ -396,7 +396,7 @@ namespace TailRemote
                     string outside = Path.Combine(Root, "escaped.txt");
                     string? arrived = null;
                     host.ClipboardFilesReceived += p => arrived = string.Join(",", p);
-                    foreach (string evil in new[] { "..\\escaped.txt", "../escaped.txt", "C:\\Windows\\escaped.txt", "\\\\server\\share\\x.txt", "a\\..\\..\\escaped.txt", "con.txt\u0000x", "" })
+                    foreach (string evil in new[] { "..\\escaped.txt", "../escaped.txt", "C:\\Windows\\escaped.txt", "\\\\server\\share\\x.txt", "a\\..\\..\\escaped.txt", "" })
                         ctrl.Files!.TestSendEntries(new List<(string, byte[]?)> { (evil, Encoding.UTF8.GetBytes("pwned")) });
                     Thread.Sleep(1500);
                     string? acceptedEvil = arrived; // before the normal copy below, which should arrive
@@ -409,26 +409,36 @@ namespace TailRemote
                     return !escaped && acceptedEvil == null && landed != null ? "every escape was refused, and normal copies still work" : "FAIL: escaped " + escaped + ", accepted " + acceptedEvil;
                 });
 
-                Scenario("a hostile PC sending names Windows keeps for itself (CON, NUL.txt, COM1, names ending in a dot or a space): refused, saying why", 30, () =>
+                // Since 4.1.4 such names (made on a Mac, in Linux, or by a hostile PC) are renamed to something Windows can
+                // use, inside the holding folder, and the receiver is told; before, one of them refused the whole send.
+                Scenario("a hostile PC sending names Windows keeps for itself (CON, NUL.txt, COM1, a NUL character, names ending in a dot or a space): renamed safely inside the folder, saying so", 30, () =>
                 {
-                    string? arrived = null;
-                    Action<string[]> gotFiles = p => arrived = string.Join(",", p);
+                    var arrived = new List<string>();
+                    Action<string[]> gotFiles = p => { lock (arrived) arrived.AddRange(p); };
                     var said = new List<string>();
-                    Action<FileChannel.Transfer> note = t => { if (t.Finished && t.Outgoing && t.What == "reserved") lock (said) said.Add(t.Result ?? ""); };
+                    Action<FileChannel.Transfer> note = t => { if (t.Finished && !t.Outgoing) lock (said) said.Add(t.Result ?? ""); };
                     host.ClipboardFilesReceived += gotFiles;
-                    ctrl.TransferProgress += note;
-                    var names = new[] { "CON", "nul.txt", "sub\\AUX", "sub\\com1.log", "LPT9.dat", "trailing dot.", "trailing space ", "folder.\\x.txt" };
+                    host.TransferProgress += note;
+                    var names = new[] { "CON", "nul.txt", "sub\\AUX", "sub\\com1.log", "LPT9.dat", "trailing dot.", "trailing space ", "folder.\\x.txt", "con.txt\u0000x" };
                     try
                     {
                         foreach (string bad in names) ctrl.Files!.TestSendEntries(new List<(string, byte[]?)> { (bad, Encoding.UTF8.GetBytes("x")) }, "reserved");
-                        WaitFor(() => { lock (said) return said.Count >= names.Length; }, 3000);
+                        WaitFor(() => { lock (said) return said.Count >= names.Length; }, 5000);
                     }
-                    finally { host.ClipboardFilesReceived -= gotFiles; ctrl.TransferProgress -= note; }
-                    List<string> results;
+                    finally { host.ClipboardFilesReceived -= gotFiles; host.TransferProgress -= note; }
+                    List<string> results, paths;
                     lock (said) results = said.ToList();
-                    bool clear = results.Count == names.Length && results.All(r => r.Contains("Windows"));
-                    return arrived == null && clear ? "all " + names.Length + " refused, each saying why (" + results[0] + ")"
-                        : "FAIL: arrived " + arrived + "; " + results.Count + " of " + names.Length + " said why: " + string.Join(" | ", results);
+                    lock (arrived) paths = arrived.ToList();
+                    string stage = Path.GetFullPath(Path.Combine(Root, "stage")) + "\\";
+                    var reserved = new System.Text.RegularExpressions.Regex(@"^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    var files = paths.SelectMany(p => Directory.Exists(p) ? Directory.EnumerateFileSystemEntries(p, "*", SearchOption.AllDirectories).Prepend(p) : new[] { p }).ToList();
+                    bool inside = paths.Count > 0 && paths.All(p => Path.GetFullPath(p).StartsWith(stage, StringComparison.OrdinalIgnoreCase));
+                    bool usable = files.All(f => { string n = Path.GetFileName(f); return !reserved.IsMatch(n) && !n.EndsWith('.') && !n.EndsWith(' ') && n.IndexOf('\0') < 0; });
+                    // Every send but "folder.\x.txt" renames its own last name; that one only renames the folder it sits in
+                    // (said when the folder itself is listed, which this hand-made list leaves out).
+                    bool told = results.Count == names.Length && results.Count(r => r.Contains("had to change")) >= names.Length - 1;
+                    return inside && usable && told ? "all " + names.Length + " arrived inside the holding folder under names Windows can use, each saying so (" + results[0] + ")"
+                        : "FAIL: inside " + inside + ", usable " + usable + " (" + string.Join(", ", files.Select(Path.GetFileName)) + "); " + results.Count + " of " + names.Length + " told: " + string.Join(" | ", results);
                 });
 
                 Scenario("over a million files and folders in one go: refused cleanly by both PCs, never left waiting", 120, () =>

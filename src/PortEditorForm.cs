@@ -113,7 +113,9 @@ namespace TailRemote
         {
             string? problem = Protocol.PortProblem(_newPort.Text.Trim(), out int port);
             if (problem != null) { MessageBox.Show(this, problem, "Port editor"); _newPort.Focus(); return; } // NVDA reads the box; speaking too said it twice
-            Remember(_settings, port);
+            // Said, not lost in silence: the port is still opened, but Port editor may not list it next time.
+            if (!Remember(_settings, port))
+                Speech.Speak((_settings.SaveProblem ?? "Kova could not save its settings.") + " Port editor may not list port " + port + " next time.", interrupt: false);
             if (!_state.ContainsKey(port)) _state[port] = false;
             _newPort.Clear();
             Refill();
@@ -152,12 +154,12 @@ namespace TailRemote
             });
         }
 
-        /// <summary>Adds a port to the record of ports TailRemote has used.</summary>
-        public static void Remember(Settings settings, int port)
+        /// <summary>Adds a port to the record of ports TailRemote has used. False if that could not be saved (Settings.SaveProblem says why).</summary>
+        public static bool Remember(Settings settings, int port)
         {
-            if (settings.KnownPorts.Contains(port)) return;
+            if (settings.KnownPorts.Contains(port)) return true;
             settings.KnownPorts.Add(port);
-            settings.Save();
+            try { return settings.Save(retries: 1); } catch { return false; } // on the window's thread: not frozen for long
         }
     }
 }

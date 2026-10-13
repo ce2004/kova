@@ -471,6 +471,8 @@ namespace TailRemote
             public bool Moving, NeedsWhole;
             public long VideoOffUntil; // H.264 would not start here: still pictures only until then
             public long ResizedAt = long.MinValue / 2; // when the picture last changed size
+            public long SentAskedAt;   // when the ask that last sent something came (0: the last ask sent nothing)
+            public double Pace;        // usual time from one ask that sent something to the next, ms: how often the screen is looked at
             public readonly Queue<(long At, bool[] Tiles)> Changes = new(); // which tiles changed, when
             public int Shown, Asked;       // the screen shown, and the last one asked for (0: the main one)
             public int Asks;               // how many asks the viewer had made by the last one taken in
@@ -518,7 +520,21 @@ namespace TailRemote
             }
             Sweep(asked);
             // One viewer's pictures at a time: the sweep (on another viewer's thread) may let this one's go.
-            lock (v) return UpdateNow(v, everything, settings);
+            lock (v)
+            {
+                // How long the line makes each picture wait: a still picture is only followed by the next
+                // once it is confirmed, a round trip later. Motion is judged over enough time for the same
+                // number of looks at the screen, else a far-away viewer would never get H.264.
+                long at = Environment.TickCount64;
+                if (v.SentAskedAt != 0)
+                {
+                    double gap = Math.Min(2000, at - v.SentAskedAt);
+                    v.Pace = v.Pace == 0 ? gap : v.Pace * 0.75 + gap * 0.25;
+                }
+                byte[]? u = UpdateNow(v, everything, settings);
+                v.SentAskedAt = u is { Length: > 0 } && u[0] != ScreenNote ? at : 0;
+                return u;
+            }
         }
 
         private byte[]? UpdateNow(Viewer v, bool everything, VideoSettings settings)
@@ -543,9 +559,12 @@ namespace TailRemote
                 }
                 v.Seen = f;
             }
-            while (v.Changes.Count > 0 && now - v.Changes.Peek().At > 1000) v.Changes.Dequeue();
-            var (halfFrames, halfArea) = Motion(v, now, 500);
-            var (secondFrames, secondArea) = Motion(v, now, 1000);
+            // Half a second and a second on a quick line; on a slow one (a round trip of 200 ms or more, so
+            // the screen is looked at less than 8 times a second) as long as 4 looks take, up to 2 seconds.
+            int halfMs = (int)Math.Clamp(v.Pace * 4, 500, 2000), secondMs = 2 * halfMs;
+            while (v.Changes.Count > 0 && now - v.Changes.Peek().At > secondMs) v.Changes.Dequeue();
+            var (halfFrames, halfArea) = Motion(v, now, halfMs);
+            var (secondFrames, secondArea) = Motion(v, now, secondMs);
             bool mayMove = !NoVideo && settings.VideoKbps > 0 && now >= v.VideoOffUntil;
             // Moving: change again and again (4 times or more within half a second) over a real part of
             // the screen together (a fifth of it: a scroll, a drag, a video). One big change (Alt Tab, a
@@ -775,6 +794,7 @@ namespace TailRemote
             v.Has = v.Seen = null;
             v.Changes.Clear();
             v.Moving = false;
+            v.SentAskedAt = 0; v.Pace = 0;
         }
 
         /// <summary>No viewer left: what the screen source keeps for taking pictures goes too (once, until someone watches again).</summary>
@@ -892,7 +912,14 @@ namespace TailRemote
             bool all = (r.ReadByte() & 1) != 0;
             int count = r.ReadUInt16();
             if (width == 0 || height == 0) throw new InvalidDataException("an empty picture");
+            // The same limit as H.264 frames: a few bytes claiming a huge screen would otherwise make this PC
+            // set aside gigabytes for it.
+            if ((long)width * height > MaxArea) throw new InvalidDataException("a picture far too big");
+            // Each piece is at least one 64-pixel tile, so there are never more pieces than tiles: a flood of
+            // tiny ones would all be held decoded at once.
+            if (count > (long)((width + ScreenVideo.Tile - 1) / ScreenVideo.Tile) * ((height + ScreenVideo.Tile - 1) / ScreenVideo.Tile)) throw new InvalidDataException("a damaged picture");
             var pieces = new List<(Rectangle At, Image Image)>(count);
+            long area = 0;
             try
             {
                 for (int i = 0; i < count; i++)
@@ -900,9 +927,16 @@ namespace TailRemote
                     int x = r.ReadUInt16(), y = r.ReadUInt16(), w = r.ReadUInt16(), h = r.ReadUInt16(), n = r.ReadInt32();
                     long left = r.BaseStream.Length - r.BaseStream.Position;
                     if (n < 8 || n > left || w == 0 || h == 0 || x + w > width || y + h > height) throw new InvalidDataException("a damaged picture");
+                    // The host's pieces never overlap, so together they cover the picture at most: more is a
+                    // flood of pieces that would all be held decoded at once.
+                    area += (long)w * h;
+                    if (area > (long)width * height) throw new InvalidDataException("a damaged picture");
                     byte[] data = r.ReadBytes(n);
                     bool jpeg = data[0] == 0xFF && data[1] == 0xD8, png = data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
                     if (!jpeg && !png) throw new InvalidDataException("a picture of a kind this version does not take");
+                    // Its size as the picture itself says, checked before it is decoded: a small file can
+                    // unpack to a huge picture, which decoding would set aside memory for first.
+                    if (StoredSize(data, png) != (w, h)) throw new InvalidDataException("a picture of the wrong size");
                     var img = Image.FromStream(new MemoryStream(data));
                     pieces.Add((new Rectangle(x, y, w, h), img));
                     if (img.Width != w || img.Height != h) throw new InvalidDataException("a picture of the wrong size");
@@ -930,7 +964,7 @@ namespace TailRemote
         {
             int width = BitConverter.ToUInt16(m, offset + 1), height = BitConverter.ToUInt16(m, offset + 3);
             if (width < 16 || height < 16) throw new InvalidDataException("a video frame of no size");
-            if ((long)width * height > 8192L * 8192) throw new InvalidDataException("a video frame far too big");
+            if ((long)width * height > MaxArea) throw new InvalidDataException("a video frame far too big");
             bool got;
             lock (_decoding)
             {
@@ -963,6 +997,43 @@ namespace TailRemote
                 finally { Picture.UnlockBits(d); }
             }
             return 1;
+        }
+
+        /// <summary>The biggest picture taken, either way (an 8K screen fits): bigger is a damaged or hostile update.</summary>
+        private const long MaxArea = 8192L * 8192;
+
+        /// <summary>
+        /// The width and height a PNG or JPEG says it has, read from its header without decoding it; (-1, -1)
+        /// when it cannot be read (then the piece is refused).
+        /// </summary>
+        private static (int W, int H) StoredSize(byte[] d, bool png)
+        {
+            if (png)
+            {
+                // The signature, then the IHDR chunk, which must come first: width and height big-endian.
+                if (d.Length < 24 || d[12] != 'I' || d[13] != 'H' || d[14] != 'D' || d[15] != 'R') return (-1, -1);
+                long pw = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(16)), ph = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(20));
+                return pw > ushort.MaxValue || ph > ushort.MaxValue ? (-1, -1) : ((int)pw, (int)ph);
+            }
+            // JPEG: the segments after the start, each a marker and a length, up to the frame header (SOF).
+            int at = 2;
+            while (at + 4 <= d.Length)
+            {
+                if (d[at] != 0xFF) return (-1, -1);
+                byte m = d[at + 1];
+                if (m == 0xFF) { at++; continue; } // padding before a marker
+                if (m == 0x01 || (m >= 0xD0 && m <= 0xD8)) { at += 2; continue; } // markers with nothing after them
+                if (m == 0xD9 || m == 0xDA) return (-1, -1); // the end, or the picture data, with no frame header first
+                int len = (d[at + 2] << 8) | d[at + 3];
+                if (len < 2) return (-1, -1);
+                if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC)
+                {
+                    if (len < 7 || at + 9 > d.Length) return (-1, -1);
+                    return ((d[at + 7] << 8) | d[at + 8], (d[at + 5] << 8) | d[at + 6]);
+                }
+                at += 2 + len;
+            }
+            return (-1, -1);
         }
 
         /// <summary>A pixel of the copy (tests), or Empty if there is none yet.</summary>

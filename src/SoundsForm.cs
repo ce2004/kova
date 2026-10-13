@@ -103,7 +103,10 @@ namespace TailRemote
             _settings.SoundChoices = new Dictionary<string, string>();
             foreach (var (t, list) in _lists)
                 if (list.SelectedItem is string s && s != Sounds.DefaultName) _settings.SoundChoices[t.ToString()] = s;
-            try { _settings.Save(); } catch { }
+            bool saved;
+            try { saved = _settings.Save(retries: 1); } catch { saved = false; }
+            // In use until Kova closes either way; said, so it is not a surprise when they are gone next time.
+            if (!saved) Speech.Speak((_settings.SaveProblem ?? "Kova could not save its settings.") + " The sounds you chose are only in use until Kova closes.", interrupt: false);
             _saved = true;
         }
     }

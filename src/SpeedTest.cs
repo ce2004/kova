@@ -56,7 +56,7 @@ namespace TailRemote
                 if (where.Length > 0) lines.Add("Server: Cloudflare's " + where + " data centre");
                 if (address.Length > 0) lines.Add("Internet address: " + address);
                 lines.Add("Data used: " + FileChannel.Size(used));
-                lines.Add("Tested on: " + Environment.MachineName + ", " + DateTime.Now.ToString("t"));
+                lines.Add("Tested on: " + Environment.MachineName + ", " + DateTime.Now.ToString(MainForm.TimeWords, System.Globalization.CultureInfo.InvariantCulture));
                 return string.Join("\n", lines);
             }
             catch (Exception e) { return "Problem: the speed test could not finish: " + e.Message; }

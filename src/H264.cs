@@ -153,7 +153,9 @@ namespace TailRemote
                 if (key) SetCodec(Mf.CODECAPI_AVEncVideoForceKeyFrame, 19, 1);
                 IntPtr sample = Mf.SampleFrom(_nv12, _nv12.Length);
                 // Its real time: frames come only when the screen changes, and the bitrate is kept per second.
-                long t = (System.Diagnostics.Stopwatch.GetTimestamp() - _t0) * 10_000_000L / System.Diagnostics.Stopwatch.Frequency;
+                // In 100 ns units, as Media Foundation counts; worked out by .NET, because multiplying the raw
+                // count by ten million first ran past what a long holds after about 25 hours of motion.
+                long t = System.Diagnostics.Stopwatch.GetElapsedTime(_t0).Ticks;
                 Mf.Call(sample, 36, t); // SetSampleTime
                 Mf.Call(sample, 38, 10_000_000L / _fps); // SetSampleDuration
                 try
