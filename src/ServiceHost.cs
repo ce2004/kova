@@ -22,13 +22,13 @@ namespace TailRemote
     /// whichever session is on the console, also as SYSTEM: "TailRemote.exe --agent", which
     /// types the keys it is handed (AgentLink) on whichever desktop has the keyboard.
     ///
-    /// The service runs its own copy in Program Files (only administrators can
-    /// change it); its settings live in ProgramData, readable only by SYSTEM and
+    /// The service runs the copy of Kova it was installed from, where it is (PlannedExe;
+    /// Program Files only for older installs and copies it could not keep running); its settings live in ProgramData, readable only by SYSTEM and
     /// administrators, with the passwords DPAPI-encrypted for the machine.
     /// </summary>
     internal static class ServiceHost
     {
-        public const string Name = Names.Service;
+        public static readonly string Name = Names.Service;
         public static string InstallDir => Names.InstallDir;
         public static string InstalledExe => Names.InstalledExe;
         public static string DataDir => Names.DataDir;
@@ -81,7 +81,79 @@ namespace TailRemote
         public static bool IsInstalled() => RunHidden("sc.exe", "query " + Name) == 0;
 
         /// <summary>The version of the copy the service runs, or null.</summary>
-        public static Version? InstalledVersion() => VersionOf(InstalledExe);
+        public static Version? InstalledVersion() => ServiceExe() is string exe ? VersionOf(exe) : null;
+
+        /// <summary>The service's own copy, as the service itself sees it (it always runs the file it was registered with).</summary>
+        private static string Self => Names.OwnExe;
+
+        /// <summary>
+        /// The service's own file, inside the service: the path it is registered with. Not the process's own path: once the
+        /// window has updated that same file, the running copy has been renamed to .old, and the process then reports
+        /// that name, so the new version put in place was never seen and the service did not restart into it.
+        /// </summary>
+        private static string ServiceSelf => ServiceExe() ?? Self;
+
+        internal static bool SameFile(string? a, string? b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
+
+        /// <summary>The exe the installed service runs, read from its registration (anyone may read it), or null when there is no service.</summary>
+        public static string? ServiceExe()
+        {
+            try
+            {
+                using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + Name);
+                if (k?.GetValue("ImagePath") is not string image) return null;
+                image = Environment.ExpandEnvironmentVariables(image).Trim();
+                string path = image.StartsWith('"') ? image.Substring(1, Math.Max(0, image.IndexOf('"', 1) - 1)) : image.Split(' ')[0];
+                return path.Length == 0 ? null : Path.GetFullPath(path);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// The copy the service will run if it is installed, or given settings, from this one. Since 4.2 that is this
+        /// very file, wherever it was run from (Documents, an apps folder): nothing is copied, so updating this copy
+        /// updates the service too. Two exceptions: a service installed in Program Files before keeps that copy, kept
+        /// up to date there as it always was, and a copy the service could not keep running from (CanRunInPlace) is
+        /// copied to Program Files as before.
+        /// </summary>
+        public static string PlannedExe()
+        {
+            string me = Self;
+            if (SameFile(ServiceExe(), InstalledExe)) return InstalledExe;
+            return CanRunInPlace(me) ? me : InstalledExe;
+        }
+
+        /// <summary>
+        /// Whether the service can keep running this file where it is. Not on a network drive (it is not there for
+        /// the service before anyone signs in), a USB stick (it may be pulled out), nor in a temp folder (a copy
+        /// opened straight from a zip, which Windows clears away).
+        /// </summary>
+        internal static bool CanRunInPlace(string exe)
+        {
+            try
+            {
+                if (exe.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+                if (Path.GetPathRoot(exe) is not { Length: > 0 } root || new DriveInfo(root).DriveType != DriveType.Fixed) return false;
+                string temp = Path.GetFullPath(Path.GetTempPath());
+                if (exe.StartsWith(temp, StringComparison.OrdinalIgnoreCase)) return false;
+                // Another account's temp folder too: the elevated half may run as an administrator who is not the user.
+                if (exe.Contains(@"\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) || exe.Contains(@"\Windows\Temp\", StringComparison.OrdinalIgnoreCase)) return false;
+                // Nor a OneDrive folder (Documents often is one): OneDrive can leave only a placeholder of the file,
+                // which the service cannot fetch back before anyone signs in, and the PC would be lost.
+                foreach (string v in new[] { "OneDrive", "OneDriveConsumer", "OneDriveCommercial" })
+                    if (Environment.GetEnvironmentVariable(v) is { Length: > 3 } od && exe.StartsWith(od.TrimEnd('\\') + @"\", StringComparison.OrdinalIgnoreCase)) return false;
+                if (exe.Contains(@"\OneDrive\", StringComparison.OrdinalIgnoreCase) || exe.Contains(@"\OneDrive - ", StringComparison.OrdinalIgnoreCase)) return false;
+                const FileAttributes RecallOnOpen = (FileAttributes)0x40000, RecallOnDataAccess = (FileAttributes)0x400000;
+                if ((File.GetAttributes(exe) & (FileAttributes.Offline | RecallOnOpen | RecallOnDataAccess)) != 0) return false;
+                return true;
+            }
+            catch { return false; }
+        }
 
         private static Version? VersionOf(string path)
         {
@@ -93,19 +165,139 @@ namespace TailRemote
             catch { return null; }
         }
 
-        /// <summary>Asks for administrator rights and runs --service install or remove. False if refused or failed.</summary>
-        public static System.Threading.Tasks.Task<bool> SetAsync(bool install) => System.Threading.Tasks.Task.Run(() =>
+        /// <summary>
+        /// What the window hands the elevated copy that installs or removes the service. When a standard user types
+        /// an administrator's password, that copy runs as the administrator: it read the administrator's settings
+        /// (none, so "set a password first" every time, and it could never have opened the user's passwords), wrote
+        /// why it failed where the window never looked, and on removal made the sign-in task for the administrator.
+        /// So the window says it all, over a pipe only an elevated administrator can open.
+        /// </summary>
+        internal sealed class Handover
         {
+            public int Port { get; set; }
+            public string Password { get; set; } = "";
+            public string ListenPassword { get; set; } = "";
+            public string CaptureDevice { get; set; } = "";
+            public bool Logging { get; set; }
+            public string User { get; set; } = "";
+        }
+
+        private const string HandoverPrefix = "Kova-setup-";
+        private static Handover? _handover;
+        private static bool _handoverWanted;
+        private static NamedPipeClientStream? _answerTo;
+        private static string? _failWhy, _lastError;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeClientProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint processId);
+
+        private static void WriteBlock(Stream s, byte[] b)
+        {
+            s.Write(BitConverter.GetBytes(b.Length));
+            s.Write(b);
+            s.Flush();
+        }
+
+        private static byte[] ReadBlock(Stream s)
+        {
+            byte[] head = new byte[4];
+            Protocol.ReadExactly(s, head);
+            int n = BitConverter.ToInt32(head);
+            if (n < 0 || n > 1 << 20) throw new InvalidDataException("a message too big");
+            byte[] b = new byte[n];
+            Protocol.ReadExactly(s, b);
+            return b;
+        }
+
+        /// <summary>Asks for administrator rights and runs --service install or remove with these settings. False if refused or failed.</summary>
+        public static System.Threading.Tasks.Task<bool> SetAsync(bool install, Settings s) => System.Threading.Tasks.Task.Run(() =>
+        {
+            _lastError = null;
             try
             {
-                using var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--service " + (install ? "install" : "remove") + " " + Environment.ProcessId)
-                { UseShellExecute = true, Verb = "runas" });
+                // An old failure's words must not be read out when this time the prompt was turned down.
+                try { File.Delete(Path.Combine(Path.GetTempPath(), "tailremote-service.txt")); } catch { }
+                string name = HandoverPrefix + Guid.NewGuid().ToString("N");
+                var sec = new PipeSecurity();
+                sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
+                using var pipe = NamedPipeServerStreamAcl.Create(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance, 0, 0, sec);
+                Process? p;
+                try
+                {
+                    p = Process.Start(new ProcessStartInfo(Names.OwnExe, Names.InstanceArgs + "--service " + (install ? "install" : "remove") + " " + Environment.ProcessId + " " + name)
+                    { UseShellExecute = true, Verb = "runas" });
+                }
+                catch { return false; } // the prompt was turned down
                 if (p == null) return false;
-                p.WaitForExit();
-                return p.ExitCode == 0;
+                using (p)
+                {
+                    var connected = pipe.WaitForConnectionAsync();
+                    try { System.Threading.Tasks.Task.WaitAny(connected, p.WaitForExitAsync()); } catch { }
+                    if (connected.IsCompletedSuccessfully)
+                    {
+                        // Only the copy just started gets the passwords: anything else that got in first is told nothing.
+                        if (GetNamedPipeClientProcessId(pipe.SafePipeHandle, out uint by) && by == (uint)p.Id)
+                        {
+                            using (var me = WindowsIdentity.GetCurrent())
+                                WriteBlock(pipe, JsonSerializer.SerializeToUtf8Bytes(new Handover
+                                {
+                                    Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword,
+                                    CaptureDevice = s.CaptureDevice, Logging = s.Logging, User = me.Name,
+                                }));
+                            try { _lastError = System.Text.Encoding.UTF8.GetString(ReadBlock(pipe)); } catch { }
+                            if (_lastError?.Length == 0) _lastError = null;
+                        }
+                        else
+                        {
+                            _lastError = "another program answered in place of Kova's setup.";
+                            pipe.Dispose(); // let go: the real setup then finds no window and ends, rather than wait for ever
+                        }
+                    }
+                    p.WaitForExit();
+                    // Ended without a word (it never got this window's settings): not "permission was not given".
+                    if (p.ExitCode != 0 && _lastError == null) _lastError = "Kova's setup could not get this window's settings. Try again.";
+                    return p.ExitCode == 0;
+                }
             }
-            catch { return false; }
+            catch (Exception e) { _lastError ??= e.Message; return false; }
         });
+
+        /// <summary>The elevated half: takes the settings the window hands over (--service install|remove PID PIPE).</summary>
+        internal static void ReceiveHandover(string name)
+        {
+            _handoverWanted = true;
+            if (!name.StartsWith(HandoverPrefix, StringComparison.Ordinal) || name.Length > 64) return;
+            try
+            {
+                var c = new NamedPipeClientStream(".", name, PipeDirection.InOut);
+                c.Connect(10_000);
+                // The window that asked made it, and nothing else.
+                if (!GetNamedPipeServerProcessId(c.SafePipeHandle, out uint by) || by != (uint)WindowPid) { c.Dispose(); return; }
+                try { _handover = JsonSerializer.Deserialize<Handover>(ReadBlock(c)); }
+                catch { c.Dispose(); throw; }
+                _answerTo = c;
+            }
+            catch { _handover = null; }
+        }
+
+        /// <summary>The elevated half's last word to the window: nothing when it worked, else why not.</summary>
+        internal static void Answer(int result)
+        {
+            if (_answerTo is not NamedPipeClientStream c) return;
+            try { WriteBlock(c, System.Text.Encoding.UTF8.GetBytes(result == 0 ? "" : _failWhy ?? "it did not work.")); } catch { }
+            try { c.Dispose(); } catch { }
+        }
+
+        /// <summary>The settings to install with: the window's, or this account's own when run by hand.</summary>
+        private static Handover? SettingsToInstall()
+        {
+            if (_handoverWanted) return _handover;
+            var s = Settings.Load();
+            return new Handover { Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, Logging = s.Logging };
+        }
 
         /// <summary>
         /// Installs, or updates the copy and settings of, the service from this
@@ -116,29 +308,42 @@ namespace TailRemote
             // Once the service is stopped, any failure must not leave it stopped: on a PC reached only
             // through Kova that would lose the PC. Started again in finally unless the install did it.
             bool stopped = false, started = false;
-            string fresh = InstalledExe + ".new";
+            // Usually this very file (PlannedExe): then nothing is copied, and the service is pointed at it.
+            string target = PlannedExe();
+            // What the service runs now, which may be another file: that is the one to wait for as it stops.
+            string? running = ServiceExe();
+            // Not ".new": the service's own update downloads to that name, and one starting between this copy and
+            // the stop below cut the copy short as the stop killed it, and then the cut-off file was put in place.
+            string fresh = target + ".install";
             try
             {
-                var s = Settings.Load();
+                if (SettingsToInstall() is not Handover s) return Fail("Kova could not get this window's settings. Try again.");
                 if (MainForm.Characters(s.Password) < MainForm.MinPasswordLength) return Fail("Set a password of at least " + MainForm.MinPasswordLength + " characters first.");
 
                 // The new copy goes in next to the old one first, while the service still runs: a full
                 // disk or a refused copy then fails here, with the service still up.
-                Directory.CreateDirectory(InstallDir);
-                bool copy = !string.Equals(Path.GetFullPath(Environment.ProcessPath!), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
-                if (copy) File.Copy(Environment.ProcessPath!, fresh, true);
+                bool copy = !SameFile(Self, target);
+                if (copy)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                    File.Copy(Self, fresh, true);
+                    // On the disk before it is renamed into place: after a power cut, a rename that landed
+                    // before the contents left a Kova.exe of zeros, and nothing could start to roll it back.
+                    // Shared: an antivirus still looking at the new copy must not make the install fail.
+                    using (var f = new FileStream(fresh, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite)) f.Flush(flushToDisk: true);
+                }
 
                 // 1060: there is no service yet (the first install), so nothing was stopped. Counted as stopped,
                 // any failure after this spent a minute trying to start a service that did not exist before
                 // saying what went wrong.
                 stopped = RunHidden("sc.exe", "stop " + Name) != 1060;
-                WaitForStopped();
+                WaitForStopped(running ?? target);
 
                 if (copy)
                 {
                     for (int i = 0; ; i++)
                     {
-                        try { File.Move(fresh, InstalledExe, overwrite: true); break; }
+                        try { File.Move(fresh, target, overwrite: true); break; }
                         catch when (i < 20) { Thread.Sleep(250); } // the old agent is still letting go
                     }
                 }
@@ -165,13 +370,14 @@ namespace TailRemote
                     }
                 }
                 WriteConfig(cfg);
-                if (!Register()) return Fail("Windows would not create the service.");
+                if (!Register(target)) return Fail("Windows would not create the service.");
 
                 // The service replaces the at-sign-in task, and opens its port (closing the one it
                 // used before, which Remove would otherwise never close).
                 Startup.Apply(false);
                 if (old != null && old.Port != s.Port) Firewall.Apply(false, old.Port);
                 Firewall.Apply(true, s.Port);
+                Firewall.Clean(new[] { s.Port }, thorough: false); // already administrator: rules for copies that are gone go too
 
                 if (RunHidden("sc.exe", "start " + Name) != 0) return Fail("The service was installed but would not start.");
                 started = true;
@@ -186,7 +392,7 @@ namespace TailRemote
                 if (stopped && !started)
                     for (int i = 0; i < 12; i++)
                     {
-                        WaitForStopped();
+                        WaitForStopped(running ?? target);
                         int rc = RunHidden("sc.exe", "start " + Name);
                         if (rc == 0 || rc == 1056) break;
                         Thread.Sleep(5000);
@@ -197,10 +403,14 @@ namespace TailRemote
 
         public static int Remove()
         {
+            // Asked by a window that could not hand over who it is: removing anyway would make the sign-in task
+            // for the administrator whose password let this run.
+            if (_handoverWanted && _handover == null) return Fail("Kova could not get this window's settings. Try again.");
             try
             {
+                string? exe = ServiceExe(); // asked before the service is gone
                 RunHidden("sc.exe", "stop " + Name);
-                WaitForStopped();
+                WaitForStopped(exe ?? InstalledExe);
                 RunHidden("sc.exe", "delete " + Name);
                 var cfg = LoadConfig();
                 if (cfg?.WeSetSasPolicy == true)
@@ -212,10 +422,15 @@ namespace TailRemote
                 // Undo what Install() did: close the port it opened, and bring back the at-sign-in task
                 // the service had replaced, only if there was one ("this PC stops hosting" means just that).
                 Firewall.Apply(false, cfg?.Port ?? Protocol.DefaultPort);
-                if (cfg?.HadStartupTask != false) Startup.Apply(true); // not known (installed before 4.1.1): as it always did
+                // For the person whose window asked, not the administrator whose password let it run.
+                if (cfg?.HadStartupTask != false) Startup.Apply(true, _handover?.User is { Length: > 0 } user ? user : null); // not known (installed before 4.1.1): as it always did
                 // Each on its own: the window often runs from InstallDir, which then cannot go, and
-                // that must not leave the service's saved passwords behind in DataDir.
-                foreach (string dir in new[] { DataDir, InstallDir })
+                // that must not leave the service's saved passwords behind in DataDir. Program Files\Kova
+                // only when the service ran from there: a service run from the user's own folder leaves
+                // that folder and the copy in it alone, with only its roll back note cleared away.
+                bool fromInstallDir = exe == null || SameFile(Path.GetDirectoryName(exe), InstallDir);
+                if (exe != null && !fromInstallDir) try { File.Delete(exe + ".rollback"); } catch { }
+                foreach (string dir in fromInstallDir ? new[] { DataDir, InstallDir } : new[] { DataDir })
                 {
                     for (int i = 0; i < 20; i++)
                     {
@@ -230,12 +445,14 @@ namespace TailRemote
 
         private static int Fail(string why)
         {
+            _failWhy = why;
             try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "tailremote-service.txt"), why); } catch { }
             return 1;
         }
 
         public static string LastError()
         {
+            if (_lastError != null) return _lastError;
             try { return File.ReadAllText(Path.Combine(Path.GetTempPath(), "tailremote-service.txt")); }
             catch { return "administrator permission was not given"; }
         }
@@ -262,7 +479,13 @@ namespace TailRemote
             // one takes this folder's rules rather than any rules an old one was given.
             string tmp = ConfigPath + ".tmp", bak = ConfigPath + ".bak";
             File.Delete(tmp);
-            File.WriteAllText(tmp, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+            // Flushed to the disk before the rename, as Settings.Save does: otherwise a power cut can keep the
+            // rename and lose the contents, and on a first install there is no .bak to fall back to.
+            using (var f = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                f.Write(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true })));
+                f.Flush(flushToDisk: true);
+            }
             if (LoadConfigFrom(ConfigPath) != null)
             {
                 File.Delete(bak);
@@ -278,15 +501,21 @@ namespace TailRemote
         }
 
         /// <summary>Creates the Kova service, or brings its settings up to date. False if Windows would not create it.</summary>
-        private static bool Register()
+        private static bool Register(string exe)
         {
-            string bin = "\"" + InstalledExe + "\" --service";
+            string bin = "\"" + exe + "\" --service";
             string quoted = "\"" + bin.Replace("\"", "\\\"") + "\"";
+            string display = "\"Kova host" + (Names.Instance.Length > 0 ? " " + Names.Instance : "") + "\"";
             if (!IsInstalled())
             {
-                if (RunHidden("sc.exe", "create " + Name + " binPath= " + quoted + " start= auto DisplayName= \"Kova host\"") != 0) return false;
+                if (RunHidden("sc.exe", "create " + Name + " binPath= " + quoted + " start= auto DisplayName= " + display) != 0) return false;
             }
-            else RunHidden("sc.exe", "config " + Name + " binPath= " + quoted + " start= auto DisplayName= \"Kova host\"");
+            else if (RunHidden("sc.exe", "config " + Name + " binPath= " + quoted + " start= auto DisplayName= " + display) != 0) return false;
+            // A test service (KOVA_INSTANCE) must know it is one before it reads a single setting: Windows
+            // gives a service only the environment written here, and its agent inherits it.
+            if (Names.Instance.Length > 0)
+                using (var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + Name, true))
+                    k?.SetValue("Environment", new[] { "KOVA_INSTANCE=" + Names.Instance }, RegistryValueKind.MultiString);
             RunHidden("sc.exe", "description " + Name + " \"Lets another PC control this one through Kova, including the lock screen and UAC prompts.\"");
             RunHidden("sc.exe", "failure " + Name + " reset= 60 actions= restart/2000/restart/5000/restart/10000");
             return true;
@@ -295,18 +524,23 @@ namespace TailRemote
         /// <summary>The window that started this install or remove (passed on its command line), or 0.</summary>
         public static int WindowPid;
 
-        private static void WaitForStopped()
+        private static void WaitForStopped(string exe)
         {
-            for (int i = 0; i < 40; i++)
+            for (int i = 0; i < 80; i++) // up to 20 seconds
             {
                 bool any = false;
-                foreach (var p in Process.GetProcessesByName("Kova"))
+                // By the exe's own name: a copy called Kova-x64.exe is not a process called Kova.
+                foreach (var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exe)))
                 {
-                    // Not this installer itself, nor the window that started it: both often run from
-                    // InstalledExe too, and never stop, so every Apply used to wait the full 10 seconds.
-                    using (p) try { if (p.Id != Environment.ProcessId && p.Id != WindowPid && string.Equals(p.MainModule?.FileName, InstalledExe, StringComparison.OrdinalIgnoreCase)) any = true; } catch { }
+                    // Not this installer itself, nor the window that started it: both often run the
+                    // service's file too, and never stop, so every Apply used to wait the full 10 seconds.
+                    // Its file or the same file renamed aside by an update (name.old...): a copy running from there still holds on.
+                    using (p) try { if (p.Id != Environment.ProcessId && p.Id != WindowPid && p.MainModule?.FileName is string f && (SameFile(f, exe) || f.StartsWith(exe + ".old", StringComparison.OrdinalIgnoreCase))) any = true; } catch { }
                 }
-                if (!any) return;
+                // And Windows itself must say it has stopped: a start sent while it was still stopping failed with
+                // "already running", and the service then finished stopping and stayed stopped.
+                int state = NativeService.ServiceState(Name);
+                if (!any && state != NativeService.SERVICE_STOP_PENDING && state != NativeService.SERVICE_RUNNING) return;
                 Thread.Sleep(250);
             }
         }
@@ -366,12 +600,13 @@ namespace TailRemote
             _statusHandle = NativeService.RegisterServiceCtrlHandlerExW(Name, _handler!, IntPtr.Zero);
             Report(NativeService.SERVICE_START_PENDING);
             if (_rolledBack) Environment.Exit(1); // a failed start: Windows' recovery setting starts the restored copy
+            _startedFrom = FileNow();
             // Hosting starts at once, from the service itself: before the sign-in screen exists.
             new Thread(Agent.StartHosting) { IsBackground = true, Name = "Kova service hosting" }.Start();
             new Thread(UpdateLoop) { IsBackground = true, Name = "Kova service updates" }.Start();
             new Thread(UpdatePipe) { IsBackground = true, Name = "Kova update nudge" }.Start();
             Report(NativeService.SERVICE_RUNNING);
-            if (!File.Exists(RollbackNote)) { try { File.Delete(InstalledExe + ".old"); } catch { } } // left by the last self-update
+            if (!File.Exists(RollbackNote)) { try { File.Delete(ServiceSelf + ".old"); } catch { } } // left by the last self-update
             Log("Service started, version " + Updater.Current + ".");
 
             Process? agent = null;
@@ -517,46 +752,42 @@ namespace TailRemote
 
         private static void TryUpdate(Version? requested, Action<string>? reply)
         {
+            // The window runs this same file (the service runs the copy it was installed from) and has just
+            // updated it: the new version is already in place, so restart into it straight away, without
+            // asking GitHub (which may be limiting questions, and then the service stayed behind for an hour).
+            // Its version cannot be read from here: Windows answers with the copy this process already runs from that
+            // path. So: the file is not the one this service started from, and the window says it runs a newer version.
+            if (requested == null && WindowVersion() is Version told && told > Updater.Current && FileChangedSinceStart())
+            {
+                RestartIntoPlaced(told, reply);
+                return;
+            }
             var r = Updater.CheckAsync().GetAwaiter().GetResult();
             if (requested != null && r?.Version != requested)
             {
                 reply?.Invoke("The remote PC did not update: the newest Kova on GitHub is " + (r?.Version ?? Updater.Current) + ", not " + requested + ".");
                 return;
             }
-            if (r == null) return;
+            if (r == null)
+            {
+                Log("No update: GitHub has nothing newer than " + Updater.Current + ".");
+                return;
+            }
             var chosen = WindowVersion();
             if (requested == null && chosen != null && r.Version > chosen)
             {
                 Log("GitHub has " + r.Version + ", but Kova on this PC is " + chosen + "; staying in step with it.");
                 return;
             }
-            if (VersionOf(InstalledExe) == r.Version)
+            if (FileChangedSinceStart() && WindowVersion() == r.Version)
             {
-                // The window runs this same file and has already updated it: the new version is in
-                // place and this service runs the previous one, renamed to name.old or name.old-....
-                // Swapping again would move the window's new copy aside and record it as the copy to
-                // roll back to, so a bad update could only ever be rolled back to itself. Point the
-                // roll back at the real previous copy instead, and restart into the new one.
-                string? previous = null;
-                try
-                {
-                    previous = Directory.GetFiles(InstallDir, Path.GetFileName(InstalledExe) + ".old*")
-                        .Where(f => !f.Contains(".old-failed-", StringComparison.OrdinalIgnoreCase)) // a copy that already failed is never one to go back to
-                        .OrderByDescending(File.GetLastWriteTimeUtc)
-                        .FirstOrDefault(f => VersionOf(f) == Updater.Current);
-                }
-                catch { }
-                if (previous != null) try { File.WriteAllLines(RollbackNote, new[] { previous, Updater.Current.ToString(), "0" }); } catch { }
-                Log("Kova on this PC already put version " + r.Version + " in place; the service restarts into it.");
-                reply?.Invoke("The remote PC's Kova service is restarting into " + r.Version + ".");
-                _restartingTo = r.Version.ToString();
-                Restarting = true;
+                RestartIntoPlaced(r.Version, reply);
                 return;
             }
             Log("Updating the service to version " + r.Version + ".");
             reply?.Invoke("The remote PC's Kova service is downloading " + r.Version + ". Everything carries on until it is ready.");
             if (r.Sha256 == null) throw new InvalidOperationException("GitHub gave no fingerprint for the download, so it was not used");
-            string exe = Environment.ProcessPath!, fresh = exe + ".new", old = exe + ".old";
+            string exe = ServiceSelf, fresh = exe + ".new", old = exe + ".old";
             // Streamed and checked as it comes, for as long as data keeps arriving: a whole-download time limit
             // meant a slow line could never update the service. A damaged download throws and changes nothing.
             try { Updater.DownloadAsync(r.Url, fresh, r.Sha256).GetAwaiter().GetResult(); }
@@ -581,11 +812,47 @@ namespace TailRemote
             Restarting = true;
         }
 
+
+        /// <summary>
+        /// The window runs this same file and has already updated it: the new version is in place and this
+        /// service runs the previous one, renamed to name.old or name.old-.... Swapping again would move the
+        /// window's new copy aside and record it as the copy to roll back to, so a bad update could only ever
+        /// be rolled back to itself. Point the roll back at the real previous copy instead, and restart into the new one.
+        /// </summary>
+        // The service's file as it started: its size and time, to see later whether something else replaced it.
+        private static (long Length, DateTime Written)? _startedFrom;
+
+        private static (long, DateTime)? FileNow()
+        {
+            try { var f = new FileInfo(ServiceSelf); return f.Exists ? (f.Length, f.LastWriteTimeUtc) : null; }
+            catch { return null; }
+        }
+
+        private static bool FileChangedSinceStart() => _startedFrom != null && FileNow() is { } now && now != _startedFrom.Value;
+
+        private static void RestartIntoPlaced(Version version, Action<string>? reply)
+        {
+            string? previous = null;
+            try
+            {
+                previous = Directory.GetFiles(Path.GetDirectoryName(ServiceSelf)!, Path.GetFileName(ServiceSelf) + ".old*")
+                    .Where(f => !f.Contains(".old-failed-", StringComparison.OrdinalIgnoreCase)) // a copy that already failed is never one to go back to
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .FirstOrDefault(f => VersionOf(f) == Updater.Current);
+            }
+            catch { }
+            if (previous != null) try { File.WriteAllLines(RollbackNote, new[] { previous, Updater.Current.ToString(), "0" }); } catch { }
+            Log("Kova on this PC already put version " + version + " in place; the service restarts into it.");
+            reply?.Invoke("The remote PC's Kova service is restarting into " + version + ".");
+            _restartingTo = version.ToString();
+            Restarting = true;
+        }
+
         /// <summary>
         /// Written when the service swaps in a new version: where the old copy is, its version, and
         /// how many times the new one has started. While it is there, the old copy is never cleared.
         /// </summary>
-        internal static string RollbackNote => InstalledExe + ".rollback";
+        internal static string RollbackNote => ServiceSelf + ".rollback";
 
         /// <summary>
         /// Automatic roll back. A PC reached only through TailRemote must never be lost to an update
@@ -606,9 +873,15 @@ namespace TailRemote
                 string old = note.Length > 0 ? note[0] : "";
                 string oldVersion = note.Length > 1 ? note[1] : "the previous version";
                 int starts = (note.Length > 2 && int.TryParse(note[2], out int n) ? n : 0) + 1;
+                // Only ever a copy kept beside the service's own file (name.old...): the note may sit in a folder others
+                // can write, and the service must never be steered into moving some other file as SYSTEM.
+                string self = ServiceSelf;
+                bool beside = old.Length > 0 && SameFile(Path.GetDirectoryName(old), Path.GetDirectoryName(self))
+                    && Path.GetFileName(old).StartsWith(Path.GetFileName(self) + ".old", StringComparison.OrdinalIgnoreCase);
+                if (!beside) { File.Delete(RollbackNote); return; }
                 if (starts >= 4 && File.Exists(old))
                 {
-                    string exe = InstalledExe;
+                    string exe = ServiceSelf;
                     string bad = exe + ".old-failed-" + DateTime.UtcNow.Ticks;
                     File.Move(exe, bad);
                     // Never no copy at all: if the old one cannot go back, the failing one does, and is
@@ -677,6 +950,7 @@ namespace TailRemote
                     var told = new Version(nudge[1], nudge[2], nudge[3]);
                     if (told < Updater.Current) continue;
                     _windowVersion = told;
+                    Log("Kova " + told + " on this PC asked the service to check for an update.");
                     long since = Environment.TickCount64 - last;
                     if (since >= 60_000)
                     {

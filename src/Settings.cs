@@ -100,6 +100,8 @@ namespace TailRemote
         public string? SaveProblem { get; private set; }
         /// <summary>Every port TailRemote has used here, so Port editor can still close it later.</summary>
         public System.Collections.Generic.List<int> KnownPorts { get; set; } = new();
+        /// <summary>The port this PC last hosted on, in this window or through the service it gave settings to (0: not known yet). When it moves, the old one is offered for closing.</summary>
+        public int HostedPort { get; set; }
         /// <summary>What was running when TailRemote last closed: "host", "connect" or "". Used by --resume.</summary>
         public string ResumeState { get; set; } = "";
 
@@ -135,6 +137,7 @@ namespace TailRemote
             copy.ListenPasswordEnc = ListenPassword;
             foreach (var pc in copy.SavedPcs) pc.PasswordEnc = Unprotect(pc.PasswordEnc);
             copy.KnownPorts = new();   // this PC's firewall history, not the next one's
+            copy.HostedPort = 0;
             copy.ResumeState = "";
             byte[] plain = JsonSerializer.SerializeToUtf8Bytes(copy);
             byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
@@ -173,6 +176,7 @@ namespace TailRemote
             foreach (var pc in s.SavedPcs) pc.PasswordEnc = Protect(pc.PasswordEnc);
             // As Export leaves them out: another PC's firewall history and what it was doing as it closed.
             s.KnownPorts = new();
+            s.HostedPort = 0;
             s.ResumeState = "";
             return s;
         }
@@ -184,9 +188,11 @@ namespace TailRemote
         public void CopyFrom(Settings other)
         {
             var ports = KnownPorts;
+            int hosted = HostedPort;
             foreach (var p in typeof(Settings).GetProperties())
                 if (p.CanWrite && p.CanRead && !Attribute.IsDefined(p, typeof(JsonIgnoreAttribute))) p.SetValue(this, p.GetValue(other));
             foreach (int port in ports) if (!KnownPorts.Contains(port)) KnownPorts.Add(port);
+            HostedPort = hosted;
         }
 
         /// <summary>

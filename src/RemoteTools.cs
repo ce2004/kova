@@ -75,11 +75,13 @@ namespace TailRemote
                     }
                     return sb.ToString();
                 }
-                var dir = new DirectoryInfo(path);
+                // Opened by its \\?\ form: plain, Windows cuts a dot or space off the end of a name, so a folder a
+                // Mac, Linux or WSL made ("notes.") was listed but opening it opened "notes" (or said it was gone).
+                var dir = new DirectoryInfo(FileChannel.Long(path));
                 if (!dir.Exists)
                 {
                     // An empty CD drive or a disk that is asleep or locked is not "a folder not there any more".
-                    string? root = Path.GetPathRoot(dir.FullName);
+                    string? root = Path.GetPathRoot(FileChannel.Plain(dir.FullName));
                     if (root != null && root.Length <= 3 && !Directory.Exists(root) &&
                         DriveInfo.GetDrives().Any(d => string.Equals(d.Name, root, StringComparison.OrdinalIgnoreCase)))
                         return "E\tThat drive is not ready.\n";
@@ -110,24 +112,24 @@ namespace TailRemote
                 // letter), whatever the culture settings of the process.
                 foreach (var d in dirs.OrderBy(d => d.Name, Natural))
                 {
-                    if (n >= MaxEntries || !Fits(d.FullName, d.Name)) break;
+                    if (n >= MaxEntries || !Fits(FileChannel.Plain(d.FullName), d.Name)) break;
                     n++;
-                    Line('D', d.FullName, d.Name, 0, Ticks(d));
+                    Line('D', FileChannel.Plain(d.FullName), d.Name, 0, Ticks(d));
                 }
                 foreach (var f in files.OrderBy(f => f.Name, Natural))
                 {
-                    if (n >= MaxEntries || !Fits(f.FullName, f.Name)) break;
+                    if (n >= MaxEntries || !Fits(FileChannel.Plain(f.FullName), f.Name)) break;
                     n++;
                     long length;
                     try { length = f.Length; } catch { length = 0; }
-                    Line('F', f.FullName, f.Name, length, Ticks(f));
+                    Line('F', FileChannel.Plain(f.FullName), f.Name, length, Ticks(f));
                 }
                 // T: there were more than were listed, and how many were. An older controlling PC skips lines it does not know.
                 if (more) sb.Append("T\t").Append(n).Append('\n');
                 return sb.ToString();
             }
             catch (UnauthorizedAccessException) { return "E\tKova on the remote PC is not allowed into that folder.\n"; }
-            catch (Exception e) { return "E\t" + e.Message.Replace('\n', ' ').Replace('\t', ' ') + "\n"; }
+            catch (Exception e) { return "E\t" + FileChannel.Plain(e.Message).Replace('\n', ' ').Replace('\t', ' ') + "\n"; } // the folder is opened by its \\?\ form: not said aloud
         }
 
         /// <summary>How big a folder listing may grow: under SecureLink's 8 MB message, with room to spare.</summary>

@@ -90,6 +90,12 @@ namespace TailRemote
 
         private static int Main(string[] args)
         {
+            // A test copy's elevated half (Names.InstanceArgs): taken before anything reads a name.
+            if (args.Length >= 2 && args[0] == "--instance")
+            {
+                Environment.SetEnvironmentVariable("KOVA_INSTANCE", args[1]);
+                args = args[2..];
+            }
             // The service counts its start before anything else can go wrong: a new version that failed
             // before it got as far as the service itself was never counted, so it was never rolled back.
             if (args.Length == 1 && args[0] == "--service") ServiceHost.CountStart();
@@ -131,13 +137,17 @@ namespace TailRemote
             }
 
             if (args.Length >= 1 && args[0] == "--firewall")
-                return args.Length == 3 && int.TryParse(args[2], out int fwPort) && OnOff(args[1], "open", "close") is bool fwOpen ? Firewall.Apply(fwOpen, fwPort) : 2;
+                return Firewall.Command(args[1..]);
 
-            if ((args.Length == 2 || args.Length == 3) && args[0] == "--service" && args[1] is "install" or "remove")
+            if (args.Length is >= 2 and <= 4 && args[0] == "--service" && args[1] is "install" or "remove")
             {
                 // The window that asked, so waiting for TailRemote to stop does not wait on it.
-                if (args.Length == 3 && int.TryParse(args[2], out int windowPid)) ServiceHost.WindowPid = windowPid;
-                return args[1] == "install" ? ServiceHost.Install() : ServiceHost.Remove();
+                if (args.Length >= 3 && int.TryParse(args[2], out int windowPid)) ServiceHost.WindowPid = windowPid;
+                // And its settings, handed over (this copy may run as another account: an administrator's password).
+                if (args.Length == 4) ServiceHost.ReceiveHandover(args[3]);
+                int result = args[1] == "install" ? ServiceHost.Install() : ServiceHost.Remove();
+                ServiceHost.Answer(result);
+                return result;
             }
             if (args.Length == 1 && args[0] == "--screentest-service") return ServiceScreenTest();
             if (args.Length == 1 && args[0] == "--service") return ServiceHost.RunService();
@@ -212,6 +222,9 @@ namespace TailRemote
                 // Optional fourth: a listen-only password. What it says goes to %TEMP%\tailremote-testhost.txt.
                 string said = Path.Combine(Path.GetTempPath(), "tailremote-testhost.txt");
                 using var host = new Host(testPort, args[2], args.Length > 3 ? args[3] : null, s => { try { File.AppendAllText(said, s + Environment.NewLine); } catch { } });
+                // What arrives is written down too, so a test can check a window's Send the clipboard end to end.
+                host.ClipboardReceived += t => { try { File.AppendAllText(said, "clipboard text: " + t + Environment.NewLine); } catch { } };
+                host.ClipboardFilesReceived += p => { try { File.AppendAllText(said, "clipboard files: " + string.Join(" | ", p) + Environment.NewLine); } catch { } };
                 System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
                 return 0;
             }

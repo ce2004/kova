@@ -227,9 +227,11 @@ namespace TailRemote
                         int width = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN)), height = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
                         if (!GetCursorPos(out var p)) return SendMouseInput(MOUSEEVENTF_MOVE, a, b); // the lock screen can refuse: move relative then
                         int x = Math.Clamp(p.X + a, left, left + width - 1), y = Math.Clamp(p.Y + b, top, top + height - 1);
-                        // 0 to 65535 across the whole of every screen.
-                        int nx = (int)(((long)(x - left) * 65535 + width / 2) / Math.Max(1, width - 1));
-                        int ny = (int)(((long)(y - top) * 65535 + height / 2) / Math.Max(1, height - 1));
+                        // 0 to 65535 across the whole of every screen. Windows turns the number back into a pixel
+                        // rounding down, so it is rounded up here: rounded to nearest, x 1, 2 and 6 landed a pixel
+                        // short (measured), and a slow move could never creep away from the left or top edge.
+                        int nx = (int)Math.Min(65535, ((long)(x - left) * 65536 + width - 1) / width);
+                        int ny = (int)Math.Min(65535, ((long)(y - top) * 65536 + height - 1) / height);
                         return SendMouseInput(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, Math.Clamp(nx, 0, 65535), Math.Clamp(ny, 0, 65535));
                         }
                         finally { if (oldDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(oldDpi); }

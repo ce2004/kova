@@ -105,8 +105,15 @@ namespace TailRemote
         }
 
         /// <summary>GitHub's newest release as text, with every way that can fail said in plain words.</summary>
+        /// <summary>
+        /// Tests only: a file shaped like GitHub's answer about the newest release, whose download is a file on this
+        /// PC (still checked against its SHA-256). Lets a test update a copy end to end without a real release.
+        /// </summary>
+        private static readonly string? TestFeed = Environment.GetEnvironmentVariable("KOVA_UPDATE_FEED") is { Length: > 0 } f ? f : null;
+
         private static async Task<string> ReleaseJsonAsync()
         {
+            if (TestFeed != null) return await File.ReadAllTextAsync(TestFeed);
             using var h = Http();
             using var limit = new System.Threading.CancellationTokenSource(ApiLimit);
             try
@@ -151,7 +158,7 @@ namespace TailRemote
         /// </summary>
         public static async Task InstallAsync(Release r, Func<string> beforeStart)
         {
-            string exe = Environment.ProcessPath!;
+            string exe = Names.OwnExe;
             string fresh = exe + ".new", old = exe + ".old";
             // No checksum from GitHub means nothing to check against: refuse before downloading
             // 33 MB for nothing, rather than after.
@@ -224,6 +231,19 @@ namespace TailRemote
         /// </summary>
         internal static async Task DownloadAsync(string url, string fresh, string sha256) // the service's own updates use it too
         {
+            if (TestFeed != null && Path.IsPathFullyQualified(url))
+            {
+                using (var src = File.OpenRead(url))
+                using (var dst = new FileStream(fresh, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await src.CopyToAsync(dst);
+                    dst.Flush(flushToDisk: true);
+                }
+                using (var check = File.OpenRead(fresh))
+                    if (!Convert.ToHexString(await SHA256.HashDataAsync(check)).Equals(sha256, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("The download was damaged. Nothing was changed.");
+                return;
+            }
             using var h = Http();
             using var stall = new System.Threading.CancellationTokenSource(StallLimit);
             try
@@ -245,6 +265,9 @@ namespace TailRemote
                         hash.AppendData(buf, 0, n);
                         await dst.WriteAsync(buf.AsMemory(0, n), stall.Token);
                     }
+                    // On the disk before it is renamed into place: after a power cut, a rename that landed
+                    // before the contents left an exe of zeros (for the service, one that cannot roll back).
+                    dst.Flush(flushToDisk: true);
                 }
                 if (!Convert.ToHexString(hash.GetHashAndReset()).Equals(sha256, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("The download was damaged. Nothing was changed.");
@@ -310,7 +333,7 @@ namespace TailRemote
         /// <summary>Deletes TailRemote's own leftovers from earlier updates (name.old, name.old-...). True if none are left.</summary>
         public static bool CleanLeftovers()
         {
-            string exe = Environment.ProcessPath!;
+            string exe = Names.OwnExe;
             // A service update not yet proven: its old copy is what roll back would restore.
             if (File.Exists(exe + ".rollback")) return true;
             bool all = true;

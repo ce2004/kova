@@ -143,10 +143,19 @@ namespace TailRemote
             return names.Count > 1 && what.EndsWith(" items") && int.TryParse(what[..^6], out int k) && k >= 2 && k <= names.Count;
         }
 
-        private static bool SameName(string asked, string what)
+        private static bool SameName(string asked, string what) =>
+            NameOrTaken(asked, what) || (FileChannel.Suited(asked) is string suited && NameOrTaken(suited, what));
+
+        /// <summary>
+        /// The name itself or, taken already, "name (2)" as FileChannel.Marked makes it. This PC changes a name
+        /// Windows cannot make ("notes." is "notes", "con" is "con_"), which SameName also tries; and a name that
+        /// is all extension (".vscode") is all name, ".vscode (2)": both once left a Get saying "getting" forever.
+        /// </summary>
+        private static bool NameOrTaken(string asked, string what)
         {
             if (string.Equals(asked, what, StringComparison.OrdinalIgnoreCase)) return true;
-            string stem = System.IO.Path.GetFileNameWithoutExtension(asked), ext = System.IO.Path.GetExtension(asked);
+            string ext = System.IO.Path.GetExtension(asked), stem = asked[..^ext.Length];
+            if (stem.Length == 0) { stem = asked; ext = ""; }
             if (!what.StartsWith(stem + " (", StringComparison.OrdinalIgnoreCase) || !what.EndsWith(")" + ext, StringComparison.OrdinalIgnoreCase)) return false;
             int digits = what.Length - stem.Length - 3 - ext.Length;
             return digits > 0 && what.Substring(stem.Length + 2, digits).All(char.IsAsciiDigit);

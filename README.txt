@@ -9,7 +9,7 @@ On the PC you want to control (the host)
 1. Either install Tailscale on both PCs and sign in to the same tailnet, or use the host's internet address.
 2. Run Kova. In the File menu, choose Mode, Host, set Password, then choose Start hosting.
 3. A cloud PC usually has no sound card. Kova notices and sets up an audio device called Kova: approve the administrator prompt, then press Install Driver in VB-Cable's window. A progress bar shows the rest. You can also use Settings, Set up audio device at any time, and Settings, Remove audio device takes it off again.
-4. If Windows Firewall would keep other PCs out, Kova offers to open the port. Settings, Port editor lists every port Kova has used and opens or closes them.
+4. If Windows Firewall would keep other PCs out, Kova offers to open the port. When you change the port on a PC that hosts, Kova opens the new one and offers to close the old one. Settings, Port editor lists every port Kova has used or has a firewall rule for, marks the one in use, and opens, closes or removes the others. Its Clean up old firewall rules button removes the rules Windows piled up for copies of Kova that are gone or no longer used, and old TailRemote rules. The port in use always stays open.
 5. Turn on Settings, Start hosting when Windows starts. It asks for administrator once, then starts hosting at every sign-in as administrator, so keys also reach administrator windows and the port is opened by itself.
 
 On your PC
@@ -58,7 +58,8 @@ Running the host as a Windows service
 - The service starts with Windows, before anyone signs in, and has full system access. You can use the lock screen, sign in, answer administrator prompts and send Control Alt Delete with Control Alt End.
 - Anyone who knows the Kova password gets that access too, so use a long password.
 - While the service runs, Start hosting in the File menu becomes Apply settings to the service. Press it after changing the port or passwords.
-- The service runs its own copy from Program Files. It never updates by itself: when you update Kova on that PC with Check for updates, the service follows straight away to the same version, without asking.
+- The service runs the very copy of Kova you turned it on from, where it is, for example in Documents or an apps folder, so leave that copy where it is. Kova only copies itself to Program Files for the service when it was started from a network drive, a USB stick or a temporary folder, and a service set up in Program Files by an older Kova stays there.
+- It never updates by itself: when you update Kova on that PC with Check for updates, the copy you ran is updated in place and restarted, and the service, which runs that same copy, restarts into it straight away, without asking. A service in Program Files follows to the same version.
 - Turn off Settings, Run as a Windows service to remove it completely.
 
 More settings

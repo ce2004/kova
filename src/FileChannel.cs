@@ -980,7 +980,7 @@ namespace TailRemote
         private sealed class LeftOut { public int Unopened, Links, Broken; }
 
         /// <summary>Windows' words about a path without the \\?\ in front that this side reads files by (said aloud, it is noise).</summary>
-        private static string Plain(string said) => said.Replace(@"\\?\UNC\", @"\\").Replace(@"\\?\", "");
+        internal static string Plain(string said) => said.Replace(@"\\?\UNC\", @"\\").Replace(@"\\?\", "");
 
         /// <summary>A junction or symbolic link (not a cloud file's or deduplication's own marks, which are real files and folders).</summary>
         private static bool? IsLink(string path, bool folder)
@@ -1000,7 +1000,7 @@ namespace TailRemote
         /// The \\?\ form of a path, which Windows takes exactly as it is: no dot or space at the end of a name
         /// cut off, and no 260-character limit. One that is not a plain full path is made one first.
         /// </summary>
-        private static string Long(string path)
+        internal static string Long(string path)
         {
             if (path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal)) return path;
             string p = path.Replace('/', '\\');
@@ -2350,7 +2350,7 @@ namespace TailRemote
         /// not allow becomes "_", a dot or space at the end goes, and a name it keeps for itself gets "_" ("con" is
         /// "con_", "NUL.txt" is "NUL_.txt"). "." and ".." are left alone, for SafePath to refuse as escapes.
         /// </summary>
-        private static string? Suited(string rel)
+        internal static string? Suited(string rel)
         {
             string[] parts = rel.Split('\\', '/');
             bool changed = false;

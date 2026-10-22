@@ -82,7 +82,41 @@ namespace TailRemote
         // Host: this PC's addresses, to give the other PC. Enter copies the best one.
         private readonly MenuItem _copyAddress = new() { WhyNot = "This PC has no network address right now." };
         private string? _bestAddress;
-        private readonly System.Collections.Generic.List<(string Id, string Name)> _devices = new();
+        // Each choice's own list: one shared list put the capture device chosen before (unplugged) among the
+        // output devices and the other way round.
+        private readonly System.Collections.Generic.List<(string Id, string Name)> _outDevices = new(), _capDevices = new();
+        private bool _fillingDevices;
+
+        /// <summary>
+        /// Both device choices from the devices there now, each keeping its setting's device. Done again every
+        /// time the Settings menu opens: filled once at start, a headset plugged in (or the Kova device set up)
+        /// later never showed until Kova restarted, and Kova runs for months.
+        /// </summary>
+        private void FillDevices()
+        {
+            var now = Wasapi.OutputDevices();
+            void Fill(MenuChoice menu, System.Collections.Generic.List<(string Id, string Name)> list, string chosen, string role)
+            {
+                list.Clear();
+                list.Add(("", "Windows default"));
+                list.AddRange(now);
+                // A chosen device that is unplugged right now keeps its place: it showed as Windows default, and
+                // the next setting saved wrote that back, so the headset was forgotten for good.
+                if (!string.IsNullOrEmpty(chosen) && !list.Exists(d => d.Id == chosen)) list.Add((chosen, NotConnected(role)));
+                menu.Clear();
+                foreach (var d in list) menu.Add(d.Name);
+                int i = list.FindIndex(d => d.Id == chosen);
+                menu.SelectedIndex = i < 0 ? 0 : i;
+            }
+            bool wasFilling = _fillingCapture;
+            _fillingDevices = _fillingCapture = true;
+            try
+            {
+                Fill(_device, _outDevices, _settings.OutputDevice, "output");
+                Fill(_captureFrom, _capDevices, _settings.CaptureDevice, "capture");
+            }
+            finally { _fillingDevices = false; _fillingCapture = wasFilling; }
+        }
         private static string NotConnected(string role) => "The " + role + " device chosen before (not connected now: Windows default until it is back)";
 
         private readonly NotifyIcon _tray = new() { Text = "Kova, hosting", Icon = SystemIcons.Application };
@@ -125,13 +159,19 @@ namespace TailRemote
             _transferStatus.Item.DropDownClosed += (_, _) => { if (_barsStale) ShowFileBars(_barsWanted); };
             _transferStop.Click += (_, _) =>
             {
-                if (_client != null) _client.CancelTransfer();
-                else Client.ForgetTransfers(); // waiting for a reconnection: stopped for good
+                _client?.CancelTransfer();
+                // Transfers waiting for a reconnection are stopped for good, always: one to a PC let go (or
+                // to this one while it reconnects) waits there, not with the PC in front, and Stop with
+                // another PC in front left it to carry on when that PC came back.
+                Client.ForgetTransfers();
                 // PCs in the background keep their transfers going and the Files line counts them, so
                 // Stop must end theirs too: otherwise it stayed on and pressing it did nothing.
                 foreach (var p in _parked) p.Client.CancelTransfer();
                 _host?.CancelTransfer();
                 _serviceLink?.CancelTransfer();
+                // The menu closes on Stop and only files coming here are said as they end: without this,
+                // stopping a send gave no word at all.
+                Menus.AfterMenu(() => Say("Stopping the file transfer."));
             };
 
             // The menu bar (Alt, then the arrows): File, Clipboard, Settings.
@@ -202,33 +242,18 @@ namespace TailRemote
             _settingService = false;
             FillSaved();
 
-            _device.Add("Windows default");
-            _devices.Add(("", "Windows default"));
-            foreach (var d in Wasapi.OutputDevices()) { _devices.Add(d); _device.Add(d.Name); }
-            // A chosen device that is unplugged right now keeps its place: it showed as Windows default, and
-            // the next setting saved wrote that back, so the headset was forgotten for good.
-            foreach (var (id, role) in new[] { (_settings.OutputDevice, "output"), (_settings.CaptureDevice, "capture") })
-                if (!string.IsNullOrEmpty(id) && !_devices.Exists(d => d.Id == id))
-                {
-                    _devices.Add((id, NotConnected(role)));
-                    _device.Add(NotConnected(role));
-                }
-            int sel = _devices.FindIndex(d => d.Id == _settings.OutputDevice);
-            _device.SelectedIndex = sel < 0 ? 0 : sel;
-            // Wired after the initial SelectedIndex so it fires only on the person's choice:
-            // save it and, if a player exists, switch it live rather than only on reconnect.
+            FillDevices();
+            // Wired after the first fill, and quiet during every later one, so it fires only on the person's
+            // choice: save it and, if a player exists, switch it live rather than only on reconnect.
             _device.SelectedIndexChanged += (_, _) =>
             {
+                if (_fillingDevices) return;
                 SaveSettings();
-                string device = _devices[Math.Max(0, _device.SelectedIndex)].Id;
+                string device = _outDevices[Math.Max(0, _device.SelectedIndex)].Id;
                 if (_player != null) { _player.SetDevice(device); _playerDevice = device; }
             };
-            _fillingCapture = true;
-            foreach (var d in _devices) _captureFrom.Add(d.Name);
-            int cap = _devices.FindIndex(d => d.Id == _settings.CaptureDevice);
-            _captureFrom.SelectedIndex = cap < 0 ? 0 : cap;
-            _fillingCapture = false;
             _captureFrom.SelectedIndexChanged += (_, _) => CaptureChanged();
+            set.DropDownOpening += (_, _) => FillDevices();
 
             _mode.SelectedIndexChanged += (_, _) => UpdateMode();
             _saved.SelectedIndexChanged += (_, _) => UseSaved();
@@ -246,7 +271,7 @@ namespace TailRemote
             };
             _go.Click += (_, _) => Menus.AfterMenu(() => Go());
             _address.Changed += SaveSettings;
-            _port.Changed += SaveSettings;
+            _port.Changed += PortChanged;
             _password.Changed += SaveSettings;
             _listenPassword.Changed += SaveSettings;
             _toggle.Click += (_, _) => Menus.AfterMenu(() => _keys?.Toggle());
@@ -271,7 +296,7 @@ namespace TailRemote
             _rideOut.CheckedChanged += (_, _) => { SaveSettings(); if (_player != null) _player.RideOut = _rideOut.Checked; };
             _audioSetup.Click += (_, _) => Menus.AfterMenu(() => SetUpAudio());
             _audioRemove.Click += (_, _) => Menus.AfterMenu(() => RemoveAudio());
-            _portEditor.Click += (_, _) => Menus.AfterMenu(() => { SaveSettings(); using var f = new PortEditorForm(_settings); f.ShowDialog(this); });
+            _portEditor.Click += (_, _) => Menus.AfterMenu(() => { SaveSettings(); using var f = new PortEditorForm(_settings, PortsInUse()); f.ShowDialog(this); });
             _startup.CheckedChanged += (_, _) => Menus.AfterMenu(StartupChanged); // after the menu closes, so NVDA reads what comes up
             _service.CheckedChanged += (_, _) => { if (!_settingService) Menus.AfterMenu(ServiceChanged); };
             _titleTimer.Tick += (_, _) => UpdateTitle();
@@ -387,13 +412,17 @@ namespace TailRemote
                 var link = new ServiceLink.Client { ReceiveFolder = _settings.ReceiveFolder };
                 link.TextArrived += text => Later(() => ClipboardArrived(text));
                 link.FilesArrived += paths => Later(() => ClipboardFilesArrived(paths));
-                link.TransferProgress += t => Later(() => ShowTransfer(t));
+                // Only while it is still the link: a report already on its way when it was let go put the Files
+                // line back at "Receiving" after it had said the transfer stopped.
+                link.TransferProgress += t => Later(() => { if (_serviceLink == link) ShowTransfer(t); });
                 _serviceLink = link;
             }
             else if (!want && _serviceLink != null)
             {
                 _serviceLink.Dispose();
                 _serviceLink = null;
+                // Let go mid-transfer, it sends no last report: the Files line stayed at "Receiving" for good.
+                if (_client == null && _parked.Count == 0 && _host == null && !Client.HasKeptTransfers) TransferEnded("Stopped: no longer hosting as the service.");
             }
         }
 
@@ -728,13 +757,13 @@ namespace TailRemote
 
         private void CaptureChanged()
         {
+            if (_fillingCapture) return; // refilled as the Settings menu opens: nothing was changed
             Doing("changing the capture device");
-            if (_fillingCapture) return;
             SaveSettings();
             string id = _settings.CaptureDevice;
             _host?.SetCaptureDevice(id.Length == 0 ? null : id);
             if (_service.Checked) Say("Press Apply settings to the service to use this there too.");
-            else if (_host != null) Say("Now sending " + _devices[Math.Max(0, _captureFrom.SelectedIndex)].Name + ".");
+            else if (_host != null) Say("Now sending " + _capDevices[Math.Max(0, _captureFrom.SelectedIndex)].Name + ".");
         }
 
         // ---- The remote PC: update it, its info, get files from it, switch with Control 1 to 9 ----
@@ -1129,7 +1158,13 @@ namespace TailRemote
                 items.Add(item);
             }
             if (_client != null && !_settings.SavedPcs.Any(s => SamePc(s.Address, s.Port, FrontAddress, FrontPort)))
-                items.Add(new ToolStripMenuItem((NameFor(FrontAddress, FrontPort) + ", in front").Replace("&", "&&")));
+            {
+                // Enter on it closed the menu without a word; a saved PC's line says it is already in front.
+                string front = NameFor(FrontAddress, FrontPort);
+                var item = new ToolStripMenuItem((front + ", in front").Replace("&", "&&"));
+                item.Click += (_, _) => Menus.AfterMenu(() => Say("Already on " + front + "."));
+                items.Add(item);
+            }
             // Never an empty or all-greyed-out menu: with nothing NVDA can land on, it froze.
             if (items.Count == 0) items.Add(new MenuStatus("There are no saved PCs to switch to yet. Connect to one, then File, Save this PC.").Item);
             if (_parked.Count > 0)
@@ -1339,19 +1374,9 @@ namespace TailRemote
                 _muteLocal.Checked = _settings.MuteWhenNotControlling;
                 _rideOut.Checked = _settings.RideOutStalls;
                 _quality.SelectedIndex = Math.Clamp(_settings.SoundQuality + 1, 0, _quality.Count - 1);
-                foreach (var (id, role) in new[] { (_settings.OutputDevice, "output"), (_settings.CaptureDevice, "capture") })
-                    if (!string.IsNullOrEmpty(id) && !_devices.Exists(d => d.Id == id))
-                    {
-                        _devices.Add((id, NotConnected(role)));
-                        _device.Add(NotConnected(role));
-                        _captureFrom.Add(NotConnected(role));
-                    }
-                int sel = _devices.FindIndex(d => d.Id == _settings.OutputDevice);
-                _device.SelectedIndex = sel < 0 ? 0 : sel;
-                _fillingCapture = true;
-                int cap = _devices.FindIndex(d => d.Id == _settings.CaptureDevice);
-                _captureFrom.SelectedIndex = cap < 0 ? 0 : cap;
-                _fillingCapture = false;
+                FillDevices();
+                // A restored output device is used at once, as choosing it in the menu does.
+                if (_player != null && _playerDevice != _settings.OutputDevice) { _player.SetDevice(_settings.OutputDevice); _playerDevice = _settings.OutputDevice; }
                 Sounds.Key = Math.Clamp(_settings.SoundKey, 0, 11);
                 ApplyReceiveFolder();
                 FillSaved();
@@ -1834,8 +1859,8 @@ namespace TailRemote
             _settings.Address = _address.Text.Trim();
             if (int.TryParse(_port.Text.Trim(), out int port)) _settings.Port = port;
             _settings.Password = _password.Text;
-            _settings.OutputDevice = _devices[Math.Max(0, _device.SelectedIndex)].Id;
-            _settings.CaptureDevice = _devices[Math.Max(0, _captureFrom.SelectedIndex)].Id;
+            _settings.OutputDevice = _outDevices[Math.Max(0, _device.SelectedIndex)].Id;
+            _settings.CaptureDevice = _capDevices[Math.Max(0, _captureFrom.SelectedIndex)].Id;
             _settings.ListenPassword = _listenPassword.Text;
             _settings.Logging = _logging.Checked;
             _settings.CatchUpBySpeed = _speedUp.Checked;
@@ -1924,7 +1949,91 @@ namespace TailRemote
             catch (Exception e) { Say("Could not start hosting: " + e.Message); }
             UpdateButtons();
             UpdateTitle();
-            if (_host != null) await OfferToOpenPort(port);
+            if (_host == null) return;
+            _hostingPort = port;
+            // Hosting on another port than last time: open this one, and offer to close the old one.
+            int before = _settings.HostedPort;
+            if (before != 0 && before != port) await OfferPortMove(port, before);
+            else await OfferToOpenPort(port);
+            if (_settings.HostedPort != port) { _settings.HostedPort = port; SaveNow(); }
+        }
+
+        // The port this window hosts on now (when _host is not null).
+        private int _hostingPort;
+
+        /// <summary>The ports Port editor must never close: the port setting, the one this window hosts on, and the service's.</summary>
+        private System.Collections.Generic.IReadOnlyCollection<int> PortsInUse()
+        {
+            var ports = new System.Collections.Generic.SortedSet<int>();
+            if (CurrentPort > 0) ports.Add(CurrentPort);
+            if (_host != null && _hostingPort > 0) ports.Add(_hostingPort);
+            if (_settings.HostedPort > 0 && ServiceHost.IsInstalled()) ports.Add(_settings.HostedPort);
+            return ports;
+        }
+
+        /// <summary>
+        /// The port was changed. On a PC that hosts, the new port is opened in Windows Firewall and closing the
+        /// old one is offered, so old ports do not pile up open. A PC that controls others needs nothing here:
+        /// the port is the other PC's.
+        /// </summary>
+        private async void PortChanged()
+        {
+            int old = _settings.Port;
+            SaveSettings();
+            int now = _settings.Port;
+            if (now == old || !HostMode || Protocol.PortProblem(now.ToString(), out _) != null) return;
+            if (_service.Checked)
+            {
+                Say("Press Apply settings to the service to move it to port " + now + ". That opens port " + now + " in Windows Firewall and closes port " + old + ".");
+                return;
+            }
+            if (_host != null)
+            {
+                Say("Kova keeps hosting on port " + _hostingPort + " until you stop hosting and start again. Then it opens port " + now + ".");
+                return;
+            }
+            await OfferPortMove(now, _settings.HostedPort != 0 ? _settings.HostedPort : old);
+        }
+
+        /// <summary>Opens newPort (if it is not open yet) and offers to close oldPort, with one administrator prompt for both.</summary>
+        private async System.Threading.Tasks.Task OfferPortMove(int newPort, int oldPort)
+        {
+            if (newPort == oldPort) { await OfferToOpenPort(newPort); return; }
+            Say("Checking Windows Firewall."); // the look takes a few seconds before the question comes up
+            bool newOpen = await System.Threading.Tasks.Task.Run(() => Firewall.IsOpen(newPort));
+            var rules = await System.Threading.Tasks.Task.Run(Firewall.Scan);
+            bool oldOpen = rules != null ? rules.Any(r => r.Port == oldPort) : await System.Threading.Tasks.Task.Run(() => Firewall.IsOpen(oldPort));
+            if (IsDisposed) return;
+            if (!oldOpen)
+            {
+                // Closed already: nothing to offer, and nothing to keep on Port editor's list.
+                if (!PortEditorForm.Forget(_settings, oldPort)) TellSaveProblem();
+                if (!newOpen) await OfferToOpenPort(newPort);
+                return;
+            }
+            string question = newOpen
+                ? "Kova now uses port " + newPort + ", which is open. Port " + oldPort + ", which Kova used before, is still open in Windows Firewall. Close port " + oldPort + " now?"
+                : "Kova now uses port " + newPort + ". Open port " + newPort + " in Windows Firewall, so other PCs can connect, and close port " + oldPort + ", which Kova used before?" + Environment.NewLine + Environment.NewLine +
+                  "Yes opens " + newPort + " and closes " + oldPort + ". No only opens " + newPort + ". Cancel changes nothing.";
+            var answer = MessageBox.Show(this, question + Environment.NewLine + Environment.NewLine + "Windows asks for administrator permission. You can also do this later in Port editor.",
+                "Port changed", newOpen ? MessageBoxButtons.YesNo : MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel || (newOpen && answer != DialogResult.Yes)) return;
+            bool close = answer == DialogResult.Yes;
+            var result = close ? newOpen ? await Firewall.ChangeAsync(oldPort, false) : await Firewall.MoveAsync(newPort, oldPort)
+                : await Firewall.ChangeAsync(newPort, true);
+            if (IsDisposed) return;
+            if (result == ChangeResult.Done)
+            {
+                if (!PortEditorForm.Remember(_settings, newPort) || (close && !PortEditorForm.Forget(_settings, oldPort))) TellSaveProblem();
+                if (_host == null) { _settings.HostedPort = newPort; SaveNow(); }
+            }
+            Say(result switch
+            {
+                ChangeResult.Done => close ? newOpen ? "Port " + oldPort + " is closed." : "Port " + newPort + " is open and port " + oldPort + " is closed." : "Port " + newPort + " is open.",
+                ChangeResult.InUse => "Port " + newPort + " is open. Port " + oldPort + " stays open, because the Kova service still hosts on it.",
+                ChangeResult.Declined => "Windows Firewall was not changed: administrator permission was not given.",
+                _ => "Windows Firewall did not take the change. Port editor in Settings shows what is open.",
+            });
         }
 
         /// <summary>If Windows Firewall would keep other PCs out, open the port (asking first unless already administrator).</summary>
@@ -2076,7 +2185,7 @@ namespace TailRemote
             int attempt = ++_attempt;
             if (!quiet) { _go.Enabled = false; Say("Connecting to " + address + "."); }
             UpdateButtons();
-            string device = _devices[Math.Max(0, _device.SelectedIndex)].Id;
+            string device = _outDevices[Math.Max(0, _device.SelectedIndex)].Id;
             try
             {
                 if (_player == null || _playerDevice != device)
@@ -2414,7 +2523,7 @@ namespace TailRemote
             string plan = want
                 ? "Run Kova as a Windows service?" + Environment.NewLine + Environment.NewLine +
                   "The service starts with Windows, before anyone signs in, and has full system access. Whoever knows the Kova password can then use the lock screen, sign in, and approve administrator prompts on this PC, and Control Alt End sends Control Alt Delete." + Environment.NewLine + Environment.NewLine +
-                  "It uses this window's port and passwords, opens the port in Windows Firewall, and replaces Start hosting when Windows starts. Windows asks for administrator permission."
+                  "It uses this window's port and passwords, opens the port in Windows Firewall, and replaces Start hosting when Windows starts. " + ServiceWhere() + " Windows asks for administrator permission."
                 : "Remove the Kova service? This PC stops hosting until you start hosting here again. Windows asks for administrator permission.";
             if (MessageBox.Show(this, plan, want ? "Run as a Windows service" : "Remove the service", MessageBoxButtons.OKCancel,
                     want ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
@@ -2427,12 +2536,15 @@ namespace TailRemote
             if (want && _host != null) StopHost(); // the service takes the port
             SaveSettings();
             Say("Windows asks for administrator permission.");
-            bool ok = await ServiceHost.SetAsync(want);
+            bool ok = await ServiceHost.SetAsync(want, _settings);
             bool now = ServiceHost.IsInstalled();
             SetServiceBox(now);
             _startup.Checked = Startup.IsEnabled();
             if (ok && now == want)
+            {
+                if (want) await ServiceGotPort(_settings.Port);
                 Say(want ? "The Kova service is running and hosting this PC on port " + _settings.Port + "." : "The Kova service is removed.");
+            }
             else
                 Say((want ? "The service was not set up: " : "The service was not removed: ") + ServiceHost.LastError());
             UpdateMode();
@@ -2443,9 +2555,34 @@ namespace TailRemote
             if (!CheckPassword() || !CheckPort(out _) || !CheckListenPassword()) return;
             SaveSettings();
             Say("Giving the service these settings. Windows asks for administrator permission.");
-            Say(await ServiceHost.SetAsync(true)
+            bool ok = await ServiceHost.SetAsync(true, _settings);
+            if (ok) await ServiceGotPort(_settings.Port);
+            Say(ok
                 ? "The service is hosting with these settings on port " + _settings.Port + "."
                 : "The service was not changed: " + ServiceHost.LastError());
+        }
+
+        /// <summary>
+        /// The service now hosts on this port. It closed the port it used before, so that one leaves Port editor's
+        /// list (once it really is closed), and this one is remembered.
+        /// </summary>
+        private async System.Threading.Tasks.Task ServiceGotPort(int port)
+        {
+            int before = _settings.HostedPort;
+            bool forget = before != 0 && before != port && !await System.Threading.Tasks.Task.Run(() => Firewall.IsOpen(before));
+            if (!PortEditorForm.Remember(_settings, port) || (forget && !PortEditorForm.Forget(_settings, before))) TellSaveProblem();
+            _settings.HostedPort = port;
+            SaveNow();
+        }
+
+        /// <summary>Where the service will run from, for the question before it is set up.</summary>
+        private static string ServiceWhere()
+        {
+            string exe = ServiceHost.PlannedExe();
+            string folder = System.IO.Path.GetDirectoryName(exe) ?? exe;
+            return ServiceHost.SameFile(exe, Names.OwnExe)
+                ? "The service runs this copy of Kova, from " + folder + ", so leave it there. Updating this copy updates the service too. Any program that can change files in that folder could then act with full system access; if that worries you, put Kova in Program Files and turn this on from there."
+                : "Kova puts a copy of itself in " + folder + " for the service to run.";
         }
 
         private void SetServiceBox(bool on)

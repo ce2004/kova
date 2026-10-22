@@ -49,8 +49,13 @@ namespace TailRemote
             new Thread(Pump) { IsBackground = true, Name = "Kova speech" }.Start();
         }
 
+        // Tests only: every line handed to NVDA is also written here, so a test run can check what was said.
+        private static readonly string? TestLog = Environment.GetEnvironmentVariable("KOVA_SPEECH_LOG") is { Length: > 0 } f ? f : null;
+
         public static void Speak(string message, bool interrupt = true)
         {
+            if (TestLog != null && !string.IsNullOrEmpty(message))
+                lock (Gate) try { System.IO.File.AppendAllText(TestLog, DateTime.Now.ToString("HH:mm:ss ") + message + Environment.NewLine); } catch { }
             if (_speakText == null || string.IsNullOrEmpty(message)) return;
             lock (Gate)
             {

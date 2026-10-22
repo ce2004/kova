@@ -172,6 +172,23 @@ namespace TailRemote
                 return dropped ? "the host hung up at once (" + (why ?? "") + ") and reconnecting worked" : "FAIL: the damaged connection was not noticed";
             });
 
+            Scenario("clipboard text from a PC whose network sends each connection from another address (login on 127.0.0.1, lanes from ::1)", 30, () =>
+            {
+                string? got = null;
+                Action<string> took = t => got = t;
+                host.ClipboardReceived += took;
+                Client.TestLaneAddress = System.Net.IPAddress.IPv6Loopback;
+                try
+                {
+                    using var c = Connect(Password);
+                    WaitFor(() => c.Files != null, 5000);
+                    c.SendClipboard("hello from another address");
+                    WaitFor(() => got != null, 15_000);
+                }
+                finally { Client.TestLaneAddress = null; host.ClipboardReceived -= took; }
+                return got == "hello from another address" ? "it arrived" : "FAIL: got " + (got ?? "nothing");
+            });
+
             using (var ctrl = Connect(Password))
             {
                 for (int i = 0; i < 100 && (ctrl.Files == null || host.ControllerFiles == null); i++) Thread.Sleep(50);

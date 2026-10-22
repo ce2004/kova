@@ -1,3 +1,27 @@
+4.2.0
+Bug fixed: if your internet connection sends each new connection out from a different address, as some university, office and phone networks do, Send the clipboard, Send files and the remote screen never got through to the other PC, without a word. Now they arrive. Update the PC you control to get this fix.
+New feature: the Windows service now runs the copy of Kova you turned it on from, wherever it is, such as Documents or an apps folder, instead of its own copy in Program Files. A service already set up in Program Files keeps working there. To move it, turn Run as a Windows service off and on again from the copy you use.
+Bug fixed: if you updated Kova and the service ran that same copy, the service went on running the old version until it was restarted. Now it restarts into the new version straight away.
+New feature: when you change the port on a PC that hosts, Kova opens the new port in Windows Firewall and offers to close the old one, so old ports no longer stay open.
+New feature: Port editor lists every port Kova has a firewall rule for and says which one is in use. Remove port closes a port and takes it off the list. The port in use, and the port the service hosts on, are never closed from there.
+New feature: Clean up old firewall rules in Port editor removes the rules Windows made for copies of Kova that are gone or no longer used, rules that block Kova, and old TailRemote rules. Rules for copies that are gone are also cleared whenever Kova opens or closes a port.
+Bug fixed: if Kova first started hosting while nobody could answer Windows' firewall question (the PC locked or unattended), Windows could block that copy, and opening the port in Kova did not help. Now opening the port, or setting up the service, removes that block.
+Bug fixed: on a Windows account that is not an administrator, turning on Run as a Windows service with an administrator's password always failed with "Set a password first", and turning it off set Kova to start at sign-in for the administrator instead of you. Now the service gets this window's settings, and turning it off puts Kova back at your own sign-in.
+Bug fixed: if you turned down the administrator prompt when setting up the service, Kova could read out an old, unrelated error from weeks before. Now it says permission was not given.
+Bug fixed: if the service was updating itself at the moment you applied settings to it, the half-downloaded copy could be put in place and the service would not start again. Now each uses its own file.
+Bug fixed: after a power cut just after an update, Kova or the service's settings could come back empty. Now they are fully written to the disk before they replace the old ones.
+Bug fixed: in Get files, a folder on the remote PC whose name ended in a dot or a space (made by a Mac, Linux or WSL) said it was not there any more, or showed another folder. Now it opens.
+Bug fixed: if you got a file starting with a dot, like .vscode, a second time, or one whose name Windows had to change, Get files kept saying "getting" and refused every later Get until you closed it. Now it is marked as got.
+Bug fixed: moving the mouse slowly near the left or top edge of the remote screen could get stuck a pixel short. Now every move lands exactly.
+Bug fixed: Stop the file transfer did nothing for a transfer waiting to reconnect to a PC that was not in front, and that transfer carried on later. Now Stop ends it. Stop now also says it is stopping.
+Bug fixed: if you turned off Run as a Windows service while files were coming in through it, the Files line stayed at "Receiving" for good. Now it says the transfer stopped.
+Bug fixed: a headset plugged in, or the Kova sound device set up, after Kova started never showed in Output device or Capture sound from until Kova restarted. Now the lists are up to date every time you open Settings, and an unplugged device chosen for one list no longer shows in the other.
+Bug fixed: in Switch to PC, pressing Enter on the PC in front that is not saved did nothing and said nothing. Now it says you are already on it.
+Bug fixed: on a remote PC running the service, the screen picture dropped in quality after every switch of user or sign in. Now it stays.
+Bug fixed: if the remote PC running the service was very busy, the screen window could keep dropping and reconnecting every 15 seconds. Now it waits.
+Bug fixed: choosing another remote screen while that PC was busy could switch the picture without ever saying "Screen 2 of 3". Now it is always said.
+Bug fixed: the remote screen dropped in quality each time you scrolled and stopped, and while things kept moving it never came back up on an ordinary internet connection. Now it only steps down when the line really cannot keep up, and climbs back while things move.
+
 4.1.4
 New feature: opening Kova again while it is already running brings the open window forward, even from the notification area, instead of starting a second copy. If it was started at sign-in and is sitting idle, it starts hosting. Copies of Kova kept in different folders still each have their own window.
 New feature: if Kova cannot read or save its settings, or some saved passwords cannot be read on this Windows account, it now tells you once, in plain words, instead of losing changes in silence. If the settings file was busy when Kova started, it tries again every half minute, says when it can read it again, and keeps what you changed meanwhile.

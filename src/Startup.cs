@@ -19,7 +19,7 @@ namespace TailRemote
         private static string Quoted(string text) =>
             System.Text.RegularExpressions.Regex.Replace(text, "['\u2018\u2019\u201A\u201B]", "$0$0");
 
-        private const string TaskName = Names.Task;
+        private static readonly string TaskName = Names.Task;
         // The catch-all rule older versions made. Removed here; Port editor manages ports now.
         private const string RuleName = "TailRemote";
 
@@ -70,10 +70,10 @@ namespace TailRemote
         /// <summary>The elevated half: runs in the copy started by ChangeAsync. user: the account to start for, or null for this one.</summary>
         public static int Apply(bool on, string? user)
         {
-            string exe = Environment.ProcessPath!;
+            string exe = Names.OwnExe;
             string? account = null;
             if (on && user != null && (account = Account(user)) == null) return 1; // never a task for a mistyped or unknown name
-            Run(Netsh, "advfirewall firewall delete rule name=\"" + RuleName + "\"");
+            if (Names.Instance.Length == 0) Run(Netsh, "advfirewall firewall delete rule name=\"" + RuleName + "\""); // TailRemote's old rule: never from a test copy
             if (!on)
             {
                 Run(Schtasks, "/Delete /TN \"" + TaskName + "\" /F");
@@ -81,7 +81,7 @@ namespace TailRemote
             }
             // Not schtasks /Create: its tasks stop after 3 days and refuse to start on battery.
             string ps = (account != null ? "$u = '" + Quoted(account) + "'; " : "$u = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ") +
-                "$a = New-ScheduledTaskAction -Execute '" + Quoted(exe) + "' -Argument '--host'; " +
+                "$a = New-ScheduledTaskAction -Execute '" + Quoted(exe) + "' -Argument '" + Names.InstanceArgs + "--host'; " +
                 "$t = New-ScheduledTaskTrigger -AtLogOn -User $u; " +
                 "$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest; " +
                 "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; " +

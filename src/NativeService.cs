@@ -27,6 +27,30 @@ namespace TailRemote
         [DllImport("advapi32.dll", SetLastError = true)]
         public static extern bool SetServiceStatus(IntPtr handle, ref SERVICE_STATUS status);
 
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenSCManagerW(string? machine, string? database, int access);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenServiceW(IntPtr manager, string name, int access);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool QueryServiceStatus(IntPtr service, out SERVICE_STATUS status);
+        [DllImport("advapi32.dll")]
+        private static extern bool CloseServiceHandle(IntPtr handle);
+
+        /// <summary>A service's state (SERVICE_STOPPED and so on), or 0 if it is not there or cannot be asked.</summary>
+        public static int ServiceState(string name)
+        {
+            IntPtr scm = OpenSCManagerW(null, null, 0x0001); // SC_MANAGER_CONNECT
+            if (scm == IntPtr.Zero) return 0;
+            try
+            {
+                IntPtr svc = OpenServiceW(scm, name, 0x0004); // SERVICE_QUERY_STATUS
+                if (svc == IntPtr.Zero) return 0;
+                try { return QueryServiceStatus(svc, out var s) ? s.CurrentState : 0; }
+                finally { CloseServiceHandle(svc); }
+            }
+            finally { CloseServiceHandle(scm); }
+        }
+
         public const int SERVICE_WIN32_OWN_PROCESS = 0x10;
         public const int SERVICE_START_PENDING = 2, SERVICE_RUNNING = 4, SERVICE_STOP_PENDING = 3, SERVICE_STOPPED = 1;
         public const int SERVICE_ACCEPT_STOP = 1, SERVICE_ACCEPT_SHUTDOWN = 4, SERVICE_ACCEPT_SESSIONCHANGE = 0x80;

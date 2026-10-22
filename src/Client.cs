@@ -322,7 +322,7 @@ namespace TailRemote
             tcp.Client.DualMode = true;
             try
             {
-                if (!tcp.ConnectAsync(host.Address, host.Port).Wait(5000)) throw new TimeoutException();
+                if (!tcp.ConnectAsync(TestLaneAddress ?? host.Address, host.Port).Wait(5000)) throw new TimeoutException();
                 var s = tcp.GetStream();
                 s.ReadTimeout = 5000;
                 byte[] hello = new byte[Protocol.HelloBytes];
@@ -376,7 +376,10 @@ namespace TailRemote
             }
         }
 
-        /// <summary>Stop pressed while not connected: transfers waiting for a reconnection are stopped for good.</summary>
+        /// <summary>Transfers to a PC no longer connected, waiting for the next connection to it.</summary>
+        public static bool HasKeptTransfers { get { lock (KeptGate) return _kept.Exists(k => !k.Files.Gone && k.Files.HasWork); } }
+
+        /// <summary>Stop pressed: transfers waiting for a reconnection (to any PC) are stopped for good.</summary>
         public static void ForgetTransfers()
         {
             lock (KeptGate)
@@ -398,7 +401,7 @@ namespace TailRemote
             tcp.Client.DualMode = true;
             try
             {
-                if (!tcp.ConnectAsync(host.Address, host.Port).Wait(5000)) throw new TimeoutException();
+                if (!tcp.ConnectAsync(TestLaneAddress ?? host.Address, host.Port).Wait(5000)) throw new TimeoutException();
                 var s = tcp.GetStream();
                 s.ReadTimeout = 5000;
                 byte[] hello = new byte[Protocol.HelloBytes];
@@ -847,7 +850,8 @@ namespace TailRemote
         }
 
         // ---- Receiving audio ----
-
+        /// <summary>Tests only: file and screen lanes dial this address instead, so they arrive from another address than the login (as through some networks).</summary>
+        internal static System.Net.IPAddress? TestLaneAddress;
         /// <summary>Test only (--audiotest): delay each audio packet by a random 0 to N ms, like a bumpy network.</summary>
         public static int TestJitterMs;
         /// <summary>Test only (--audiotest ... lagN): from 5 seconds in, every packet arrives N ms later, like Clumsy's lag.</summary>

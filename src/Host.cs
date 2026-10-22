@@ -299,6 +299,26 @@ namespace TailRemote
             return a;
         }
 
+        /// <summary>
+        /// The logged-in controller a file or screen lane belongs to, by the token its login was given. Not by
+        /// address: many home, phone and university networks send each new connection out from a different
+        /// public address, and every lane from such a PC was refused without a word, so clipboard text, files
+        /// and the screen never arrived. Who it is is proven by the lane proof made with the session's key,
+        /// checked next. One from the same address block wins, should two tokens ever match.
+        /// </summary>
+        private Session? LaneOwner(ReadOnlySpan<byte> token, IPAddress remote)
+        {
+            Session? any = null;
+            lock (_gate)
+                foreach (var c in _controllers)
+                {
+                    if (!c.Token.AsSpan().SequenceEqual(token)) continue;
+                    if (Bucket(c.Address).Equals(Bucket(remote))) return c;
+                    any ??= c;
+                }
+            return any;
+        }
+
         /// <summary>This address block has logged in before: it keeps reserved handshake slots during a flood.</summary>
         private void MarkKnown(IPAddress a)
         {
@@ -672,7 +692,7 @@ namespace TailRemote
                     Session? owner = null;
                     for (int i = 0; i < 40 && owner == null; i++)
                     {
-                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && Bucket(c.Address).Equals(Bucket(remote))); // the block, not the exact address: IPv6 privacy addresses change daily, and LaneProof proves who it is
+                        owner = LaneOwner(answer.AsSpan(4, 8), remote);
                         if (owner == null) Thread.Sleep(50);
                     }
                     if (owner == null) { tcp.Dispose(); return; }
@@ -692,7 +712,7 @@ namespace TailRemote
                     Session? owner = null;
                     for (int i = 0; i < 40 && owner == null; i++)
                     {
-                        lock (_gate) owner = _controllers.Find(c => c.Token.AsSpan().SequenceEqual(answer.AsSpan(4, 8)) && Bucket(c.Address).Equals(Bucket(remote))); // the block, not the exact address: IPv6 privacy addresses change daily, and LaneProof proves who it is
+                        owner = LaneOwner(answer.AsSpan(4, 8), remote);
                         if (owner == null) Thread.Sleep(50);
                     }
                     if (owner == null) { tcp.Dispose(); return; }
@@ -982,6 +1002,7 @@ namespace TailRemote
             int noH264 = 0; // the viewer cannot show H.264: still pictures only, for this line
             int screen = 0; // which of this PC's screens the viewer asked for (0: the main one); ScreenVideo checks it
             uint acked = 0;
+            long[] ackTimes = new long[8]; // when each of the last frames' confirmations came (by number & 7)
             var got = new AutoResetEvent(false);
             bool MayClimb(long t) => step > 0 && (step - 1 >= owner.VideoFloor || t > owner.VideoFloorUntil);
             void StepDown(long t, int by)
@@ -1008,7 +1029,14 @@ namespace TailRemote
                         if (n < 1) continue;
                         switch (b![0])
                         {
-                            case Protocol.VideoGot when n == 5: Volatile.Write(ref acked, BitConverter.ToUInt32(b, 1)); got.Set(); break;
+                            case Protocol.VideoGot when n == 5:
+                                {
+                                    uint g = BitConverter.ToUInt32(b, 1);
+                                    Volatile.Write(ref ackTimes[g & 7], Environment.TickCount64); // stamped first: read only once acked says g
+                                    Volatile.Write(ref acked, g);
+                                    got.Set();
+                                    break;
+                                }
                             case Protocol.VideoAgain: Volatile.Write(ref whole, 1); got.Set(); break;
                             // The viewer cannot show H.264 (no decoder, or it keeps failing): asking for key
                             // frames for ever would leave its picture frozen, so still pictures only.
@@ -1038,6 +1066,16 @@ namespace TailRemote
                 uint ackSeen = 0;
                 long ackSeenAt = lastSent; // when a confirmation last came (or nothing was waiting for one)
                 string? said = null;
+                // The screen choice whose answer (ScreenNote) was last passed on. The agent can take a choice after
+                // the wait for it ran out (TooSlow); its answer then went nowhere, and the agent, having answered,
+                // never said it again: the picture switched, but "Screen 2 of 3" was never heard.
+                int noted = -1; // nothing passed on yet: the very first answer, lost the same way, is asked again too
+                int reasked = -1; // the ask made here last: once, so a busy agent does not say the screen line over and over
+                // How long frames take to be confirmed: the least lately (the line's own delay) against the newest.
+                // A queue building up on the way shows as the newest growing well past the least.
+                long[] sentTimes = new long[8];
+                uint latencyOf = 0;
+                long latency = 0, leastNow = long.MaxValue, leastBefore = long.MaxValue, leastSince = 0;
                 while (!_stop && Volatile.Read(ref closed) == 0 && IsController(owner))
                 {
                     long now = Environment.TickCount64;
@@ -1073,6 +1111,16 @@ namespace TailRemote
                         // is the screen being too much at this step, not "no picture". A step down, quietly.
                         if (step < VideoSettings.Ladder.Length - 1) StepDown(now, 1);
                         Volatile.Write(ref whole, 1);
+                        // A choice not answered yet is asked again (as one more ask: a choice is always answered).
+                        int sc = Volatile.Read(ref screen);
+                        if (settings.Screen != noted && settings.Screen != reasked && settings.Screen == sc)
+                        {
+                            int again = (sc & 0xFF) | ((((sc >> 8) + 1) & 0xFFFFFF) << 8);
+                            if (Interlocked.CompareExchange(ref screen, again, sc) == sc) reasked = again;
+                        }
+                        // Something every 5 seconds, as everywhere else here: each of these waits 5 seconds for the
+                        // agent, and three in a row ran past the viewer's 15 seconds, so it hung up and dialled again.
+                        if (now - lastSent > 5000) { Send(Protocol.VideoStill, default); lastSent = now; }
                         // A moment before asking again: when the agent's queue is full the answer comes at
                         // once, and asking straight back would spin a core for every viewer.
                         long retry = Environment.TickCount64 + 250;
@@ -1110,6 +1158,7 @@ namespace TailRemote
                         // Not a picture: which screen is shown and how many there are (first, and after a
                         // choice). Passed on as it is; the picture itself comes next time round, whole.
                         Send(Protocol.VideoScreen, update.AsSpan(1));
+                        noted = settings.Screen;
                         lastSent = now;
                         Volatile.Write(ref whole, 1);
                         continue;
@@ -1123,6 +1172,9 @@ namespace TailRemote
                     }
                     bool video = update[0] == ScreenVideo.VideoFrame;
                     lastWasVideo = video;
+                    // Whole by its own flag, not only when asked for here: the whole exact picture sent by itself
+                    // once motion stops was judged as a small change, so ordinary scroll-and-stop stepped it down.
+                    if (!video && update.Length > 5 && (update[5] & 1) != 0) all = true;
                     if (all && !video) wholeStep = step;
                     number++;
                     byte[] m = new byte[5 + update.Length];
@@ -1130,6 +1182,7 @@ namespace TailRemote
                     BitConverter.TryWriteBytes(m.AsSpan(1), number);
                     update.CopyTo(m, 5);
                     long sentAt = Environment.TickCount64; // before sending: the time the line takes to carry it counts
+                    sentTimes[number & 7] = sentAt;
                     lock (sendGate) link.Send(stream, m);
                     lastSent = Environment.TickCount64;
                     if (video)
@@ -1139,6 +1192,18 @@ namespace TailRemote
                         // a step down and a key frame.
                         while (Volatile.Read(ref closed) == 0 && number - Volatile.Read(ref acked) >= 4 && Environment.TickCount64 - sentAt < 2000) got.WaitOne(10);
                         long tv = Environment.TickCount64;
+                        long roomWait = tv - lastSent;
+                        uint seen = Volatile.Read(ref acked);
+                        if (seen != latencyOf && number - seen < 8)
+                        {
+                            latencyOf = seen;
+                            // From its sending to its confirmation coming, not to now: measured to now, a pause in
+                            // the motion (or a lower frame rate) looked like a queue, and climbing stopped.
+                            latency = Volatile.Read(ref ackTimes[seen & 7]) - sentTimes[seen & 7];
+                            if (tv - leastSince > 10_000) { leastBefore = leastNow; leastNow = long.MaxValue; leastSince = tv; }
+                            leastNow = Math.Min(leastNow, latency);
+                        }
+                        long least = Math.Min(leastNow, leastBefore);
                         if (number - Volatile.Read(ref acked) >= 4)
                         {
                             StepDown(tv, 1);
@@ -1149,7 +1214,10 @@ namespace TailRemote
                             while (Volatile.Read(ref closed) == 0 && number - Volatile.Read(ref acked) >= 4 && Environment.TickCount64 - tv < 15_000) got.WaitOne(50);
                             continue;
                         }
-                        if (number - Volatile.Read(ref acked) >= 3) goodSince = tv; // the line is full: no climbing
+                        // The line is full (no climbing) only when room for the next frame was long in coming. Frames
+                        // on their way alone are only the line's delay: at 60 a second, 3 of them is any ping over
+                        // 50 ms, and moving pictures never climbed back after a fall on an ordinary internet line.
+                        if (roomWait > 250 || (least != long.MaxValue && latency > least * 2 + 40)) goodSince = tv;
                         else if (MayClimb(tv) && tv - goodSince > (step >= VideoSettings.Start ? 2000 : 5000)) { step--; goodSince = tv; owner.VideoClimbed = true; }
                         // At most 60 a second, and no faster than the line carries: until then, whatever wakes
                         // this (each confirmation does) it goes back to waiting.

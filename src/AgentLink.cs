@@ -91,7 +91,16 @@ namespace TailRemote
             /// <summary>Asks the agent to read its clipboard and send it back; false if no agent is there.</summary>
             public bool GetClipboard() => _pipe != null && _out.TryAdd((GetMessage, Array.Empty<byte>()));
 
-            private readonly ConcurrentDictionary<int, System.Threading.Tasks.TaskCompletionSource<byte[]?>> _videoWaits = new();
+            // Each with the agent it was sent to: one that went (a switch of user, a sign out) never answers, and
+            // its waits end at once as "no picture", not 5 seconds later as "too slow" (which stepped the viewer's
+            // quality down whenever the next agent had connected by then).
+            private readonly ConcurrentDictionary<int, (System.Threading.Tasks.TaskCompletionSource<byte[]?> Wait, NamedPipeServerStream Pipe)> _videoWaits = new();
+
+            /// <summary>Ends every picture wait sent to an agent other than this one (all of them for null).</summary>
+            private void EndWaitsNotOn(NamedPipeServerStream? current)
+            {
+                foreach (var w in _videoWaits.Values) if (w.Pipe != current) w.Wait.TrySetResult(null);
+            }
             private int _nextVideo;
 
             /// <summary>
@@ -100,10 +109,10 @@ namespace TailRemote
             /// </summary>
             public byte[]? Video(int viewer, bool whole, VideoSettings settings)
             {
-                if (_pipe == null) return null;
+                if (_pipe is not NamedPipeServerStream sentOn) return null;
                 int id = Interlocked.Increment(ref _nextVideo);
                 var wait = new System.Threading.Tasks.TaskCompletionSource<byte[]?>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
-                _videoWaits[id] = wait;
+                _videoWaits[id] = (wait, sentOn);
                 try
                 {
                     byte[] m = new byte[21];
@@ -116,7 +125,7 @@ namespace TailRemote
                     BitConverter.TryWriteBytes(m.AsSpan(13), settings.VideoKbps);
                     BitConverter.TryWriteBytes(m.AsSpan(17), settings.Screen); // the screen and how many asks (ScreenVideo.ChooseScreen)
                     if (!_out.TryAdd((VideoMessage, m))) return TooSlow;
-                    return wait.Task.Wait(5000) ? wait.Task.Result : _pipe == null ? null : TooSlow;
+                    return wait.Task.Wait(5000) ? wait.Task.Result : _pipe != sentOn ? null : TooSlow;
                 }
                 finally { _videoWaits.TryRemove(id, out _); }
             }
@@ -160,7 +169,7 @@ namespace TailRemote
                             byte[] update = new byte[n - 5];
                             Protocol.ReadExactly(pipe, update);
                             if (_videoWaits.TryGetValue(BitConverter.ToInt32(reply, 0), out var wait))
-                                wait.TrySetResult(reply[4] == 1 ? update : null);
+                                wait.Wait.TrySetResult(reply[4] == 1 ? update : null);
                             continue;
                         }
                         byte[] p = new byte[n];
@@ -178,6 +187,7 @@ namespace TailRemote
                 // quality down after each sign in or switch of user (only a write noticed the agent had gone).
                 if (Interlocked.CompareExchange(ref _pipe, null, pipe) == pipe)
                     try { pipe.Dispose(); } catch { }
+                EndWaitsNotOn(_pipe);
             }
 
             private void AcceptLoop()
@@ -226,7 +236,11 @@ namespace TailRemote
                         // The newest agent (the session now at the screen) takes over; anything queued for the old one goes.
                         var old = Interlocked.Exchange(ref _pipe, pipe);
                         try { old?.Dispose(); } catch { }
-                        while (_out.TryTake(out _)) { }
+                        // A picture asked for and thrown away here would never be answered: its wait ends now.
+                        while (_out.TryTake(out var gone))
+                            if (gone.Item1 == VideoMessage && gone.Item2.Length >= 4 && _videoWaits.TryGetValue(BitConverter.ToInt32(gone.Item2, 0), out var w))
+                                w.Wait.TrySetResult(null);
+                        EndWaitsNotOn(pipe);
                         var linked = pipe;
                         new Thread(() => ReadLoop(linked)) { IsBackground = true, Name = "Kova agent link in" }.Start();
                         ServiceHost.Log("The agent in the signed-in session is connected.");
