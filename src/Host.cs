@@ -112,6 +112,15 @@ namespace TailRemote
             public bool DrivesBusy; // under ListGate: the drive list, listed beside a slow folder
             public readonly Queue<(byte[] Id, string Path)> ListQueue = new(); // folders asked for while one was being listed; under ListGate
             public readonly object ListGate = new();
+            // The host's NVDA as text (NvdaWant): what it asked for, and its own queue, sent in order by one
+            // pool thread at a time, so a PC that stops reading holds up nobody else and lines never swap places.
+            public volatile byte NvdaWant;
+            public readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> NvdaOut = new();
+            public int NvdaPumping;
+            // Its microphone: the newest packet number seen (an older one is a replay or hopelessly late), and
+            // whether it was told another PC's microphone is already on.
+            public uint MicHigh;
+            public bool MicAny, MicBusyTold;
         }
 
         private string? _captureDevice;
@@ -125,6 +134,7 @@ namespace TailRemote
             _key = Protocol.DeriveKey(password, _salt);
             _listenKey = string.IsNullOrEmpty(listenPassword) ? null : Protocol.DeriveKey(listenPassword, _salt);
             _status = msg => { DiagLog.Write("host: " + msg); status(msg); };
+            _mic = new MicIn(() => _captureDevice, _status);
             _screenSource = new ScreenSource();
             var screen = new ScreenVideo(_screenSource.Take, _screenSource.Screens);
             VideoUpdate = screen.Update;
@@ -163,11 +173,190 @@ namespace TailRemote
             new Thread(UdpLoop) { IsBackground = true, Name = "Kova host udp" }.Start();
         }
 
+        // ---- The controlling PC's microphone (MicIn) ----
+
+        private readonly MicIn _mic;
+        private readonly object _micGate = new();
+        private Session? _micOwner; // under _micGate: whose microphone plays (one at a time)
+        private long _micOwnerAt;
+
+        /// <summary>The output chosen on this PC for the controlling PC's microphone ("" or null: Kova picks a virtual cable).</summary>
+        public string? MicDevice { get => _mic.Chosen; set => _mic.Chosen = value; }
+
+        /// <summary>Test only: whether a microphone is being played.</summary>
+        internal bool TestMicPlaying => _mic.Playing;
+
+        private void HandleMic(byte[] d, IPEndPoint from)
+        {
+            var s = Array.Find(AllSessions(), x => d.AsSpan(1, 8).SequenceEqual(x.Token));
+            // Only a PC controlling this one: a listener hears, it never speaks into this PC.
+            if (s == null || s.Role != Protocol.RoleControl || !s.Ready) return;
+            var addr = from.Address.IsIPv4MappedToIPv6 ? from.Address.MapToIPv4() : from.Address;
+            if (!Bucket(addr).Equals(Bucket(s.Address))) return;
+            if (!s.Link.OpenMic(d, d.Length)) return; // forged or damaged
+            int ticks = d[Protocol.MicHeadBytes];
+            if (ticks < 1 || ticks > 24) return;
+            uint seq = BitConverter.ToUInt32(d, 9);
+            // Only newer than every packet seen from it: a packet played back (even the newest, over and over) is nothing, so a
+            // recording can neither be heard again nor keep the microphone (and its device) taken. A packet that arrives
+            // after a newer one would be too late to play anyway.
+            if (s.MicAny && (int)(seq - s.MicHigh) <= 0) return;
+            s.MicHigh = seq;
+            s.MicAny = true;
+            long now = Environment.TickCount64;
+            lock (_micGate)
+            {
+                if (Array.IndexOf(AllSessions(), s) < 0) return; // it has just ended: never the owner again
+                if (_micOwner != s)
+                {
+                    // Still connected: looked up in the ready-made list, never under _gate (End holds _gate and then takes this lock).
+                    if (_micOwner != null && now - _micOwnerAt < 1500 && Array.IndexOf(AllSessions(), _micOwner) >= 0)
+                    {
+                        if (!s.MicBusyTold) { s.MicBusyTold = true; Tell(s, Protocol.MicNote, "Another PC's microphone is already on there. Yours plays once theirs is off."); }
+                        return;
+                    }
+                    _mic.Stop(); // a new owner starts afresh
+                    _micOwner = s;
+                    s.MicBusyTold = false;
+                    Tell(s, Protocol.MicQuality, new[] { (byte)Protocol.MicBestStep });
+                }
+                _micOwnerAt = now;
+            }
+            var owner = s;
+            _mic.Push(seq, ticks, d.AsSpan(Protocol.MicHeadBytes + 1, d.Length - Protocol.MicHeadBytes - 1 - SecureLink.TagSize), msg => Tell(owner, Protocol.MicNote, msg));
+        }
+
+        /// <summary>The microphone's owner said it is off, or went: the device is let go at once.</summary>
+        private void MicOff(Session s)
+        {
+            lock (_micGate)
+            {
+                if (_micOwner != s) return;
+                _micOwner = null;
+            }
+            _mic.Stop();
+        }
+
+        /// <summary>Once a second: the microphone's step, and letting go of its device when it stops coming.</summary>
+        private void MicTick()
+        {
+            Session? owner;
+            lock (_micGate) owner = _micOwner;
+            int step = _mic.Tick(owner == null ? null : msg => Tell(owner, Protocol.MicNote, msg));
+            if (step >= 0 && owner != null) Tell(owner, Protocol.MicQuality, new[] { (byte)step });
+        }
+
+        // ---- This PC's NVDA as text: NVDA's own Speech Viewer and Braille Viewer, hidden and read (NvdaViewers) ----
+
+        /// <summary>
+        /// The service's way to its agent, which reads NVDA's viewers at the screen: called with what the controlling
+        /// PCs want (Protocol.NvdaSpeechFlag...). Null (the window): this process reads them itself, if it may.
+        /// </summary>
+        public Action<byte>? NvdaRequest { get; init; }
+        private NvdaViewers? _nvda;
+        private byte _nvdaFlags;
+        private string? _nvdaProblem; // why NVDA's text cannot come right now, or null
+        private readonly object _nvdaGate = new();
+
+        public const string NvdaNotElevated = "The remote PC's NVDA speech can only come through when Kova there runs as the Windows service, or as administrator with Start hosting when Windows starts.";
+
+        /// <summary>
+        /// The window hosting: NVDA's viewers are kept hidden for as long as this PC hosts, whoever is connected, so they
+        /// never show up on its screen or in Alt Tab. Only an administrator's Kova may hide NVDA's windows (Windows keeps
+        /// other programs off them), so a plain one never touches them and says why to a PC that asks.
+        /// </summary>
+        public void StartNvdaHere()
+        {
+            if (NvdaRequest != null) return;
+            lock (_nvdaGate)
+            {
+                if (_nvda != null || _stop) return;
+                if (!Startup.IsElevated()) { _nvdaProblem = NvdaNotElevated; return; }
+                var v = new NvdaViewers(m => DiagLog.Write("host: " + m), null);
+                v.Spoke += NvdaLines;
+                v.Braille += NvdaBrailleNow;
+                v.Problem += NvdaProblemNow;
+                _nvda = v;
+            }
+        }
+
+        /// <summary>The flags every PC wants together changed: the reader is told.</summary>
+        private void NvdaWantsChanged()
+        {
+            byte f = 0;
+            Action<byte>? request;
+            lock (_nvdaGate)
+            {
+                // Worked out under the lock: two threads (a reader, a session ending) must not store an older answer last.
+                foreach (var x in AllSessions()) f |= x.NvdaWant;
+                if (f == _nvdaFlags) return;
+                _nvdaFlags = f;
+                request = NvdaRequest;
+                if (_nvda != null) { _nvda.ReadSpeech = (f & Protocol.NvdaSpeechFlag) != 0; _nvda.ReadBraille = (f & Protocol.NvdaBrailleFlag) != 0; }
+                request?.Invoke(f); // in order, under the lock (it only queues the message to the agent)
+            }
+        }
+
+        /// <summary>Lines NVDA spoke here: to every PC that wants them, in order.</summary>
+        public void NvdaLines(string[] lines)
+        {
+            if (lines.Length == 0) return;
+            byte[] m = Protocol.TextMessage(Protocol.NvdaSpeech, string.Join("\n", lines));
+            foreach (var s in AllSessions()) if ((s.NvdaWant & Protocol.NvdaSpeechFlag) != 0) Queue(s, m);
+        }
+
+        /// <summary>What this PC's braille display shows now.</summary>
+        public void NvdaBrailleNow(string text)
+        {
+            byte[] m = Protocol.TextMessage(Protocol.NvdaBraille, text);
+            foreach (var s in AllSessions()) if ((s.NvdaWant & Protocol.NvdaBrailleFlag) != 0) Queue(s, m);
+        }
+
+        /// <summary>Why NVDA's text cannot come (null: it can again). Said to every PC that wants it, when it changes.</summary>
+        public void NvdaProblemNow(string? why)
+        {
+            string? was;
+            lock (_nvdaGate) { was = _nvdaProblem; _nvdaProblem = why; }
+            if (was == why) return;
+            string say = why ?? "The remote PC's NVDA speech is coming through now.";
+            foreach (var s in AllSessions()) if (s.NvdaWant != 0) Queue(s, Protocol.TextMessage(Protocol.NvdaNote, say));
+        }
+
+        /// <summary>Into the PC's own NVDA queue, sent by one pool thread at a time; a PC far behind loses its oldest lines.</summary>
+        private static void Queue(Session s, byte[] m)
+        {
+            s.NvdaOut.Enqueue(m);
+            while (s.NvdaOut.Count > 256) s.NvdaOut.TryDequeue(out _);
+            if (Interlocked.CompareExchange(ref s.NvdaPumping, 1, 0) != 0) return;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                while (true)
+                {
+                    while (s.NvdaOut.TryDequeue(out var next)) { try { s.Link.Send(s.Stream, next); } catch { s.NvdaOut.Clear(); } }
+                    Volatile.Write(ref s.NvdaPumping, 0);
+                    // Something came in after the queue looked empty: this thread carries on, unless another took over.
+                    if (s.NvdaOut.IsEmpty || Interlocked.CompareExchange(ref s.NvdaPumping, 1, 0) != 0) return;
+                }
+            });
+        }
+
+        /// <summary>A small message to one PC, off the caller's thread (the UDP thread must never wait on a connection).</summary>
+        private static void Tell(Session s, byte type, string text) => Tell(s, type, System.Text.Encoding.UTF8.GetBytes(text));
+        private static void Tell(Session s, byte type, byte[] body)
+        {
+            byte[] m = new byte[1 + body.Length];
+            m[0] = type;
+            body.CopyTo(m, 1);
+            ThreadPool.QueueUserWorkItem(_ => { try { s.Link.Send(s.Stream, m); } catch { } });
+        }
+
         public void Dispose()
         {
             _stop = true;
             _wifi?.Dispose();
             _screenSource?.Dispose();
+            _mic.Dispose();
+            lock (_nvdaGate) { _nvda?.Dispose(); _nvda = null; }
             try { _listener.Stop(); } catch { }
             try { _udp.Dispose(); } catch { }
             LoopbackCapture? c;
@@ -591,6 +780,7 @@ namespace TailRemote
                 // Taken every second, logging or not: left adding up for months they wrapped round, and the
                 // first line after logging was turned on said nonsense.
                 int packets = Interlocked.Exchange(ref _txPackets, 0), bytes = Interlocked.Exchange(ref _txBytes, 0);
+                try { MicTick(); } catch { }
                 if (!DiagLog.Enabled) continue;
                 int fills = Interlocked.Exchange(ref LoopbackCapture.TestGapFills, 0);
                 int fillMs = Interlocked.Exchange(ref LoopbackCapture.TestGapFillMs, 0);
@@ -1492,6 +1682,21 @@ namespace TailRemote
                     case Protocol.FilePace when m.Length == 5:
                         Volatile.Write(ref s.Pace, Math.Max(16 << 10, BitConverter.ToUInt32(m, 1) * 1024.0));
                         break;
+                    case Protocol.NvdaWant when m.Length == 2:
+                        {
+                            byte want = (byte)(m[1] & (Protocol.NvdaSpeechFlag | Protocol.NvdaBrailleFlag));
+                            byte was = s.NvdaWant;
+                            s.NvdaWant = want;
+                            NvdaWantsChanged();
+                            string? problem;
+                            lock (_nvdaGate) problem = _nvdaProblem;
+                            // Asked for it just now: told at once if it cannot come (a missing viewer is found out by the reader).
+                            if (was == 0 && want != 0 && problem != null) Queue(s, Protocol.TextMessage(Protocol.NvdaNote, problem));
+                            break;
+                        }
+                    case Protocol.MicState when m.Length == 2:
+                        if (m[1] == 0) MicOff(s);
+                        break;
                     case Protocol.Features when m.Length >= 5:
                         s.PeerFeatures = BitConverter.ToUInt32(m, 1);
                         s.Ready = true;
@@ -1653,6 +1858,9 @@ namespace TailRemote
         private void End(Session s, string? why)
         {
             ReleaseHeld(s);
+            MicOff(s);
+            // Worked out again once it has left the list of sessions (End is called under _gate, before Rebuild).
+            if (s.NvdaWant != 0) { s.NvdaWant = 0; ThreadPool.QueueUserWorkItem(_ => NvdaWantsChanged()); }
             if (s.Files is FileChannel f)
             {
                 // Kept for the controller's next connection (a dropped one comes straight back),
@@ -1762,6 +1970,12 @@ namespace TailRemote
                 byte[] d;
                 try { d = _udp.Receive(ref any); }
                 catch { if (_stop) return; Thread.Sleep(20); continue; }
+                if (d.Length >= Protocol.MinMicPacketBytes && d[0] == Protocol.UdpMic)
+                {
+                    if (d.Length <= Protocol.MicHeadBytes + 1 + Protocol.MaxOpusBytes + SecureLink.TagSize)
+                        try { HandleMic(d, any); } catch (Exception e) { DiagLog.Write("host: microphone packet failed: " + e.Message); }
+                    continue;
+                }
                 if (d.Length != Protocol.UdpHelloBytes || d[0] != Protocol.UdpHello) continue;
                 Session? s;
                 s = Array.Find(AllSessions(), x => d.AsSpan(1, 8).SequenceEqual(x.Token));

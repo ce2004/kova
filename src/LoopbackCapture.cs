@@ -31,16 +31,26 @@ namespace TailRemote
 
         /// <summary>The device being recorded, for the log.</summary>
         public static string DeviceInfo = "none yet";
+        /// <summary>The microphone being recorded (on a controlling PC), for the log.</summary>
+        public static string MicInfo = "none yet";
 
-        /// <summary>deviceId: the output to record, or null for Windows' default (followed when it changes). firstSeq: the first packet number.</summary>
-        public LoopbackCapture(Action<uint, short[]?> onPacket, Action<string> status, string? deviceId, uint firstSeq)
+        // The controlling PC's microphone (a recording device) instead of what an output plays.
+        private readonly bool _microphone;
+        private string Who => _microphone ? "microphone" : "host capture";
+
+        /// <summary>
+        /// deviceId: the output to record, or null for Windows' default (followed when it changes). firstSeq: the first
+        /// packet number. microphone: record that recording device (or the default microphone) instead.
+        /// </summary>
+        public LoopbackCapture(Action<uint, short[]?> onPacket, Action<string> status, string? deviceId, uint firstSeq, bool microphone = false)
         {
+            _microphone = microphone;
             _seq = firstSeq;
             _deviceId = string.IsNullOrEmpty(deviceId) ? null : deviceId;
             _onPacket = onPacket;
             _emit = Emit;
             _status = status;
-            _thread = new Thread(Run) { IsBackground = true, Name = "Kova capture", Priority = ThreadPriority.Highest };
+            _thread = new Thread(Run) { IsBackground = true, Name = microphone ? "Kova microphone" : "Kova capture", Priority = ThreadPriority.Highest };
             _thread.Start();
         }
 
@@ -85,14 +95,15 @@ namespace TailRemote
                 {
                     // Unplugged or changed: open whatever is the output now, quietly (the controlling PCs
                     // used to hear "Host audio is not available" for a pair of headphones).
-                    DiagLog.Write("host capture: the device changed under us; reopening");
+                    DiagLog.Write(Who + ": the device changed under us; reopening");
                     Thread.Sleep(100);
                 }
                 catch (Exception e)
                 {
-                    string msg = "Host audio is not available: " + e.Message +
+                    string msg = _microphone ? "Your microphone is not working: " + e.Message + " Check it in Settings, Microphone to use."
+                        : "Host audio is not available: " + e.Message +
                         " A cloud PC usually has no sound card; install a virtual audio device such as VB-Cable and make it the default output.";
-                    DiagLog.Write("host capture error: " + e);
+                    DiagLog.Write(Who + " error: " + e);
                     if (msg != lastError) _status(msg);
                     lastError = msg;
                     // Quickly at first (at boot, Windows' audio may be a moment from ready: every quarter
@@ -118,16 +129,17 @@ namespace TailRemote
             {
                 // The chosen output, or Windows' default when none is chosen or it has gone.
                 en = Wasapi.Enumerator();
-                dev = Wasapi.OutputDevice(en, _deviceId);
+                dev = _microphone ? Wasapi.InputDevice(en, _deviceId) : Wasapi.OutputDevice(en, _deviceId);
                 dev.GetId(out string devId);
                 bool followDefault = _deviceId == null || devId != _deviceId;
                 client = Wasapi.Activate(dev);
                 client.GetMixFormat(out fmtPtr);
                 var fmt = Wasapi.ReadFormat(fmtPtr);
                 var mix = Downmix.For(fmt.Channels, ChannelMask(fmtPtr));
-                DeviceInfo = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
-                DiagLog.Write("host capture: opened " + DeviceInfo + (followDefault ? " (Windows default)" : " (chosen device)"));
-                client.Initialize(0, Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                string info = (Wasapi.FriendlyName(dev) ?? devId) + ", " + fmt.Rate + " Hz, " + fmt.Channels + " channels, " + fmt.Bits + "-bit" + (fmt.IsFloat ? " float" : "");
+                if (_microphone) MicInfo = info; else DeviceInfo = info;
+                DiagLog.Write(Who + ": opened " + info + (followDefault ? " (Windows default)" : " (chosen device)"));
+                client.Initialize(0, (_microphone ? 0 : Wasapi.AUDCLNT_STREAMFLAGS_LOOPBACK) | Wasapi.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                     200_000, 0, fmtPtr, IntPtr.Zero);
                 Marshal.FreeCoTaskMem(fmtPtr);
                 fmtPtr = IntPtr.Zero; // freed: the finally must not free it again
@@ -207,7 +219,7 @@ namespace TailRemote
                         lastDeviceCheck = now;
                         // Reopen when the default output changes (if following it), or when
                         // the chosen output that was missing comes back.
-                        var want = Wasapi.OutputDevice(en, _deviceId);
+                        var want = _microphone ? Wasapi.InputDevice(en, _deviceId) : Wasapi.OutputDevice(en, _deviceId);
                         string curId;
                         try { want.GetId(out curId); }
                         finally { Wasapi.Release(want); }

@@ -52,6 +52,16 @@ namespace TailRemote
         // its window comes back here and leaves it on; unticking it (here or Control Shift S) turns it off.
         private readonly MenuItem _watch = new("Show the remote &screen") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.S };
         private VideoForm? _screen;
+        // This PC's microphone to the remote PC: a checkbox, off every time Kova starts (never saved). Control Shift M
+        // in the Kova window. Only the PC in front hears it; listen-only connections never get it.
+        private readonly MenuItem _micItem = new("&Your microphone to the remote PC") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.M, Tag = Menus.KeepOpenTag };
+        private bool _micOn;
+        private readonly MenuChoice _micDevice = new("Microphone to &use");
+        // Host: where the controlling PC's microphone plays. Kova's own pick first: a virtual cable that is not what it sends.
+        private readonly MenuChoice _micOutput = new("Microphone from the controlling PC plays &into");
+        private readonly System.Collections.Generic.List<(string Id, string Name)> _micDevices = new(), _micOutputs = new();
+        // The remote NVDA: heard through the remote PC's sound, said here as text (and brailled) with no remote sound, or both.
+        private readonly MenuChoice _remoteNvda = new("Remote NVDA spea&king");
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
         private readonly MenuItem _getClipboard = new("Get the &remote PC's clipboard") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
         private readonly MenuItem _announceQuality = Menus.Check("A&nnounce when the sound quality changes");
@@ -114,6 +124,21 @@ namespace TailRemote
             {
                 Fill(_device, _outDevices, _settings.OutputDevice, "output");
                 Fill(_captureFrom, _capDevices, _settings.CaptureDevice, "capture");
+                // The microphone's lists the same way: recording devices here, and on a host its outputs, Kova's pick first.
+                _micDevices.Clear();
+                _micDevices.Add(("", "Windows default"));
+                _micDevices.AddRange(Wasapi.InputDevices());
+                if (_settings.MicDevice.Length > 0 && !_micDevices.Exists(d => d.Id == _settings.MicDevice)) _micDevices.Add((_settings.MicDevice, "The microphone chosen before (not connected now: Windows default until it is back)"));
+                _micDevice.Clear();
+                foreach (var d in _micDevices) _micDevice.Add(d.Name);
+                _micDevice.SelectedIndex = Math.Max(0, _micDevices.FindIndex(d => d.Id == _settings.MicDevice));
+                _micOutputs.Clear();
+                _micOutputs.Add(("", "a virtual cable Kova picks, never the one it sends"));
+                _micOutputs.AddRange(now);
+                if (_settings.MicOutput.Length > 0 && !_micOutputs.Exists(d => d.Id == _settings.MicOutput)) _micOutputs.Add((_settings.MicOutput, "The device chosen before (not connected now)"));
+                _micOutput.Clear();
+                foreach (var d in _micOutputs) _micOutput.Add(d.Name);
+                _micOutput.SelectedIndex = Math.Max(0, _micOutputs.FindIndex(d => d.Id == _settings.MicOutput));
             }
             finally { _fillingDevices = false; _fillingCapture = wasFilling; }
         }
@@ -178,7 +203,7 @@ namespace TailRemote
             var file = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _go, _switchTo, _wake, _toggle, _watch, _restart, _remoteInfo, _updateRemote, _streaming.Item, new ToolStripSeparator(),
+                _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 _mode.Menu, _saved.Menu, _address.Item, _port.Item, _password.Item, _listenPassword.Item, _copyAddress,
                 _savePc, _forgetPc, new ToolStripSeparator(),
@@ -192,7 +217,7 @@ namespace TailRemote
             var set = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _speedUp, _sounds, new ToolStripSeparator(),
+                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _remoteNvda.Menu, _micDevice.Menu, _micOutput.Menu, _speedUp, _sounds, new ToolStripSeparator(),
                 _startup, _service, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
                 _backup, _restore, _logging,
             });
@@ -254,6 +279,29 @@ namespace TailRemote
             };
             _captureFrom.SelectedIndexChanged += (_, _) => CaptureChanged();
             set.DropDownOpening += (_, _) => FillDevices();
+            _micItem.Click += (_, _) => ToggleMic();
+            _micDevice.SelectedIndexChanged += (_, _) =>
+            {
+                if (_fillingDevices) return;
+                SaveSettings();
+                ApplyMic(); // a microphone that is on moves to the new one at once
+            };
+            _micOutput.SelectedIndexChanged += (_, _) =>
+            {
+                if (_fillingDevices) return;
+                SaveSettings();
+                if (_host != null) _host.MicDevice = _settings.MicOutput;
+                if (_service.Checked) Say("Press Apply settings to the service to use this there too.");
+            };
+            _remoteNvda.Add("through the remote PC's sound");
+            _remoteNvda.Add("here, as text and braille from this PC's NVDA, with no remote sound");
+            _remoteNvda.Add("both: the remote sound, and text and braille here");
+            _remoteNvda.SelectedIndex = Math.Clamp(_settings.RemoteNvda, 0, 2);
+            _remoteNvda.SelectedIndexChanged += (_, _) =>
+            {
+                SaveSettings();
+                if (_client != null) { ApplyNvda(_client); SayIfNoNvda(_client); }
+            };
 
             _mode.SelectedIndexChanged += (_, _) => UpdateMode();
             _saved.SelectedIndexChanged += (_, _) => UseSaved();
@@ -364,6 +412,8 @@ namespace TailRemote
             _copyAddress.Available = host;
             if (host) FillMyAddress();
             _captureFrom.Menu.Available = host;
+            _micOutput.Menu.Available = host;
+            _micItem.Available = _micDevice.Menu.Available = _remoteNvda.Menu.Available = !host;
             _speedUp.Available = !host; // it is about how this PC plays the sound
             _sounds.Available = !host; // a host's sounds would go out with its own sound
             _quality.Menu.Available = !host; // the host always sends the best unless asked for less
@@ -755,6 +805,50 @@ namespace TailRemote
 
         // ---- Which output the host sends ----
 
+        // ---- Your microphone to the remote PC, and the remote NVDA as text ----
+
+        /// <summary>Control Shift M, or the File menu: turns this PC's microphone on or off for the PC in front.</summary>
+        private void ToggleMic()
+        {
+            if (HostMode) { Say("Your microphone goes to a PC you control, in Control another PC mode."); return; }
+            _micOn = !_micOn;
+            _micItem.Checked = _micOn;
+            ApplyMic();
+            if (!_micOn) { Say("Microphone off."); return; }
+            var c = _client;
+            if (c == null) Say("Microphone on. It goes to the remote PC once you connect.");
+            else if (c.ListenOnly) Say("Microphone on, but it never goes to a PC you only listen to.");
+            else if (c.HostVersion != null && !c.CanMic) Say("Microphone on, but the remote PC's Kova is too old to take it. Update it with File, Update the remote PC.");
+            else Say("Microphone on.");
+        }
+
+        /// <summary>The microphone, to the PC in front only, on the chosen recording device.</summary>
+        private void ApplyMic()
+        {
+            string device = _micDevices.Count > 0 ? _micDevices[Math.Max(0, _micDevice.SelectedIndex)].Id : _settings.MicDevice;
+            _client?.SetMic(_micOn, device);
+        }
+
+        private void SayIfNoMic(Client c)
+        {
+            if (_micOn && !c.ListenOnly && !c.CanMic) Speak("The remote PC's Kova is too old to take your microphone. Update it with File, Update the remote PC.");
+        }
+
+        /// <summary>Settings, Remote NVDA speaking: its sound, its text here, or both.</summary>
+        private void ApplyNvda(Client c)
+        {
+            int mode = Math.Max(0, _remoteNvda.SelectedIndex);
+            // Its sound is only given up for text a host can send: an older one would leave nothing at all.
+            c.SoundOff = mode == 1 && c.CanNvda;
+            c.NvdaText = mode >= 1;
+        }
+
+        private void SayIfNoNvda(Client c)
+        {
+            if (_remoteNvda.SelectedIndex >= 1 && c.HostVersion != null && !c.CanNvda)
+                Speak("The remote PC's Kova is too old to send its NVDA speech as text. Update it with File, Update the remote PC.");
+        }
+
         private void CaptureChanged()
         {
             if (_fillingCapture) return; // refilled as the Settings menu opens: nothing was changed
@@ -991,6 +1085,7 @@ namespace TailRemote
         {
             if (_keys?.Remote == true) { _quietModeChange = true; _keys.Toggle(); } // keys come home first
             _keys?.SetClient(null);
+            c.SetMic(false, null); // only the PC in front hears the microphone
             c.Muted = true;
             c.LockedStep = Protocol.OpusSteps.Length - 1; // a few kilobits, so it takes nothing from the one in front
             _parked.Add(new Parked(NameFor(FrontAddress, FrontPort), FrontAddress, FrontPort, FrontPassword, c));
@@ -1031,6 +1126,8 @@ namespace TailRemote
             c.LockedStep = _quality.SelectedIndex - 1;
             c.StartBest();
             ApplyMute();
+            ApplyNvda(c);
+            ApplyMic();
             if (!c.ListenOnly) _keys?.SetClient(c);
             Tone(Sounds.Tone.Connected);
             Say("Switched to " + p.Name + "." + (c.ListenOnly ? " Listen only." : " Press Control Shift Enter to control it.") + DroppedNote());
@@ -1374,6 +1471,7 @@ namespace TailRemote
                 _muteLocal.Checked = _settings.MuteWhenNotControlling;
                 _rideOut.Checked = _settings.RideOutStalls;
                 _quality.SelectedIndex = Math.Clamp(_settings.SoundQuality + 1, 0, _quality.Count - 1);
+                _remoteNvda.SelectedIndex = Math.Clamp(_settings.RemoteNvda, 0, 2);
                 FillDevices();
                 // A restored output device is used at once, as choosing it in the menu does.
                 if (_player != null && _playerDevice != _settings.OutputDevice) { _player.SetDevice(_settings.OutputDevice); _playerDevice = _settings.OutputDevice; }
@@ -1869,6 +1967,9 @@ namespace TailRemote
             _settings.MuteWhenNotControlling = _muteLocal.Checked;
             _settings.RideOutStalls = _rideOut.Checked;
             _settings.SoundQuality = _quality.SelectedIndex - 1;
+            if (_micDevices.Count > 0) _settings.MicDevice = _micDevices[Math.Max(0, _micDevice.SelectedIndex)].Id;
+            if (_micOutputs.Count > 0) _settings.MicOutput = _micOutputs[Math.Max(0, _micOutput.SelectedIndex)].Id;
+            _settings.RemoteNvda = Math.Max(0, _remoteNvda.SelectedIndex);
             SaveNow(now: closing, retries: closing ? 5 : 1);
         }
 
@@ -1939,6 +2040,8 @@ namespace TailRemote
                 _host.ClipboardRequested += () => SendClipboardToControllers(hosting); // a controller pulled this host's clipboard
                 _host.TransferProgress += t => Later(() => ShowTransfer(t));
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
+                _host.MicDevice = _settings.MicOutput;
+                _host.StartNvdaHere(); // keeps NVDA's Speech Viewer and Braille Viewer hidden while hosting (as administrator)
                 Say("Hosting on port " + port + ". Waiting for a connection." + (listen.Length > 0 ? " Listening with the listen-only password is on." : ""));
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
@@ -2221,7 +2324,16 @@ namespace TailRemote
                 c.HealthAlert += text => Later(() => HealthSaid(c, text));
                 c.WakeInfoKnown += info => Later(() => RememberWake(address, port, info));
                 if (c.WakeInfo is string knownNow) RememberWake(address, port, knownNow); // it can come before the line above
+                // The remote NVDA's words go straight to this PC's NVDA from the network thread (never waiting on the
+                // window); the connection only raises them while it is the one heard.
+                c.NvdaSpoke += lines => Speech.Remote(lines, c.TakeKeyPressed());
+                c.NvdaBraille += Speech.Braille;
+                c.NvdaNote += note => Later(() => { if (c == _client) Speak(note); });
+                c.MicNote += note => Later(() => { if (c == _client) Speak(note); });
+                c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoMic(c); SayIfNoNvda(c); } });
                 _client = c;
+                ApplyNvda(c);
+                ApplyMic();
                 if (!c.ListenOnly) _keys?.SetClient(c); // a listener never sends keys
                 ApplyMute();
                 bool wasReconnecting = _reconnecting;

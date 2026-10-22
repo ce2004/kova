@@ -1,3 +1,10 @@
+4.3.0
+New feature: your microphone can go to the PC you control. Turn it on with File, Your microphone to the remote PC, or Control Shift M in the Kova window, and off the same way. It is off every time Kova starts. Choose which microphone in Settings, Microphone to use.
+New feature: on the remote PC your microphone comes out of a virtual cable, so programs there such as TeamTalk or a call can use it as their microphone. Kova picks a cable that is not the one it sends you, so you never hear yourself. On a cloud PC whose only sound device is the Kova one, install a second cable there, such as VB-Audio's Hi-Fi Cable, and Kova finds it by itself. Kova says where your microphone went, or why it could not.
+New feature: Settings, Remote NVDA speaking. Choose to hear the remote PC's NVDA through its sound as before, to have your own NVDA say its speech as text and show its braille, with no remote sound at all, or both. No NVDA add-on is needed: Kova uses NVDA's own Speech Viewer and Braille Viewer on the remote PC and keeps them hidden, off the screen and out of Alt Tab. Turn them on once in NVDA there: NVDA menu, Tools, Speech Viewer, and check Show Speech Viewer on Startup. The same for the Braille Viewer if you want braille.
+Changed: while Kova hosts as the Windows service, or as administrator, it keeps NVDA's Speech Viewer and Braille Viewer hidden and empties them as it goes, so they never grow.
+Both PCs need 4.3.0 for these. Update the PC you control with File, Update the remote PC.
+
 4.2.0
 Bug fixed: if your internet connection sends each new connection out from a different address, as some university, office and phone networks do, Send the clipboard, Send files and the remote screen never got through to the other PC, without a word. Now they arrive. Update the PC you control to get this fix.
 New feature: the Windows service now runs the copy of Kova you turned it on from, wherever it is, such as Documents or an apps folder, instead of its own copy in Program Files. A service already set up in Program Files keeps working there. To move it, turn Run as a Windows service off and on again from the copy you use.

@@ -85,6 +85,9 @@ namespace TailRemote
         public const byte Mouse = 15;     // u8 kind (MouseMove: i16 dx, i16 dy; MouseWheel / MouseSideWheel: i16 amount, i16 0). Buttons go as Key (Native.VkLeftButton...)
         public const byte MouseMove = 0, MouseWheel = 1, MouseSideWheel = 2;
         public const byte WakeRequest = 16; // 6-byte network card address: send a Wake-on-LAN packet on the host's network (Wake)
+        public const byte NvdaWant = 17;  // u8 flags (NvdaSpeechFlag, NvdaBrailleFlag): what of the host's NVDA this PC wants as text; 0 = nothing
+        public const byte MicState = 18;  // u8 1 = this PC's microphone is on (its packets follow over UDP), 0 = off: the host lets go of the device at once
+        public const byte NvdaSpeechFlag = 1, NvdaBrailleFlag = 2;
         public const byte ClipboardRequest = 13; // the controller asks the host to send its clipboard here (text or files), like Send the clipboard but pulled
         // A clipboard pull reads the clipboard and fans a transfer out to every controller; the host
         // window's message pump drowns under the progress updates if the controller mashes or holds
@@ -102,6 +105,11 @@ namespace TailRemote
         public const byte SpeedResult = 0x87; // UTF-8 lines: the host's internet speed test
         public const byte WakeInfo = 0x88;    // UTF-8 (Wake.Describe): the host's network cards, kept with the saved PC to wake it later
         public const byte HealthAlert = 0x89; // UTF-8 sentence: something about the host PC worth saying (HealthWatch)
+        public const byte MicNote = 0x8A;     // UTF-8 sentence about this PC's microphone on the host (where it plays, or why it cannot)
+        public const byte MicQuality = 0x8B;  // u8: the bitrate step the host wants the microphone sent at (it follows how the microphone arrives)
+        public const byte NvdaSpeech = 0x8C;  // UTF-8 lines the host's NVDA spoke, one per line (NvdaViewers)
+        public const byte NvdaBraille = 0x8D; // UTF-8: what the host's braille display shows now
+        public const byte NvdaNote = 0x8E;    // UTF-8 sentence: why the host's NVDA text cannot come (no Speech Viewer, not allowed to hide it)
         public const byte Leaving = 0x83; // u8 why (Leaving*), then UTF-8 detail (the new version when updating): sent just before the host closes on purpose
         // 0x84 was CaptureBurst (1.7.x): no longer sent, never reuse it
 
@@ -115,6 +123,13 @@ namespace TailRemote
         public const byte UdpPong = 0xA8;   // stamp[8] mac[16], host to client: the hello's stamp straight back, so the audio path's own ping is measured
         // 0xA1 to 0xA5 were the lossless formats (up to 1.7): never reuse them
         public const byte UdpOpus = 0xA6; // u32 sequence (5 ms ticks), then sealed: u8 ticks, Opus packet
+        // The controller's microphone, controller to host: token (8, so the host knows whose), u32 sequence (5 ms ticks, from 0
+        // per connection), then sealed with the microphone's own key: u8 ticks, Opus packet. Never from a listen-only connection.
+        public const byte UdpMic = 0xA7;
+        public const int MicHeadBytes = 1 + 8 + 4;
+        public const int MinMicPacketBytes = MicHeadBytes + 1 + SecureLink.TagSize;
+        /// <summary>The microphone's best step (128 kbit/s in 5 ms packets: low delay, and plenty for a voice) and where it starts.</summary>
+        public const int MicBestStep = 4;
 
         // Roles
         public const byte RoleControl = 1, RoleListen = 2;
@@ -133,6 +148,8 @@ namespace TailRemote
         public const uint FeatureVideo = 512; // the remote screen (video lanes)
         public const uint FeatureMouse = 1024; // Mouse messages and mouse buttons as keys
         public const uint FeatureWake = 2048;  // WakeRequest
+        public const uint FeatureMic = 4096;   // takes the controller's microphone (UdpMic, MicState)
+        public const uint FeatureNvda = 8192;  // sends its NVDA's speech and braille as text (NvdaWant)
 
         /// <summary>
         /// The bitrate steps, best first. 5 ms packets down to 128 kbit/s (Opus's
@@ -154,7 +171,7 @@ namespace TailRemote
         public static int WireKbps(int step) => OpusSteps[step].Kbps + 1000 / OpusSteps[step].Ms * PacketOverheadBytes * 8 / 1000;
 
         /// <summary>What this version supports, sent to the other side after login.</summary>
-        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake;
+        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda;
 
 
         // ---- The login, damage-proof ----

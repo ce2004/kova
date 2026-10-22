@@ -225,7 +225,59 @@ namespace TailRemote
                 // What arrives is written down too, so a test can check a window's Send the clipboard end to end.
                 host.ClipboardReceived += t => { try { File.AppendAllText(said, "clipboard text: " + t + Environment.NewLine); } catch { } };
                 host.ClipboardFilesReceived += p => { try { File.AppendAllText(said, "clipboard files: " + string.Join(" | ", p) + Environment.NewLine); } catch { } };
+                // NVDA's viewers hidden and read here, as a hosting window does (only when run as administrator).
+                host.StartNvdaHere();
+                // KOVA_MIC_TEST=1: the controlling PC's microphone is counted, not played (a test PC may have no second cable).
+                if (Environment.GetEnvironmentVariable("KOVA_MIC_TEST") == "1")
+                {
+                    int ticks = 0;
+                    MicIn.TestHeard = (_, t) => System.Threading.Interlocked.Add(ref ticks, t);
+                    new System.Threading.Thread(() =>
+                    {
+                        while (true)
+                        {
+                            System.Threading.Thread.Sleep(1000);
+                            int n = System.Threading.Interlocked.Exchange(ref ticks, 0);
+                            if (n > 0) try { File.AppendAllText(said, "microphone ticks this second: " + n + Environment.NewLine); } catch { }
+                        }
+                    }) { IsBackground = true }.Start();
+                }
                 System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                return 0;
+            }
+            if (args.Length >= 4 && args[0] == "--testcontrol" && int.TryParse(args[1], out int controlPort) && int.TryParse(args[3], out int controlSecs))
+            {
+                // A controlling PC with no window, for testing a host's microphone and NVDA text against (4.3):
+                // --testcontrol PORT PASSWORD SECONDS [mic] [nvda] [micoff=N]. Connects to this PC, turns on the
+                // microphone (Windows' default recording device) and asks for the remote NVDA as text with no sound,
+                // the way the window does; never sends a key. What it hears goes to %TEMP%\kova-testcontrol.txt.
+                string said = Path.Combine(Path.GetTempPath(), "kova-testcontrol.txt");
+                void Note(string s) { try { File.AppendAllText(said, DateTime.Now.ToString("HH:mm:ss.fff ") + s + Environment.NewLine); } catch { } }
+                Speech.Init();
+                bool mic = Array.IndexOf(args, "mic") >= 0, nvda = Array.IndexOf(args, "nvda") >= 0;
+                int micOff = 0;
+                foreach (var a in args) if (a.StartsWith("micoff=") && int.TryParse(a[7..], out int mo)) micOff = mo;
+                using var player = new Player(Player.NoDevice, Note);
+                using var c = Client.Connect("127.0.0.1", controlPort, args[2], player, s => Note("status: " + s));
+                Note("connected" + (c.ListenOnly ? ", listen only" : ""));
+                c.NvdaSpoke += lines => { Note("remote NVDA: " + string.Join(" / ", lines)); Speech.Remote(lines, c.TakeKeyPressed()); };
+                c.NvdaBraille += b => { Note("remote braille: " + b); Speech.Braille(b); };
+                c.NvdaNote += n => Note("NVDA note: " + n);
+                c.MicNote += n => Note("microphone note: " + n);
+                c.Disconnected += why => Note("disconnected: " + why);
+                c.SoundOff = nvda;
+                c.NvdaText = nvda;
+                c.SetMic(mic, null);
+                for (int i = 0; i < 50 && c.HostVersion == null; i++) System.Threading.Thread.Sleep(20);
+                Note("host " + c.HostVersion + ": microphone " + (c.CanMic ? "taken" : "not taken") + ", NVDA text " + (c.CanNvda ? "offered" : "not offered") + ", sending microphone " + c.MicSending);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                bool offDone = false;
+                while (sw.Elapsed.TotalSeconds < controlSecs)
+                {
+                    System.Threading.Thread.Sleep(200);
+                    if (micOff > 0 && !offDone && sw.Elapsed.TotalSeconds >= micOff) { offDone = true; c.SetMic(false, null); Note("microphone turned off"); }
+                }
+                Note("done, microphone was " + (c.MicSending ? "on" : "off") + " at the end");
                 return 0;
             }
             if (args.Length >= 1 && args[0] == "--dialogtest")
@@ -991,6 +1043,51 @@ namespace TailRemote
             for (int i = 0; i < 40 && (toHost == null || toClient == null); i++) System.Threading.Thread.Sleep(50);
             System.Threading.Thread.Sleep(100);
             if (toHost != "from client ✓" || toClient != "from host ✓") return Fail("clipboard: host got " + toHost + ", client got " + toClient);
+
+            // The microphone (4.3): a controller's reaches the host under its own key; a listener's is never played;
+            // a packet played back later, or tampered with, is dropped.
+            {
+                int heard = 0;
+                MicIn.TestHeard = (_, t) => System.Threading.Interlocked.Add(ref heard, t);
+                try
+                {
+                    for (int i = 0; i < 100 && (c.HostVersion == null || listener.HostVersion == null); i++) System.Threading.Thread.Sleep(20);
+                    if (!c.CanMic) return Fail("the host does not take a microphone");
+                    if (listener.CanMic) return Fail("a listen-only connection was offered the microphone");
+                    short[] tone = new short[Protocol.TickFrames * 2];
+                    for (int i = 0; i < Protocol.TickFrames; i++) tone[2 * i] = tone[2 * i + 1] = (short)(8000 * Math.Sin(i * 2 * Math.PI * 440 / Protocol.AudioRate));
+                    for (uint s = 0; s < 100; s++) { c.TestMicTick(s, tone); if (s % 10 == 9) System.Threading.Thread.Sleep(5); }
+                    for (int i = 0; i < 100 && System.Threading.Volatile.Read(ref heard) < 90; i++) System.Threading.Thread.Sleep(20);
+                    if (heard < 90) return Fail("microphone: the host heard " + heard + " of 100 ticks");
+                    if (!host.TestMicPlaying) return Fail("microphone: the host is not playing it");
+                    int before = heard;
+                    for (uint s = 0; s < 50; s++) listener.TestMicTick(s, tone);
+                    for (uint s = 0; s < 20; s++) c.TestMicTick(s, tone, replay: true); // the controller's oldest numbers again: a replay
+                    System.Threading.Thread.Sleep(300);
+                    if (heard != before) return Fail("microphone: a listener's or a replayed packet was played (" + (heard - before) + " ticks)");
+                    lossless += " | microphone: " + heard + " ticks heard, listener and replay refused";
+                }
+                finally { MicIn.TestHeard = null; }
+            }
+
+            // The remote NVDA as text (4.3): lines go to a PC that asked, and to nobody else.
+            {
+                var nvdaGot = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                c.NvdaSpoke += lines => { foreach (var l in lines) nvdaGot.Enqueue("c " + l); };
+                listener.NvdaSpoke += lines => { foreach (var l in lines) nvdaGot.Enqueue("l " + l); };
+                c.NvdaText = true;
+                System.Threading.Thread.Sleep(200);
+                host.NvdaLines(new[] { "Desktop list", "Recycle Bin 1 of 4" });
+                for (int i = 0; i < 50 && nvdaGot.Count < 2; i++) System.Threading.Thread.Sleep(20);
+                System.Threading.Thread.Sleep(100);
+                string all = string.Join("|", nvdaGot);
+                if (all != "c Desktop list|c Recycle Bin 1 of 4") return Fail("remote NVDA text: " + all);
+                c.NvdaText = false;
+                System.Threading.Thread.Sleep(200);
+                host.NvdaLines(new[] { "not wanted" });
+                System.Threading.Thread.Sleep(200);
+                if (nvdaGot.Count != 2) return Fail("remote NVDA text came after it was turned off");
+            }
 
             // A flood of logins that never finish must not touch a session that is
             // already running, and someone else must still be able to log in.

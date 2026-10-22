@@ -1301,6 +1301,54 @@ namespace TailRemote
                 }
             });
 
+            Scenario("hosting as the service: the remote NVDA's wants reach the agent and its lines come back, a listener's microphone is never played", 30, () =>
+            {
+                // The service's way (Agent.StartHosting): the host asks the agent through the pipe, the agent's NVDA reader
+                // answers. The reader is in test mode: it never looks at this PC's real NVDA windows.
+                AgentLink.TestAnyOwner = true;
+                string pipes = Names.TestPipes;
+                Names.TestPipes = pipes + "Nvda"; // a pipe of its own: the other agent scenarios' servers are still listening on theirs
+                var server = new AgentLink.Server();
+                var nvda = new NvdaViewers(null, null, testOnly: true);
+                new Thread(() => AgentLink.Run((_, _, _, _) => { }, (_, _, _) => { }, _ => { }, _ => { }, null, null, nvda)) { IsBackground = true }.Start();
+                Thread.Sleep(1500); // the agent connects on this scenario's own pipe
+                Names.TestPipes = pipes;
+                var svc = new Host(Port + 8, Password, ListenPassword, _ => { }) { NvdaRequest = server.Nvda };
+                server.NvdaText = (kind, t) => { if (kind == AgentLink.NvdaKindLines) svc.NvdaLines(t.Split('\n', StringSplitOptions.RemoveEmptyEntries)); };
+                try
+                {
+                    using var c = Client.Connect("127.0.0.1", Port + 8, Password, new Player(Player.NoDevice, _ => { }), _ => { });
+                    using var l = Client.Connect("127.0.0.1", Port + 8, ListenPassword, new Player(Player.NoDevice, _ => { }), _ => { });
+                    var heard = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    c.NvdaSpoke += lines => { foreach (var x in lines) heard.Enqueue(x); };
+                    for (int i = 0; i < 100 && c.HostVersion == null; i++) Thread.Sleep(20);
+                    Thread.Sleep(1500); // the agent connects
+                    c.NvdaText = true;
+                    for (int i = 0; i < 100 && !nvda.ReadSpeech; i++) Thread.Sleep(20);
+                    if (!nvda.ReadSpeech) return "FAIL: the agent was never told to read NVDA's speech";
+                    nvda.TestSpeak(new[] { "Start button", "Search box, edit" });
+                    for (int i = 0; i < 100 && heard.Count < 2; i++) Thread.Sleep(20);
+                    if (string.Join("|", heard) != "Start button|Search box, edit") return "FAIL: the controller heard " + string.Join("|", heard);
+                    c.NvdaText = false;
+                    for (int i = 0; i < 100 && nvda.ReadSpeech; i++) Thread.Sleep(20);
+                    if (nvda.ReadSpeech) return "FAIL: the agent kept reading once nobody wanted it";
+                    // A listener's microphone packets, sent by hand: never played (it may only listen).
+                    int mic = 0;
+                    MicIn.TestHeard = (_, t) => Interlocked.Add(ref mic, t);
+                    try
+                    {
+                        short[] tone = new short[Protocol.TickFrames * 2];
+                        for (int i = 0; i < tone.Length; i++) tone[i] = (short)(i * 37 % 4000);
+                        for (uint s = 0; s < 60; s++) l.TestMicTick(s, tone);
+                        Thread.Sleep(400);
+                        if (mic != 0) return "FAIL: a listener's microphone was played";
+                    }
+                    finally { MicIn.TestHeard = null; }
+                    return "lines said on the agent came to the controller, it stopped reading when nobody wanted them, and a listener's microphone was refused";
+                }
+                finally { svc.Dispose(); nvda.Dispose(); }
+            });
+
             Scenario("the connection drops before the window is listening: it still hears about it", 30, () =>
             {
                 // A second host of its own, so stopping it disturbs nothing else.

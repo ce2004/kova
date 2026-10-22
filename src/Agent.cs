@@ -69,6 +69,8 @@ namespace TailRemote
                     {
                         SecureAttention = SendSecureAttention,
                         FileUser = NativeService.ConsoleUser, // file tools with the signed-in user's rights, never SYSTEM's
+                        NvdaRequest = agent.Nvda, // NVDA's viewers are in the signed-in session: the agent reads them
+                        MicDevice = cfg.MicDevice,
                     };
                     break;
                 }
@@ -83,6 +85,13 @@ namespace TailRemote
             // The screen is the agent's to see (the service is in session 0): pictures come from it.
             _host.VideoUpdate = agent.Video;
             _host.VideoForget = agent.ForgetVideo;
+            var host = _host;
+            agent.NvdaText = (kind, text) =>
+            {
+                if (kind == AgentLink.NvdaKindLines) host.NvdaLines(text.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+                else if (kind == AgentLink.NvdaKindBraille) host.NvdaBrailleNow(text);
+                else if (kind == AgentLink.NvdaKindProblem) host.NvdaProblemNow(text.Length == 0 ? null : text);
+            };
             // The TailRemote window, when open, does the clipboard and sends files through the service
             // (ServiceLink), as the signed-in user; it must be in the session at the screen. Without a
             // window, what the controlling PC sends goes onto the clipboard through the agent.
@@ -179,8 +188,11 @@ namespace TailRemote
             // The remote screen is taken here, at the screen: the service in session 0 cannot see it. Any of
             // the PC's screens, as each viewer chooses.
             var screens = new ScreenSource();
+            // NVDA's Speech Viewer and Braille Viewer, kept hidden for as long as this agent runs (the service hosts), and
+            // read only while a controlling PC wants NVDA's text. They are on the normal desktop, whichever has the keyboard.
+            var nvda = new NvdaViewers(m => ServiceHost.Log("Agent: " + m), "Default");
             AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), (kind, a, b) => Native.SendMouse(kind, a, b), clip.Arrived, clip.FilesArrived, reader.Read,
-                new ScreenVideo(screens.Take, screens.Screens, screens.Idle)); // Idle: nothing of the screen is held while nobody watches
+                new ScreenVideo(screens.Take, screens.Screens, screens.Idle), nvda); // Idle: nothing of the screen is held while nobody watches
             return 0;
         }
 

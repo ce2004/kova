@@ -21,7 +21,7 @@ namespace TailRemote
     {
         public const int TagSize = 16;
 
-        private readonly AesGcm _send, _recv, _audio;
+        private readonly AesGcm _send, _recv, _audio, _mic;
         private readonly object _sendLock = new();
         private ulong _sendCounter, _recvCounter;
         private readonly int _maxReceive, _maxSend;
@@ -41,6 +41,9 @@ namespace TailRemote
             _send = new AesGcm(isHost ? toClient : toHost, TagSize);
             _recv = new AesGcm(isHost ? toHost : toClient, TagSize);
             _audio = new AesGcm(Derive("Kova audio"), TagSize);
+            // The microphone goes the other way, numbered from 0 per connection: under the sound's key its numbers
+            // would meet the host's own, and a nonce used twice under AES-GCM gives the key away.
+            _mic = new AesGcm(Derive("Kova microphone"), TagSize);
             _helloKey = Derive("Kova udp hello");
         }
 
@@ -71,6 +74,7 @@ namespace TailRemote
             _send.Dispose();
             _recv.Dispose();
             _audio.Dispose();
+            _mic.Dispose();
         }
 
         private static void CounterNonce(Span<byte> nonce, ulong counter)
@@ -229,6 +233,38 @@ namespace TailRemote
             packet.AsSpan(1, 4).CopyTo(nonce);
             var payload = packet.AsSpan(5, payloadLength);
             try { _audio.Decrypt(nonce, payload, packet.AsSpan(5 + payloadLength, TagSize), payload, packet.AsSpan(0, 5)); return true; }
+            catch (CryptographicException) { return false; }
+        }
+
+        /// <summary>How far a connection's microphone may count before it must reconnect for new keys (its numbers start at 0).</summary>
+        public const uint MicSeqSpan = 0xF0000000;
+
+        /// <summary>
+        /// Seals a microphone packet in place: [type][token 8][u32 seq][payload][tag], the head authenticated. Its
+        /// number is the nonce: the caller never seals two with one number (they only count up, from 0, and the
+        /// connection ends before MicSeqSpan). Microphone thread only.
+        /// </summary>
+        public void SealMic(byte[] packet, int payloadLength)
+        {
+            uint seq = BitConverter.ToUInt32(packet, 9);
+            if (seq >= MicSeqSpan) throw new InvalidOperationException("Microphone key must be refreshed before the nonce counter wraps.");
+            Span<byte> nonce = stackalloc byte[12];
+            nonce.Clear();
+            packet.AsSpan(9, 4).CopyTo(nonce);
+            var payload = packet.AsSpan(Protocol.MicHeadBytes, payloadLength);
+            _mic.Encrypt(nonce, payload, payload, packet.AsSpan(Protocol.MicHeadBytes + payloadLength, TagSize), packet.AsSpan(0, Protocol.MicHeadBytes));
+        }
+
+        /// <summary>Opens a microphone packet in place; false if it was forged or damaged. The host's UDP thread only.</summary>
+        public bool OpenMic(byte[] packet, int length)
+        {
+            int payloadLength = length - Protocol.MicHeadBytes - TagSize;
+            if (payloadLength < 1) return false;
+            Span<byte> nonce = stackalloc byte[12];
+            nonce.Clear();
+            packet.AsSpan(9, 4).CopyTo(nonce);
+            var payload = packet.AsSpan(Protocol.MicHeadBytes, payloadLength);
+            try { _mic.Decrypt(nonce, payload, packet.AsSpan(Protocol.MicHeadBytes + payloadLength, TagSize), payload, packet.AsSpan(0, Protocol.MicHeadBytes)); return true; }
             catch (CryptographicException) { return false; }
         }
     }

@@ -27,6 +27,12 @@ namespace TailRemote
         public string OutputDevice { get; set; } = "";
         /// <summary>Host: the output whose sound is sent ("" = Windows' default).</summary>
         public string CaptureDevice { get; set; } = "";
+        /// <summary>Controlling: the microphone sent to the remote PC ("" = Windows' default). Whether it is on is never saved: it starts off.</summary>
+        public string MicDevice { get; set; } = "";
+        /// <summary>Host: where the controlling PC's microphone plays ("" = Kova picks a virtual cable that is not what it sends).</summary>
+        public string MicOutput { get; set; } = "";
+        /// <summary>Controlling: the remote NVDA as its sound (0), as text spoken and brailled here with no sound (1), or both (2).</summary>
+        public int RemoteNvda { get; set; }
         /// <summary>Where Send files and Send a folder from the other PC are saved; empty: Downloads\TailRemote.</summary>
         public string ReceiveFolder { get; set; } = "";
         public string ListenPasswordEnc { get; set; } = "";
@@ -230,7 +236,8 @@ namespace TailRemote
         private Settings Tidy()
         {
             Address ??= ""; PasswordEnc ??= ""; OutputDevice ??= ""; CaptureDevice ??= ""; ReceiveFolder ??= "";
-            ListenPasswordEnc ??= ""; ResumeState ??= "";
+            ListenPasswordEnc ??= ""; ResumeState ??= ""; MicDevice ??= ""; MicOutput ??= "";
+            RemoteNvda = Math.Clamp(RemoteNvda, 0, 2);
             SoundChoices ??= new();
             KnownPorts ??= new();
             SavedPcs ??= new();

@@ -19,7 +19,7 @@ namespace TailRemote
             if (o == null || !Marshal.IsComObject(o)) return;
             try { Marshal.ReleaseComObject(o); } catch { }
         }
-        public const int eRender = 0, eConsole = 0;
+        public const int eRender = 0, eCapture = 1, eConsole = 0;
         public const uint DEVICE_STATE_ACTIVE = 1;
         public const uint CLSCTX_ALL = 23;
         public const uint AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000;
@@ -150,7 +150,12 @@ namespace TailRemote
         public static IMMDeviceEnumerator Enumerator() => (IMMDeviceEnumerator)new MMDeviceEnumeratorCo();
 
         /// <summary>Output devices as (id, friendly name).</summary>
-        public static List<(string Id, string Name)> OutputDevices()
+        public static List<(string Id, string Name)> OutputDevices() => Devices(eRender);
+
+        /// <summary>Microphones and other recording devices as (id, friendly name).</summary>
+        public static List<(string Id, string Name)> InputDevices() => Devices(eCapture);
+
+        private static List<(string Id, string Name)> Devices(int flow)
         {
             var list = new List<(string, string)>();
             // Everything asked of Windows here is let go before returning: the list is built every
@@ -160,7 +165,7 @@ namespace TailRemote
             try
             {
                 e = Enumerator();
-                e.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, out coll);
+                e.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, out coll);
                 coll.GetCount(out uint n);
                 for (uint i = 0; i < n; i++)
                 {
@@ -193,7 +198,22 @@ namespace TailRemote
         /// The same, with an enumerator the caller keeps: the sound threads look once a second, and a new
         /// enumerator each time was 86,400 COM objects a day waiting on the finalizer.
         /// </summary>
-        public static IMMDevice OutputDevice(IMMDeviceEnumerator e, string? id)
+        public static IMMDevice OutputDevice(IMMDeviceEnumerator e, string? id) => Device(e, id, eRender);
+
+        /// <summary>The chosen microphone, or the default one when id is empty or gone.</summary>
+        public static IMMDevice InputDevice(IMMDeviceEnumerator e, string? id) => Device(e, id, eCapture);
+
+        /// <summary>The id of Windows' default output now, or null if there is none.</summary>
+        public static string? DefaultOutputId()
+        {
+            IMMDeviceEnumerator? e = null;
+            IMMDevice? d = null;
+            try { e = Enumerator(); e.GetDefaultAudioEndpoint(eRender, eConsole, out d); d.GetId(out string id); return id; }
+            catch { return null; }
+            finally { Release(d); Release(e); }
+        }
+
+        private static IMMDevice Device(IMMDeviceEnumerator e, string? id, int flow)
         {
             if (!string.IsNullOrEmpty(id))
             {
@@ -202,7 +222,7 @@ namespace TailRemote
                 catch { }
                 Release(d); // there but not active (unplugged, disabled): not ours to keep
             }
-            e.GetDefaultAudioEndpoint(eRender, eConsole, out var def);
+            e.GetDefaultAudioEndpoint(flow, eConsole, out var def);
             return def;
         }
 
