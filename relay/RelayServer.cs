@@ -102,10 +102,10 @@ namespace KovaRelay
         public bool AllowNewNames
         {
             get => _allowNewNames;
-            set { _allowNewNames = value; _files.SaveAllowNewNames(value); }
+            set => _allowNewNames = value; // in memory: settings.json is written only by an elevated copy (RelayService)
         }
 
-        /// <summary>The service: an administrator changed relay-settings.txt; take it without writing it back.</summary>
+        /// <summary>An administrator changed settings.json (through an elevated copy): take it, and log it.</summary>
         public void SetAllowNewNamesFromFile(bool allow)
         {
             if (_allowNewNames == allow) return;
@@ -118,7 +118,7 @@ namespace KovaRelay
             _files = files;
             _log = log;
             _pins = files.LoadPins(Limits.MaxPinnedNames);
-            _allowNewNames = files.LoadAllowNewNames();
+            _allowNewNames = files.LoadSettings().AllowNewNames;
             _ = Task.Run(HousekeepingLoop);
         }
 

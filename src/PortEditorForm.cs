@@ -8,17 +8,34 @@ using System.Windows.Forms;
 namespace TailRemote
 {
     /// <summary>
-    /// Opens and closes Kova's ports in Windows Firewall. Lists every port Kova has used on this PC (kept in
-    /// the settings) and every port Windows Firewall has a Kova or TailRemote rule for, so a port can still be
-    /// closed after the port setting has moved on. Remove port closes one and takes it off the list. The port
-    /// Kova uses now is marked "in use" and is never closed from here. Clean up old firewall rules removes the
-    /// rules Windows piled up for copies of Kova that are gone or no longer used, and old TailRemote rules.
+    /// What the port editor needs from the app it is in (Kova, or Kova Relay, which links this file): the ports
+    /// it has used, kept in its settings, and how it speaks.
+    /// </summary>
+    internal sealed class PortBook
+    {
+        public required Func<IEnumerable<int>> Known { get; init; }
+        /// <summary>Adds a port to the record, or takes one off. False if that could not be saved (SaveProblem says why).</summary>
+        public required Func<int, bool> Remember { get; init; }
+        public required Func<int, bool> Forget { get; init; }
+        public required Func<string?> SaveProblem { get; init; }
+        public required Action<string, bool> Speak { get; init; }
+        /// <summary>Where the port in use is changed: "change Port in the main window first".</summary>
+        public required string ChangePortHint { get; init; }
+    }
+
+    /// <summary>
+    /// Opens and closes the app's ports in Windows Firewall (Firewall.App: Kova, or Kova Relay). Lists every port
+    /// it has used on this PC (kept in its settings) and every port Windows Firewall has one of its rules for, so a
+    /// port can still be closed after the port setting has moved on. Remove port closes one and takes it off the
+    /// list. The port in use now is marked "in use" and is never closed from here. Clean up old firewall rules
+    /// removes the rules Windows piled up for copies of the app that are gone or no longer used, and old-name rules.
     /// </summary>
     internal sealed class PortEditorForm : Form
     {
         private enum State { Checking, Open, OpenOld, Closed }
 
-        private readonly Settings _settings;
+        private readonly PortBook _book;
+        private static string App => Firewall.App.Name;
         private readonly IReadOnlyCollection<int> _inUse;
         private readonly ListBox _list = new() { Width = 380, Height = 150 };
         private readonly Button _open = new() { Text = "&Open port", AutoSize = true };
@@ -36,9 +53,9 @@ namespace TailRemote
         // What the last look at Windows Firewall found (null: not looked yet, or it could not be asked).
         private List<Firewall.Rule>? _rules;
 
-        public PortEditorForm(Settings settings, IReadOnlyCollection<int> inUse)
+        public PortEditorForm(PortBook book, IReadOnlyCollection<int> inUse)
         {
-            _settings = settings;
+            _book = book;
             _inUse = inUse;
             Text = "Port editor";
             Font = new Font("Segoe UI", 10f);
@@ -49,10 +66,10 @@ namespace TailRemote
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
 
             var panel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Padding = new Padding(12) };
-            panel.Controls.Add(new Label { Text = "&Ports Kova has used, and whether Windows Firewall lets them in", AutoSize = true });
-            _list.AccessibleName = "Ports Kova has used";
+            panel.Controls.Add(new Label { Text = "&Ports " + App + " has used, and whether Windows Firewall lets them in", AutoSize = true });
+            _list.AccessibleName = "Ports " + App + " has used";
             panel.Controls.Add(_list);
-            Menus.FocusWhenShown(this, () => _list);
+            Load += (_, _) => ActiveControl = _list;
             var row = new FlowLayoutPanel { AutoSize = true };
             row.Controls.Add(_open);
             row.Controls.Add(_close);
@@ -75,7 +92,7 @@ namespace TailRemote
             _newPort.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (_add.Enabled) Add(); } }; // not while a change still waits on its administrator prompt
             _list.SelectedIndexChanged += (_, _) => UpdateButtons();
 
-            foreach (int p in _settings.KnownPorts.Concat(_inUse)) _state[p] = State.Checking;
+            foreach (int p in _book.Known().Concat(_inUse)) _state[p] = State.Checking;
             Refill();
         }
 
@@ -86,7 +103,7 @@ namespace TailRemote
             await Look();
         }
 
-        /// <summary>Asks Windows Firewall what it has for Kova (off the window's thread: it takes a moment), and shows it.</summary>
+        /// <summary>Asks Windows Firewall what it has for the app (off the window's thread: it takes a moment), and shows it.</summary>
         private async Task Look()
         {
             int before = _changes;
@@ -137,7 +154,7 @@ namespace TailRemote
                 string what = _state[p] switch
                 {
                     State.Open => "open",
-                    State.OpenOld => "open by an old TailRemote rule",
+                    State.OpenOld => "open by an old " + Firewall.App.OldName + " rule",
                     State.Closed => "closed",
                     _ => "checking",
                 };
@@ -168,17 +185,18 @@ namespace TailRemote
         private bool RefuseInUse(int p, string doing)
         {
             if (!_inUse.Contains(p)) return false;
-            Speech.Speak("Port " + p + " is the port Kova uses now, so it stays open. To " + doing + " it, change Port in the main window first.");
+            Say("Port " + p + " is the port " + App + " uses now, so it stays open. To " + doing + " it, " + _book.ChangePortHint + ".");
             return true;
         }
 
         private void Add()
         {
-            string? problem = Protocol.PortProblem(_newPort.Text.Trim(), out int port);
+            string? problem = Firewall.App.PortProblem(_newPort.Text.Trim());
+            int.TryParse(_newPort.Text.Trim(), out int port);
             if (problem != null) { MessageBox.Show(this, problem, "Port editor"); _newPort.Focus(); return; } // NVDA reads the box; speaking too said it twice
             // Said, not lost in silence: the port is still opened, but Port editor may not list it next time.
-            if (!Remember(_settings, port))
-                Speech.Speak((_settings.SaveProblem ?? "Kova could not save its settings.") + " Port editor may not list port " + port + " next time.", interrupt: false);
+            if (!_book.Remember(port))
+                _book.Speak((_book.SaveProblem() ?? App + " could not save its settings.") + " Port editor may not list port " + port + " next time.", false);
             if (!_state.ContainsKey(port)) _state[port] = State.Closed;
             _newPort.Clear();
             Refill();
@@ -191,16 +209,16 @@ namespace TailRemote
             if (port == null || _busy) return;
             int p = port.Value;
             if (!open && RefuseInUse(p, "close")) return;
-            Speech.Speak((open ? "Opening port " : "Closing port ") + p + ". Windows asks for administrator permission.");
+            Say((open ? "Opening port " : "Closing port ") + p + ". Windows asks for administrator permission.");
             var result = await Busy(() => Firewall.ChangeAsync(p, open));
             if (IsDisposed) return;
             await Look();
             if (IsDisposed) return;
             _list.Focus();
-            Speech.Speak(result switch
+            Say(result switch
             {
                 ChangeResult.Done => "Port " + p + (open ? " is open." : " is closed."),
-                ChangeResult.InUse => "Port " + p + " is the port the Kova service hosts on, so it stays open.",
+                ChangeResult.InUse => "Port " + p + " is the port the " + App + " service uses now, so it stays open.",
                 ChangeResult.Declined => "Port " + p + " was not changed: administrator permission was not given.",
                 _ => "Port " + p + " could not be " + (open ? "opened" : "closed") + ": Windows Firewall did not take the change.",
             });
@@ -215,23 +233,23 @@ namespace TailRemote
             var result = ChangeResult.Done;
             if (_state[p] != State.Closed)
             {
-                Speech.Speak("Closing port " + p + " and taking it off the list. Windows asks for administrator permission.");
+                Say("Closing port " + p + " and taking it off the list. Windows asks for administrator permission.");
                 result = await Busy(() => Firewall.ChangeAsync(p, false));
                 if (IsDisposed) return;
             }
             bool saved = true;
             if (result == ChangeResult.Done)
             {
-                saved = Forget(_settings, p);
+                saved = _book.Forget(p);
                 _state.Remove(p);
             }
             await Look();
             if (IsDisposed) return;
             _list.Focus();
-            Speech.Speak(result switch
+            Say(result switch
             {
-                ChangeResult.Done => "Port " + p + " is closed and off the list." + (saved ? "" : " " + (_settings.SaveProblem ?? "Kova could not save its settings.") + " It may be listed again next time."),
-                ChangeResult.InUse => "Port " + p + " is the port the Kova service hosts on, so it stays open.",
+                ChangeResult.Done => "Port " + p + " is closed and off the list." + (saved ? "" : " " + (_book.SaveProblem() ?? App + " could not save its settings.") + " It may be listed again next time."),
+                ChangeResult.InUse => "Port " + p + " is the port the " + App + " service uses now, so it stays open.",
                 ChangeResult.Declined => "Port " + p + " was not changed: administrator permission was not given.",
                 _ => "Port " + p + " could not be closed: Windows Firewall did not take the change.",
             });
@@ -242,29 +260,29 @@ namespace TailRemote
             if (_busy) return;
             if (_rules == null)
             {
-                Speech.Speak(_state.Values.Contains(State.Checking) ? "Still looking at Windows Firewall. Try again in a moment." : "Kova could not ask Windows Firewall for its rules, so nothing can be cleaned up.");
+                Say(_state.Values.Contains(State.Checking) ? "Still looking at Windows Firewall. Try again in a moment." : App + " could not ask Windows Firewall for its rules, so nothing can be cleaned up.");
                 return;
             }
             var stale = Stale;
-            if (stale.Count == 0) { Speech.Speak("There are no old Kova firewall rules to clean up."); return; }
+            if (stale.Count == 0) { Say("There are no old " + App + " firewall rules to clean up."); return; }
             int copies = stale.Count(r => r.Port == null);
             var oldPorts = stale.Where(r => r.Port != null).Select(r => r.Port!.Value).Distinct().OrderBy(p => p).ToList();
-            string what = (copies > 0 ? Count(copies, "rule for a copy of Kova that is gone or no longer used", "rules for copies of Kova that are gone or no longer used") : "") +
+            string what = (copies > 0 ? Count(copies, "rule for a copy of " + App + " that is gone or no longer used", "rules for copies of " + App + " that are gone or no longer used") : "") +
                 (copies > 0 && oldPorts.Count > 0 ? ", and " : "") +
-                (oldPorts.Count > 0 ? "old TailRemote rules for " + (oldPorts.Count == 1 ? "port " + oldPorts[0] : "ports " + string.Join(", ", oldPorts.Take(oldPorts.Count - 1)) + " and " + oldPorts[^1]) : "");
-            string keep = _inUse.Count == 0 ? "" : " " + (_inUse.Count == 1 ? "Port " + _inUse.First() + ", which Kova uses now, stays open." : "Ports " + string.Join(" and ", _inUse.OrderBy(p => p)) + ", which Kova uses now, stay open.");
-            if (MessageBox.Show(this, "Kova found " + what + "." + keep + " Kova's own port rules are left as they are." + Environment.NewLine + Environment.NewLine +
+                (oldPorts.Count > 0 ? "old " + Firewall.App.OldName + " rules for " + (oldPorts.Count == 1 ? "port " + oldPorts[0] : "ports " + string.Join(", ", oldPorts.Take(oldPorts.Count - 1)) + " and " + oldPorts[^1]) : "");
+            string keep = _inUse.Count == 0 ? "" : " " + (_inUse.Count == 1 ? "Port " + _inUse.First() + ", which " + App + " uses now, stays open." : "Ports " + string.Join(" and ", _inUse.OrderBy(p => p)) + ", which " + App + " uses now, stay open.");
+            if (MessageBox.Show(this, App + " found " + what + "." + keep + " " + App + "'s own port rules are left as they are." + Environment.NewLine + Environment.NewLine +
                     "Remove " + (stale.Count == 1 ? "it" : "them") + "? Windows asks for administrator permission.",
                     "Clean up old firewall rules", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 return;
-            Speech.Speak("Cleaning up. Windows asks for administrator permission.");
+            Say("Cleaning up. Windows asks for administrator permission.");
             var result = await Busy(() => Firewall.CleanAsync(_inUse));
             if (IsDisposed) return;
             await Look();
             if (IsDisposed) return;
             _clean.Focus();
             int left = Stale.Count;
-            Speech.Speak(result switch
+            Say(result switch
             {
                 ChangeResult.Done => "Removed " + Count(stale.Count, "old firewall rule", "old firewall rules") + ".",
                 ChangeResult.Declined => "Nothing was removed: administrator permission was not given.",
@@ -283,19 +301,6 @@ namespace TailRemote
             finally { _busy = false; _changes++; if (!IsDisposed) UpdateButtons(); }
         }
 
-        /// <summary>Adds a port to the record of ports Kova has used. False if that could not be saved (Settings.SaveProblem says why).</summary>
-        public static bool Remember(Settings settings, int port)
-        {
-            if (settings.KnownPorts.Contains(port)) return true;
-            settings.KnownPorts.Add(port);
-            try { return settings.Save(retries: 1); } catch { return false; } // on the window's thread: not frozen for long
-        }
-
-        /// <summary>Takes a closed port off the record. False if that could not be saved.</summary>
-        public static bool Forget(Settings settings, int port)
-        {
-            if (!settings.KnownPorts.Remove(port)) return true;
-            try { return settings.Save(retries: 1); } catch { return false; }
-        }
+        private void Say(string text) => _book.Speak(text, true);
     }
 }

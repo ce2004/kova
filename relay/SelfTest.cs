@@ -40,7 +40,7 @@ namespace KovaRelay
             try
             {
                 Directory.CreateDirectory(dir);
-                var files = new RelayFiles(dir);
+                var files = new RelayFiles(dir, dir, null);
                 log = new RelayLog(dir);
                 server = new RelayServer(files, log) { LoopbackOnly = true };
                 StartOnFreePort(server, files);
@@ -73,6 +73,26 @@ namespace KovaRelay
             }
         }
 
+        /// <summary>settings.json round trip, the default with nothing saved, and 4.4.0's files read until settings.json exists.</summary>
+        private static void CheckSettings(RelayFiles files)
+        {
+            string old = Path.Combine(files.HostsFolder, "old");
+            Directory.CreateDirectory(old);
+            var legacy = new RelayFiles(files.HostsFolder, Path.Combine(files.HostsFolder, "settings"), old);
+            Check(legacy.LoadSettings() == new RelaySettings(47200, true), "with nothing saved, the relay did not use port 47200");
+            File.WriteAllText(Path.Combine(old, "port.txt"), "47321\r\n");
+            File.WriteAllText(Path.Combine(old, "relay-settings.txt"), "allow-new-host-names=no\r\n");
+            Check(legacy.HasOldSettings, "4.4.0's port.txt was not noticed");
+            Check(legacy.LoadSettings() == new RelaySettings(47321, false), "4.4.0's port.txt and relay-settings.txt were not read");
+            Directory.CreateDirectory(legacy.SettingsFolder);
+            Check(legacy.SaveSettings(new RelaySettings(47555, true)), "settings.json could not be written");
+            Check(legacy.LoadSettings() == new RelaySettings(47555, true), "settings.json did not win over 4.4.0's files");
+            File.WriteAllText(legacy.SettingsFile, "{ \"Port\": 99999, \"AllowNewHostNames\": false }");
+            Check(legacy.LoadSettings() == new RelaySettings(47200, false), "a bad port in settings.json was not replaced by 47200");
+            File.WriteAllText(legacy.SettingsFile, "not json");
+            Check(legacy.LoadSettings().Port == 47321, "a broken settings.json did not fall back");
+        }
+
         private static void StartOnFreePort(RelayServer server, RelayFiles files)
         {
             for (int i = 0; i < 20; i++)
@@ -82,7 +102,7 @@ namespace KovaRelay
                 int p = ((IPEndPoint)probe.LocalEndpoint).Port;
                 probe.Stop();
                 if (p == 47120) continue;   // never the live Kova service's port
-                if (server.Start(p) is null) { _port = p; files.WritePort(p); return; }
+                if (server.Start(p) is null) { _port = p; return; }
             }
             throw new TestFailure("could not find a free port to test on");
         }
@@ -218,8 +238,9 @@ namespace KovaRelay
                 Check(IsRefused(t, b, Wire.Reason.NewNamesOff), $"a new name with new names off got {Describe(t, b)}");
                 newcomer.Dispose();
             }
-            Check(File.ReadAllText(files.SettingsFile).Contains("allow-new-host-names=no"), "relay-settings.txt did not save new names off");
             server.AllowNewNames = true;
+            CheckSettings(files);
+            done.Add("settings.json saved and read back; 4.4.0's port.txt and relay-settings.txt read until moved");
             done.Add("new name refused NewNamesOff while new names were off");
 
             // 10. A frame with length 65535 is refused at once, without the relay waiting for its body.

@@ -8,12 +8,13 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using TailRemote;
 
 namespace KovaRelay
 {
     /// <summary>
-    /// The relay's one window. Tab goes: status, port, Use this port, Stop/Start, Allow new host names, hosts list,
-    /// Forget this host name, Start with Windows, Open the log, Exit the relay. Escape or the close button only hide
+    /// The relay's one window. Tab goes: status, port, Use this port, Port editor, Stop/Start, Allow new host names,
+    /// hosts list, Forget this host name, Start with Windows, Run as a Windows service, Open the log, Exit the relay. Escape or the close button only hide
     /// it; the relay keeps running in the tray.
     /// </summary>
     internal sealed class OptionsForm : Form
@@ -25,6 +26,7 @@ namespace KovaRelay
         private readonly TextBox _status = new();
         private readonly TextBox _port = new();
         private readonly Button _usePort = new();
+        private readonly Button _portEditor = new();
         private readonly Button _startStop = new();
         private readonly SpokenCheckBox _allowNew = new();
         private readonly ListBox _hosts = new();
@@ -84,6 +86,12 @@ namespace KovaRelay
             _usePort.TabIndex = tab++;
             _usePort.Click += (_, _) => UsePort();
             Controls.Add(_usePort);
+            _portEditor.Text = "Port &editor";
+            _portEditor.AccessibleDescription = "Opens and closes the relay's ports in Windows Firewall";
+            _portEditor.SetBounds(x + 280, y - 1, 150, 27);
+            _portEditor.TabIndex = tab++;
+            _portEditor.Click += (_, _) => OpenPortEditor();
+            Controls.Add(_portEditor);
             y += 36;
 
             _startStop.Text = "Stop the &relay";
@@ -283,39 +291,146 @@ namespace KovaRelay
                 _port.Focus(); _port.SelectAll();
                 return;
             }
-            if (_app.ServiceMode)
-            {
-                Elevated($"--service-port {_app.ServiceName} {port}", r => r == RelayService.Result.Ok
-                    ? $"The relay service now uses port {port}."
-                    : r == RelayService.Result.WouldNotStart ? $"Port {port} is saved, but the service did not start on it. Another program may be using that port." : RelayService.Say(r, ""));
-                return;
-            }
+            _ = ChangePort(port);
+        }
+
+        /// <summary>
+        /// The port, saved in the relay's settings (settings.json, which only administrators may change, so Windows
+        /// asks for permission) and used at once: the relay here, or the service, restarts on it. Then Windows
+        /// Firewall is offered the same move: open the new port, close the old one.
+        /// </summary>
+        private async Task ChangePort(int port)
+        {
+            if (_busy) return;
+            int old = _app.Files.LoadSettings().Port;
             RelayServer server = _app.Server;
-            if (server.Running && server.Port == port)
+            bool here = !_app.ServiceMode;
+            if (port == old && (!here || (server.Running && server.Port == port)) && !_app.Files.HasOldSettings)
             {
                 _note = $"The relay is already using port {port}.";
                 RefreshState(force: true);
                 MessageBox.Show(this, _note, "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            int old = server.Port;
-            bool wasRunning = server.Running;
-            string? why = server.Start(port);
-            if (why is not null)
+            int was = here ? server.Port : old;
+            bool wasRunning = here && server.Running;
+            if (here)
             {
-                if (wasRunning) server.Start(old);
-                _note = wasRunning ? $"Still using port {old}." : null;
-                RefreshState(force: true);
-                MessageBox.Show(this, why, "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                _port.Focus(); _port.SelectAll();
-                return;
+                // Tried first: a port another program holds is said at once, before any administrator prompt.
+                string? why = server.Start(port);
+                if (why is not null)
+                {
+                    if (wasRunning) server.Start(was);
+                    _note = wasRunning ? $"Still using port {was}." : null;
+                    RefreshState(force: true);
+                    MessageBox.Show(this, why, "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    _port.Focus(); _port.SelectAll();
+                    return;
+                }
             }
-            bool saved = _app.Files.WritePort(port);
-            _note = saved ? $"The relay now uses port {port}." : $"The relay now uses port {port}, but it could not save that in port.txt, so it will go back to the old port when it restarts.";
+            var r = await RunElevatedAsync($"--settings-port {_app.ServiceName} {port}");
+            if (r is not { } result || IsDisposed) return;
+            if (result != RelayService.Result.Ok && here)
+            {
+                // Not saved: back to the port the settings still say, so the relay never runs on one it would lose.
+                if (wasRunning) server.Start(was); else server.Stop();
+            }
+            _note = result switch
+            {
+                RelayService.Result.Ok => here ? $"The relay now uses port {port}." : $"The relay service now uses port {port}.",
+                RelayService.Result.WouldNotStart => $"Port {port} is saved, but the service did not start on it. Another program may be using that port.",
+                RelayService.Result.Cancelled => $"The port was not changed, because the administrator prompt was turned down. The relay still uses port {old}.",
+                _ => RelayService.Say(result, ""),
+            };
+            _port.Text = (result == RelayService.Result.Ok ? port : old).ToString(CultureInfo.InvariantCulture);
             _app.UpdateTip();
             RefreshState(force: true);
-            MessageBox.Show(this, _note, "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, _note, "Kova Relay", MessageBoxButtons.OK, result == RelayService.Result.Ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            if (result is RelayService.Result.Ok or RelayService.Result.WouldNotStart)
+            {
+                RelayFirewall.Remember(port);
+                if (!_app.Server.LoopbackOnly) await OfferPortMove(port, old);
+            }
         }
+
+        /// <summary>The ports the relay uses now: the one in its settings, and the one it listens on (if another).</summary>
+        private IReadOnlyCollection<int> PortsInUse()
+        {
+            var ports = new List<int> { _app.Files.LoadSettings().Port };
+            int now = _app.Current(null).Snap.Port;
+            if (now > 0 && !ports.Contains(now)) ports.Add(now);
+            return ports;
+        }
+
+        private void OpenPortEditor()
+        {
+            if (_busy) return;
+            _timer.Stop();
+            try
+            {
+                var inUse = PortsInUse();
+                foreach (int p in inUse) RelayFirewall.Remember(p);
+                using var f = new PortEditorForm(RelayFirewall.Book(_ => { }), inUse) { Font = Font, Icon = Icon };
+                f.ShowDialog(this);
+            }
+            finally { if (!IsDisposed && Visible) _timer.Start(); }
+            _portEditor.Focus();
+        }
+
+        /// <summary>Opens newPort in Windows Firewall (if it is not open yet) and offers to close oldPort, with one administrator prompt for both. Like Kova's.</summary>
+        private async Task OfferPortMove(int newPort, int oldPort)
+        {
+            Say("Checking Windows Firewall.");
+            bool newOpen = await Task.Run(() => Firewall.IsOpen(newPort));
+            bool oldOpen = newPort != oldPort && await Task.Run(() => Firewall.IsOpen(oldPort));
+            if (IsDisposed) return;
+            if (!oldOpen)
+            {
+                if (newPort != oldPort) RelayFirewall.Forget(oldPort);
+                if (newOpen) { Say($"Port {newPort} is already open in Windows Firewall."); return; }
+                if (MessageBox.Show(this, $"Open port {newPort} in Windows Firewall, so hosts and controlling PCs on other networks can reach the relay?" + Environment.NewLine + Environment.NewLine +
+                        "Windows asks for administrator permission. You can also do this later in Port editor.", "Port changed", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                    return;
+                var opened = await Firewall.ChangeAsync(newPort, true);
+                if (IsDisposed) return;
+                SayResult(opened switch
+                {
+                    ChangeResult.Done => $"Port {newPort} is open.",
+                    ChangeResult.Declined => "Windows Firewall was not changed: administrator permission was not given.",
+                    _ => "Windows Firewall did not take the change. Port editor shows what is open.",
+                });
+                return;
+            }
+            string question = newOpen
+                ? $"The relay now uses port {newPort}, which is open. Port {oldPort}, which it used before, is still open in Windows Firewall. Close port {oldPort} now?"
+                : $"The relay now uses port {newPort}. Open port {newPort} in Windows Firewall, so hosts and controlling PCs can reach it, and close port {oldPort}, which it used before?" + Environment.NewLine + Environment.NewLine +
+                  $"Yes opens {newPort} and closes {oldPort}. No only opens {newPort}. Cancel changes nothing.";
+            var answer = MessageBox.Show(this, question + Environment.NewLine + Environment.NewLine + "Windows asks for administrator permission. You can also do this later in Port editor.",
+                "Port changed", newOpen ? MessageBoxButtons.YesNo : MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel || (newOpen && answer != DialogResult.Yes)) return;
+            bool close = answer == DialogResult.Yes;
+            var result = close ? newOpen ? await Firewall.ChangeAsync(oldPort, false) : await Firewall.MoveAsync(newPort, oldPort)
+                : await Firewall.ChangeAsync(newPort, true);
+            if (IsDisposed) return;
+            if (result == ChangeResult.Done && close) RelayFirewall.Forget(oldPort);
+            SayResult(result switch
+            {
+                ChangeResult.Done => close ? newOpen ? $"Port {oldPort} is closed." : $"Port {newPort} is open and port {oldPort} is closed." : $"Port {newPort} is open.",
+                ChangeResult.InUse => $"Port {newPort} is open. Port {oldPort} stays open, because the relay still uses it.",
+                ChangeResult.Declined => "Windows Firewall was not changed: administrator permission was not given.",
+                _ => "Windows Firewall did not take the change. Port editor shows what is open.",
+            });
+        }
+
+        /// <summary>Said by the screen reader, and kept at the end of the status box.</summary>
+        private void SayResult(string text)
+        {
+            _note = text;
+            RefreshState(force: true);
+            Say(text);
+        }
+
+        private static void Say(string text) => RelayFirewall.Speak(text);
 
         private void StartStop()
         {
@@ -346,16 +461,15 @@ namespace KovaRelay
         private void AllowNewChanged()
         {
             if (_settingChecks) return;
-            if (_app.ServiceMode)
+            // Saved in settings.json, which only administrators may change: Windows asks.
+            bool want = _allowNew.Checked;
+            bool service = _app.ServiceMode;
+            Elevated($"--settings-allow {_app.ServiceName} {(want ? "yes" : "no")}", r =>
             {
-                bool want = _allowNew.Checked;
-                Elevated($"--service-set {_app.ServiceName} {(want ? "yes" : "no")}", r => r == RelayService.Result.Ok
-                    ? (want ? "The relay service allows new host names." : "The relay service no longer takes new host names.")
-                    : RelayService.Say(r, ""), quietSuccess: true);
-                return;
-            }
-            _app.Server.AllowNewNames = _allowNew.Checked;
-            _app.Log.Write(_allowNew.Checked ? "New host names are allowed." : "New host names are turned off.");
+                if (r != RelayService.Result.Ok) return RelayService.Say(r, "");
+                if (!service) _app.Server.SetAllowNewNamesFromFile(want);
+                return want ? "The relay allows new host names." : "The relay no longer takes new host names.";
+            }, quietSuccess: true);
         }
 
         private void Forget()
@@ -435,19 +549,23 @@ namespace KovaRelay
         /// </summary>
         private async void Elevated(string args, Func<RelayService.Result, string> say, bool quietSuccess = false)
         {
-            if (_busy) return;
-            _busy = true;
-            UseWaitCursor = true;
-            RelayService.Result r;
-            try { r = await Task.Run(() => RelayService.RunElevated(args)); }
-            finally { _busy = false; UseWaitCursor = false; }
-            if (IsDisposed) return;
+            if (await RunElevatedAsync(args) is not { } r || IsDisposed) return;
             _note = say(r);
             if (r != RelayService.Result.Ok) SetChecks();   // a check box that did not take goes back
             _app.UpdateTip();
             RefreshState(force: true);
             if (r != RelayService.Result.Ok || !quietSuccess)
                 MessageBox.Show(this, _note, "Kova Relay", MessageBoxButtons.OK, r == RelayService.Result.Ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+
+        /// <summary>Runs an elevated copy off the window's thread; null if another one is still waiting on its prompt.</summary>
+        private async Task<RelayService.Result?> RunElevatedAsync(string args)
+        {
+            if (_busy) return null;
+            _busy = true;
+            UseWaitCursor = true;
+            try { return await Task.Run(() => RelayService.RunElevated(args)); }
+            finally { _busy = false; UseWaitCursor = false; }
         }
 
         private async void AsServiceChanged()
@@ -495,7 +613,7 @@ namespace KovaRelay
                 finally { _busy = false; UseWaitCursor = false; }
                 if (r == RelayService.Result.Ok)
                 {
-                    string? why = _app.Server.Start(_app.Files.ReadPort(out _));
+                    string? why = _app.Server.Start(_app.Files.LoadSettings().Port);
                     _note = why is null ? "The relay no longer runs as a service. It runs here in the tray again, while you are signed in."
                         : "The relay no longer runs as a service, and it could not start here: " + why;
                 }

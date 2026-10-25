@@ -101,6 +101,7 @@ namespace TailRemote
                 Environment.SetEnvironmentVariable("KOVA_INSTANCE", args[1]);
                 args = args[2..];
             }
+            Firewall.App = KovaFirewall.Profile; // after the instance word: the rule names carry it
             // The service counts its start before anything else can go wrong: a new version that failed
             // before it got as far as the service itself was never counted, so it was never rolled back.
             if (args.Length == 1 && args[0] == "--service") ServiceHost.CountStart();

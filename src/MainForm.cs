@@ -394,7 +394,7 @@ namespace TailRemote
             _rideOut.CheckedChanged += (_, _) => { SaveSettings(); if (_player != null) _player.RideOut = _rideOut.Checked; };
             _audioSetup.Click += (_, _) => Menus.AfterMenu(() => SetUpAudio());
             _audioRemove.Click += (_, _) => Menus.AfterMenu(() => RemoveAudio());
-            _portEditor.Click += (_, _) => Menus.AfterMenu(() => { SaveSettings(); using var f = new PortEditorForm(_settings, PortsInUse()); f.ShowDialog(this); });
+            _portEditor.Click += (_, _) => Menus.AfterMenu(() => { SaveSettings(); using var f = new PortEditorForm(KovaFirewall.Book(_settings), PortsInUse()); f.ShowDialog(this); });
             _startup.CheckedChanged += (_, _) => Menus.AfterMenu(StartupChanged); // after the menu closes, so NVDA reads what comes up
             _service.CheckedChanged += (_, _) => { if (!_settingService) Menus.AfterMenu(ServiceChanged); };
             _titleTimer.Tick += (_, _) => UpdateTitle();
@@ -2144,7 +2144,7 @@ namespace TailRemote
             if (!CheckListenPassword()) return;
             string listen = _listenPassword.Text;
             if (!CheckPort(out int port)) return;
-            if (!PortEditorForm.Remember(_settings, port)) TellSaveProblem();
+            if (!KovaFirewall.Remember(_settings, port)) TellSaveProblem();
             try
             {
                 _host = new Host(port, _password.Text, listen, msg => Later(() => Log(msg)),
@@ -2227,7 +2227,7 @@ namespace TailRemote
             if (!oldOpen)
             {
                 // Closed already: nothing to offer, and nothing to keep on Port editor's list.
-                if (!PortEditorForm.Forget(_settings, oldPort)) TellSaveProblem();
+                if (!KovaFirewall.Forget(_settings, oldPort)) TellSaveProblem();
                 if (!newOpen) await OfferToOpenPort(newPort);
                 return;
             }
@@ -2244,7 +2244,7 @@ namespace TailRemote
             if (IsDisposed) return;
             if (result == ChangeResult.Done)
             {
-                if (!PortEditorForm.Remember(_settings, newPort) || (close && !PortEditorForm.Forget(_settings, oldPort))) TellSaveProblem();
+                if (!KovaFirewall.Remember(_settings, newPort) || (close && !KovaFirewall.Forget(_settings, oldPort))) TellSaveProblem();
                 if (_host == null) { _settings.HostedPort = newPort; SaveNow(); }
             }
             Say(result switch
@@ -2901,7 +2901,7 @@ namespace TailRemote
         {
             int before = _settings.HostedPort;
             bool forget = before != 0 && before != port && !await System.Threading.Tasks.Task.Run(() => Firewall.IsOpen(before));
-            if (!PortEditorForm.Remember(_settings, port) || (forget && !PortEditorForm.Forget(_settings, before))) TellSaveProblem();
+            if (!KovaFirewall.Remember(_settings, port) || (forget && !KovaFirewall.Forget(_settings, before))) TellSaveProblem();
             _settings.HostedPort = port;
             SaveNow();
         }

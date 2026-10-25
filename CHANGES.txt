@@ -1,3 +1,10 @@
+4.4.1
+New feature: Kova Relay has a Port editor, the same as Kova's. Find it next to the port in the relay's window. It lists the ports the relay uses and has used, says which are open in Windows Firewall and which one is in use, opens or closes a port, and cleans up old firewall rules the relay left behind. It never closes the port the relay is using.
+New feature: when you change Kova Relay's port, it offers to open the new port in Windows Firewall and close the old one, with one administrator prompt. If it runs as a Windows service, the service moves to the new port straight away.
+Changed: Kova Relay no longer keeps port.txt or any other file next to it. The port is in the relay's own settings, which the tray icon and the service share, and you change it in the relay's window. Only an administrator can change it, so Windows asks for permission. A new relay starts on port 47200.
+Changed: if you used Kova Relay 4.4.0, its port.txt is moved into the new settings the first time 4.4.1 starts, after one administrator prompt, and then deleted, so the relay stays on the same port. Its host list moves to your own folder, and its old log goes.
+Changed: Kova Relay's firewall rules are named Kova Relay port and a number, so Kova's clean-up never removes them, and the relay's never removes Kova's.
+
 4.4.0
 Important: both PCs need 4.4.0, and a PC on 4.4.0 cannot connect to one still on 4.3.0. Update the PCs you control first, from a PC that is still on 4.3.0, with File, Update the remote PC. Then update the PC you control them from.
 New feature: Kova Relay, a small separate program, KovaRelay.exe. Put it on any PC that others can reach, put the port you want in port.txt next to it, and run it. It sits in the notification area; open it to see who is connected, change the port, stop it, start it with Windows or run it as a Windows service, and open its log. A host behind a home router, or with no open port, can then still be reached.

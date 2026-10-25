@@ -10,7 +10,7 @@
     <RootNamespace>KovaRelay</RootNamespace>
     <Product>Kova Relay</Product>
     <AssemblyTitle>Kova Relay</AssemblyTitle>
-    <Version>4.4.0</Version>
+    <Version>4.4.1</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
@@ -40,6 +40,9 @@
 
   <ItemGroup>
     <Compile Include="*.cs" />
+    <!-- Kova's own firewall code and port editor, shared (not copied): the relay brings its own profile (RelayFirewall.cs). -->
+    <Compile Include="..\src\Firewall.cs" Link="Shared\Firewall.cs" />
+    <Compile Include="..\src\PortEditorForm.cs" Link="Shared\PortEditorForm.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">

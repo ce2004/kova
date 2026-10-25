@@ -47,7 +47,7 @@ namespace KovaRelayWire
     public static class Wire
     {
         public static readonly byte[] Magic = "KRL1"u8.ToArray();
-        /// <summary>The port a relay uses unless port.txt says otherwise (and the one Kova assumes for name@relay with no port).</summary>
+        /// <summary>The port a relay uses unless its settings say otherwise (and the one Kova assumes for name@relay with no port).</summary>
         public const int DefaultPort = 47200;
         public const int ChallengeBytes = 32;
         public const int ServerHelloBytes = 4 + ChallengeBytes;

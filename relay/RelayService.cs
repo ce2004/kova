@@ -16,13 +16,14 @@ namespace KovaRelay
     /// Kova Relay as a Windows service.
     ///
     /// The service runs this exe where it is ("exe" --service NAME), as its own virtual account NT SERVICE\NAME (not
-    /// SYSTEM), starts at boot with nobody signed in, and Windows restarts it after a crash. It reads port.txt from the
-    /// exe's folder; its hosts list, settings, log and status live in ProgramData\NAME, which only SYSTEM,
-    /// administrators and that account can change (users can read it, so the tray can show the status and the log).
+    /// SYSTEM), starts at boot with nobody signed in, and Windows restarts it after a crash. Its settings (settings.json,
+    /// shared with the tray), hosts list, log and status live in ProgramData\NAME, which only SYSTEM, administrators
+    /// and that account can change (users can read it, so the tray can show the status, the settings and the log).
+    /// Without the service the folder is still there, for settings.json alone, and only administrators can change it.
     ///
     /// Everything that changes the service goes through an elevated copy of this exe (a UAC prompt): install, remove,
     /// start, stop, port, settings, forgetting a name. The elevated copy writes into the protected folder, and the
-    /// service picks it up within 2 seconds. Nothing a user without administrator rights can write ever reaches the
+    /// service picks it up within 2 seconds (a new port restarts it). Nothing a user without administrator rights can write ever reaches the
     /// service, and installing is refused unless the exe and its folders are protected from such users
     /// (ProtectedFromUsers, the same check Kova's own service uses): otherwise anyone could swap the exe and run code
     /// as the service.
@@ -98,7 +99,7 @@ namespace KovaRelay
         public static string Say(Result r, string exe) => r switch
         {
             Result.Ok => "Done.",
-            Result.NotProtected => $"The relay can only run as a service from a folder that only administrators can change, such as Program Files. Otherwise any program could replace {Path.GetFileName(exe)} and run as the service. Move KovaRelay.exe and port.txt to a folder like C:\\Program Files\\Kova Relay and turn this on from there.",
+            Result.NotProtected => $"The relay can only run as a service from a folder that only administrators can change, such as Program Files. Otherwise any program could replace {Path.GetFileName(exe)} and run as the service. Move KovaRelay.exe to a folder like C:\\Program Files\\Kova Relay and turn this on from there.",
             Result.CannotRunHere => "The relay cannot run as a service from here: it is on a network drive, a removable drive, OneDrive or a temporary folder, which may not be there when Windows starts. Move it to a folder like C:\\Program Files\\Kova Relay first.",
             Result.CreateFailed => "Windows would not create the service.",
             Result.WouldNotStart => "The service was installed but would not start. The relay's log in ProgramData may say why.",
@@ -109,10 +110,10 @@ namespace KovaRelay
 
         // ------------------------------------------------------------------ the elevated side
 
-        /// <summary>Handles --service-* switches. Returns the exit code, or null if args are not one of them.</summary>
+        /// <summary>Handles --service-* and --settings-* switches. Returns the exit code, or null if args are not one of them.</summary>
         public static int? HandleSwitch(string[] args)
         {
-            if (args.Length < 2 || !args[0].StartsWith("--service", StringComparison.OrdinalIgnoreCase)) return null;
+            if (args.Length < 2 || !(args[0].StartsWith("--service", StringComparison.OrdinalIgnoreCase) || args[0].StartsWith("--settings", StringComparison.OrdinalIgnoreCase))) return null;
             string name = args[1];
             if (!NameOk(name)) return (int)Result.BadArgs;
             bool loopback = Array.Exists(args, a => a.Equals("--loopback", StringComparison.OrdinalIgnoreCase));
@@ -126,15 +127,42 @@ namespace KovaRelay
                     case "--service-control":
                         if (args.Length < 3) return (int)Result.BadArgs;
                         return (int)(args[2] == "start" ? StartAndWait(name) : StopAndWait(name));
-                    case "--service-port":
+                    case "--settings-port":
+                    {
+                        // The port, for the tray and the service alike. The service, if it runs, restarts on it.
                         if (args.Length < 3 || !int.TryParse(args[2], NumberStyles.None, CultureInfo.InvariantCulture, out int port) || port < 1 || port > 65535)
                             return (int)Result.BadArgs;
-                        if (!new RelayFiles(ExeFolder).WritePort(port)) return (int)Result.Failed;
-                        StopAndWait(name);
-                        return (int)StartAndWait(name);
-                    case "--service-set":
-                        if (args.Length < 3) return (int)Result.BadArgs;
-                        return new RelayFiles(DataDir(name)).SaveAllowNewNames(args[2] == "yes") ? 0 : (int)Result.Failed;
+                        var files = SettingsFiles(name);
+                        if (!SecureDataDir(name) || !files.SaveSettings(files.LoadSettings() with { Port = port })) return (int)Result.Failed;
+                        DeleteOldSettings(files);
+                        if (State(name) is Running or StartPending)
+                        {
+                            StopAndWait(name);
+                            return (int)StartAndWait(name);
+                        }
+                        return 0;
+                    }
+                    case "--settings-allow":
+                    {
+                        if (args.Length < 3 || args[2] is not ("yes" or "no")) return (int)Result.BadArgs;
+                        var files = SettingsFiles(name);
+                        if (!SecureDataDir(name) || !files.SaveSettings(files.LoadSettings() with { AllowNewNames = args[2] == "yes" })) return (int)Result.Failed;
+                        DeleteOldSettings(files);
+                        return 0;
+                    }
+                    case "--settings-migrate":
+                    {
+                        // 4.4.0's port.txt and relay-settings.txt, moved into settings.json once and then deleted.
+                        // hosts.txt and the log beside the exe go too, once the tray has its own copy of the host list.
+                        var files = SettingsFiles(name);
+                        if (!SecureDataDir(name)) return (int)Result.Failed;
+                        if (!File.Exists(files.SettingsFile) && !files.SaveSettings(files.LoadSettings())) return (int)Result.Failed;
+                        DeleteOldSettings(files);
+                        if (args.Length > 2 && args[2] == "--hosts-moved")
+                            foreach (string f in new[] { "hosts.txt", "relay-log.txt", "relay-log.old.txt" })
+                                try { File.Delete(Path.Combine(ExeFolder, f)); } catch (Exception) { }
+                        return 0;
+                    }
                     case "--service-forget":
                         if (args.Length < 3 || !KovaRelayWire.Wire.NameOk(args[2])) return (int)Result.BadArgs;
                         File.AppendAllText(ForgetFile(name), args[2] + "\r\n");
@@ -143,6 +171,16 @@ namespace KovaRelay
             }
             catch (Exception) { return (int)Result.Failed; }
             return (int)Result.BadArgs;
+        }
+
+        /// <summary>settings.json and what 4.4.0 left beside this exe, as the elevated copy reads them.</summary>
+        private static RelayFiles SettingsFiles(string name) => new(DataDir(name), DataDir(name), ExeFolder);
+
+        /// <summary>Deletes 4.4.0's settings files once settings.json holds what they said. A file that will not go is left.</summary>
+        private static void DeleteOldSettings(RelayFiles files)
+        {
+            foreach (string? f in new[] { files.OldPortFile, files.OldSettingsFile, files.OldDataSettingsFile })
+                if (f is not null) try { File.Delete(f); } catch (Exception) { }
         }
 
         private static Result Install(string name, bool loopback)
@@ -165,24 +203,42 @@ namespace KovaRelay
             }
             Run("sc.exe", $"description {name} \"Pairs Kova hosts and the PCs that control them, so a host with no open port can still be reached.\"");
             Run("sc.exe", $"failure {name} reset= 60 actions= restart/2000/restart/5000/restart/10000");
-            if (!PrepareDataDir(name)) return Result.Failed;
+            if (!SecureDataDir(name)) return Result.Failed;
+            // The host list a relay in the tray kept (4.4.0: beside the exe; 4.4.1: this user's LocalAppData) carries over once.
+            string hosts = Path.Combine(DataDir(name), "hosts.txt");
+            foreach (string from in new[] { Path.Combine(ExeFolder, "hosts.txt"), Path.Combine(TrayFolder(name), "hosts.txt") })
+                try { if (File.Exists(from) && !File.Exists(hosts)) File.Copy(from, hosts); } catch (Exception) { }
+            // Written by this administrator: whatever settings.json said before (or 4.4.0's files) is saved again here.
+            var files = SettingsFiles(name);
+            if (!files.SaveSettings(files.LoadSettings())) return Result.Failed;
+            DeleteOldSettings(files);
             return StartAndWait(name);
         }
 
-        /// <summary>ProgramData\NAME: SYSTEM and administrators full control, the service's own account may change it,
-        /// users may only read. Files the relay saved beside the exe before (hosts list, settings) are carried over once.</summary>
-        private static bool PrepareDataDir(string name)
+        /// <summary>The folder a relay in the tray keeps its host list and log in: this user's LocalAppData\NAME.</summary>
+        public static string TrayFolder(string name) =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), name);
+
+        /// <summary>
+        /// ProgramData\NAME, made safe: owned by administrators, SYSTEM and administrators full control, the service's own
+        /// account (when it is installed) may change it, users may only read. Done by every elevated copy that writes
+        /// there: a user may have made the folder first (anyone can make folders in ProgramData), and then owned it.
+        /// </summary>
+        internal static bool SecureDataDir(string name)
         {
             try
             {
                 string dir = DataDir(name);
-                var serviceSid = (SecurityIdentifier)new NTAccount("NT SERVICE", name).Translate(typeof(SecurityIdentifier));
+                SecurityIdentifier? serviceSid = null;
+                if (IsInstalled(name))
+                    try { serviceSid = (SecurityIdentifier)new NTAccount("NT SERVICE", name).Translate(typeof(SecurityIdentifier)); } catch (Exception) { }
                 var sec = new DirectorySecurity();
                 sec.SetAccessRuleProtection(true, false);
                 const InheritanceFlags All = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
                 sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), FileSystemRights.FullControl, All, PropagationFlags.None, AccessControlType.Allow));
                 sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), FileSystemRights.FullControl, All, PropagationFlags.None, AccessControlType.Allow));
-                sec.AddAccessRule(new FileSystemAccessRule(serviceSid, FileSystemRights.Modify, All, PropagationFlags.None, AccessControlType.Allow));
+                if (serviceSid is not null)
+                    sec.AddAccessRule(new FileSystemAccessRule(serviceSid, FileSystemRights.Modify, All, PropagationFlags.None, AccessControlType.Allow));
                 sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.ReadAndExecute, All, PropagationFlags.None, AccessControlType.Allow));
                 sec.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
                 var info = new DirectoryInfo(dir);
@@ -194,12 +250,8 @@ namespace KovaRelay
                     var fs = f.GetAccessControl();
                     fs.SetAccessRuleProtection(false, false);
                     foreach (FileSystemAccessRule r in fs.GetAccessRules(true, false, typeof(SecurityIdentifier))) fs.RemoveAccessRuleSpecific(r);
+                    fs.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
                     f.SetAccessControl(fs);
-                }
-                foreach (string file in new[] { "hosts.txt", "relay-settings.txt" })
-                {
-                    string from = Path.Combine(ExeFolder, file), to = Path.Combine(dir, file);
-                    if (File.Exists(from) && !File.Exists(to)) File.Copy(from, to);
                 }
                 return true;
             }
@@ -373,22 +425,23 @@ namespace KovaRelay
             Report(StartPending);
             string data = DataDir(_name);
             try { Directory.CreateDirectory(data); } catch (Exception) { }
-            // Port from the exe's folder (an administrator sets it there); everything the relay writes, in ProgramData.
-            var files = new RelayFiles(data, portFolder: ExeFolder);
+            // settings.json (an administrator writes it), and everything the relay writes, in ProgramData. Until the
+            // tray has moved 4.4.0's port.txt into settings.json, the port in it is still used.
+            var files = new RelayFiles(data, data, ExeFolder);
             var log = new RelayLog(data);
             AppDomain.CurrentDomain.UnhandledException += (_, e) => { log.Write("The relay service stopped because of an unexpected error: " + e.ExceptionObject); log.Flush(); };
             var server = new RelayServer(files, log) { LoopbackOnly = _loopback };
             log.Write($"Kova Relay {Program.Version} is starting as the service {_name}, from {ExeFolder}.");
-            server.Start(files.ReadPort(out _));
+            server.Start(files.LoadSettings().Port);
             Report(Running);
             DateTime settingsStamp = Stamp(files.SettingsFile);
             while (!StopNow.WaitOne(2000))
             {
                 try
                 {
-                    // An administrator changed relay-settings.txt (through --service-set): take it.
+                    // An administrator changed settings.json (through --settings-allow): take it. A new port comes with a restart.
                     DateTime now = Stamp(files.SettingsFile);
-                    if (now != settingsStamp) { settingsStamp = now; server.SetAllowNewNamesFromFile(files.LoadAllowNewNames()); }
+                    if (now != settingsStamp) { settingsStamp = now; server.SetAllowNewNamesFromFile(files.LoadSettings().AllowNewNames); }
                     // Names an administrator asked to forget (--service-forget).
                     string forget = ForgetFile(_name);
                     if (File.Exists(forget))
