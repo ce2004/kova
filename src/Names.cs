@@ -18,6 +18,22 @@ namespace TailRemote
         /// </summary>
         public static readonly string Instance = CleanInstance(Environment.GetEnvironmentVariable("KOVA_INSTANCE"));
 
+        /// <summary>
+        /// A test switch from the environment, or null when this copy runs as administrator or SYSTEM (4.4): an elevated
+        /// process's environment comes partly from HKCU\Environment, which any program the user runs can write, so a
+        /// switch there must never steer an elevated copy (where its settings come from, what it would install).
+        /// </summary>
+        public static string? TestSwitch(string name)
+        {
+            try
+            {
+                using var me = System.Security.Principal.WindowsIdentity.GetCurrent();
+                if (me.IsSystem || new System.Security.Principal.WindowsPrincipal(me).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator)) return null;
+            }
+            catch { return null; }
+            return Environment.GetEnvironmentVariable(name);
+        }
+
         private static string CleanInstance(string? s)
         {
             if (string.IsNullOrEmpty(s)) return "";

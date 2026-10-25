@@ -42,12 +42,29 @@ namespace TailRemote
             return string.Join("\n", lines.Distinct());
         }
 
-        /// <summary>The cards in a Describe text: each address, and the broadcast address of its network (or null).</summary>
-        public static List<(byte[] Mac, IPAddress? Broadcast)> Parse(string? text)
+        // The cards come from the other PC and are kept and used at every Wake, so a hostile host could otherwise have
+        // this PC send packets wherever it chose. A PC has a few cards; a directed broadcast only makes sense on a
+        // private network (the sleeping PC's home or office), so a public one is never sent to.
+        public const int MaxCards = 8;
+
+        /// <summary>True for addresses on private networks: 10/8, 172.16/12, 192.168/16 and 169.254/16.</summary>
+        public static bool IsPrivate(IPAddress a)
+        {
+            if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = a.GetAddressBytes();
+            return b[0] == 10 || (b[0] == 172 && (b[1] & 0xF0) == 16) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
+        }
+
+        /// <summary>The cards in a Describe text: each address, and the broadcast address of its network (or null). At most MaxCards.</summary>
+        public static List<(byte[] Mac, IPAddress? Broadcast)> Parse(string? text) => Parse(text, privateOnly: true);
+
+        // privateOnly false: only for this PC's own cards (Describe here), which no other PC can change.
+        private static List<(byte[] Mac, IPAddress? Broadcast)> Parse(string? text, bool privateOnly)
         {
             var list = new List<(byte[], IPAddress?)>();
             foreach (string line in (text ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
+                if (list.Count >= MaxCards) break;
                 string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                 byte[] mac;
                 try { mac = Convert.FromHexString(parts[0]); } catch { continue; }
@@ -61,6 +78,7 @@ namespace TailRemote
                     byte[] b = new byte[4];
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(b, a | (uint.MaxValue >> prefix));
                     broadcast = new IPAddress(b);
+                    if (privateOnly && (!IsPrivate(addr) || !IsPrivate(broadcast))) broadcast = null; // the card is kept; only the everyone-broadcast reaches it
                 }
                 list.Add((mac, broadcast));
             }
@@ -78,21 +96,21 @@ namespace TailRemote
 
         /// <summary>
         /// Sends the packet everywhere it might be heard on this PC's networks: everyone (255.255.255.255) and
-        /// each of this PC's own networks' broadcast addresses, plus any given, on the two usual ports, three
-        /// times (one packet can be lost). Returns how many were sent.
+        /// each of this PC's own networks' broadcast addresses, plus any given (private networks only), on port 9
+        /// (the usual one; port 7 is echo, and packets to it can bounce back), three times (one packet can be lost).
+        /// Returns how many were sent.
         /// </summary>
         public static int Send(byte[] mac, IEnumerable<IPAddress?> also)
         {
             byte[] packet = MagicPacket(mac);
             var targets = new HashSet<IPAddress> { IPAddress.Broadcast };
-            foreach (var b in also) if (b != null) targets.Add(b);
-            foreach (var (_, b) in Parse(Describe())) if (b != null) targets.Add(b);
+            foreach (var b in also) if (b != null && IsPrivate(b) && targets.Count < 1 + MaxCards) targets.Add(b);
+            foreach (var (_, b) in Parse(Describe(), privateOnly: false)) if (b != null) targets.Add(b);
             int sent = 0;
             using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
             for (int round = 0; round < 3; round++)
                 foreach (var t in targets)
-                    foreach (int port in new[] { 9, 7 })
-                        try { udp.Send(packet, packet.Length, new IPEndPoint(t, port)); sent++; } catch { }
+                    try { udp.Send(packet, packet.Length, new IPEndPoint(t, 9)); sent++; } catch { }
             return sent;
         }
     }

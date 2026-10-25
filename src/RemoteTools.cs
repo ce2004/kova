@@ -75,6 +75,9 @@ namespace TailRemote
                     }
                     return sb.ToString();
                 }
+                // Only folders on this PC's own drives: a share (\\server\share) would make this PC sign in to that
+                // server as its user, handing over their password's hash, and \\?\ or \\.\ paths reach devices.
+                if (!FileChannel.RemotePathOk(path)) return "E\tKova only opens folders on the remote PC's own drives, like C:\\Users.\n";
                 // Opened by its \\?\ form: plain, Windows cuts a dot or space off the end of a name, so a folder a
                 // Mac, Linux or WSL made ("notes.") was listed but opening it opened "notes" (or said it was gone).
                 var dir = new DirectoryInfo(FileChannel.Long(path));

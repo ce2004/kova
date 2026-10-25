@@ -13,7 +13,7 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>4.3.0</Version>
+    <Version>4.4.0</Version>
     <!-- ARM64 by default; "dotnet publish -r win-x64" builds the x64 copy. -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-arm64</RuntimeIdentifier>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
@@ -43,6 +43,8 @@
 
   <ItemGroup>
     <Compile Include="src\**\*.cs" />
+    <!-- What Kova and Kova Relay say to each other: the one file both are built from (relay\ is its own project). -->
+    <Compile Include="relay\RelayWire.cs" Link="src\RelayWire.cs" />
   </ItemGroup>
 
   <!-- Trimming keeps all of TailRemote's own code: its Windows audio and COM declarations are only reached by Windows itself. -->
@@ -90,5 +92,19 @@
   <ItemGroup>
     <PackageReference Include="Concentus" Version="2.2.2" />
   </ItemGroup>
+
+  <!-- The Kova Helper NVDA add-on (nvda-addon\): zipped into a .nvda-addon at every build where it changed, and carried inside Kova.exe (NvdaHelper installs it into a host's NVDA). -->
+  <ItemGroup>
+    <KovaHelperAddonFile Include="nvda-addon\**\*" Exclude="nvda-addon\**\__pycache__\**;nvda-addon\**\*.pyc" />
+  </ItemGroup>
+  <Target Name="KovaHelperAddonZip" Inputs="@(KovaHelperAddonFile)" Outputs="$(IntermediateOutputPath)KovaHelper.nvda-addon">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <ZipDirectory SourceDirectory="$(MSBuildProjectDirectory)\nvda-addon" DestinationFile="$(IntermediateOutputPath)KovaHelper.nvda-addon" Overwrite="true" />
+  </Target>
+  <Target Name="KovaHelperAddonEmbed" BeforeTargets="AssignTargetPaths" DependsOnTargets="KovaHelperAddonZip">
+    <ItemGroup>
+      <EmbeddedResource Include="$(IntermediateOutputPath)KovaHelper.nvda-addon" LogicalName="KovaHelper.nvda-addon" />
+    </ItemGroup>
+  </Target>
 
 </Project>

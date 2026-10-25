@@ -96,6 +96,18 @@ namespace TailRemote
         }
         /// <summary>Clipboard text from the host. Raised on a network thread.</summary>
         public event Action<string>? ClipboardReceived;
+        /// <summary>Whether text and files the host sends without being asked are taken at all (Settings.AcceptUnasked). Read at each connection.</summary>
+        public static volatile bool AcceptUnasked = true;
+
+        /// <summary>Clipboard text the host sent without being asked: never put on the clipboard by itself. The path is where it was saved (null if it could not be).</summary>
+        public event Action<string, string?>? UnaskedClipboardReceived;
+
+        /// <summary>The host is turning logins from here away for now (too many wrong passwords): trying again only makes it longer.</summary>
+        public const string TurnedAway = "The remote PC is turning away logins from here for now, after too many wrong passwords. Try again later.";
+
+        /// <summary>The most a message from the host that is read aloud may be (64 KB): words, never megabytes.</summary>
+        internal const int MaxSaidMessage = 64 << 10;
+
         /// <summary>True when the host let us in with its listen-only password: audio only, no keys.</summary>
         public bool ListenOnly { get; private set; }
         /// <summary>0 = full quality; above that, a lower sample rate while the connection struggles.</summary>
@@ -140,9 +152,28 @@ namespace TailRemote
         /// </summary>
         /// <summary>lockedStep: the bitrate step to hold from the very first sound, or -1 for Variable.</summary>
         /// <summary>answerMs: how long to wait for the PC to answer at all (shorter while trying again).</summary>
-        public static Client Connect(string address, int port, string password, Player player, Action<string> status, int lockedStep = -1, int answerMs = 8000)
+        /// <summary>
+        /// trust: what this PC remembers about hosts (their lasting identity and the device ticket each gave it).
+        /// A host whose identity differs from the one remembered is refused before anything is proven to it
+        /// (HostChangedException); null trusts any host, for tests. address may be a relay address, "name@relay".
+        /// </summary>
+        public static Client Connect(string address, int port, string password, Player player, Action<string> status, int lockedStep = -1, int answerMs = 8000, IHostTrust? trust = null)
         {
-            var tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
+            // A relay address carries its own port, or the relay's usual one (never the Port setting, which is the host's).
+            var route = Relay.Parse(address, KovaRelayWire.Wire.DefaultPort, out string? relayProblem);
+            if (relayProblem != null) throw new InvalidOperationException(relayProblem);
+            TcpClient tcp;
+            byte[]? relayId = null;
+            if (route != null)
+            {
+                // Through a Kova Relay: once paired, the stream is the host's, and the login below runs end to end.
+                tcp = Relay.Dial(Relay.Resolve(route), route.Name, answerMs, out byte[] pairing);
+                relayId = pairing;
+                tcp.Client.SendTimeout = 5000;
+            }
+            else
+            {
+            tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
             tcp.Client.DualMode = true;
             tcp.Client.SendTimeout = 5000; // a host that stops taking data is dropped, never waited on forever
             try
@@ -167,6 +198,8 @@ namespace TailRemote
             }
             catch (AggregateException e) { tcp.Dispose(); throw new InvalidOperationException(e.InnerException?.Message ?? e.Message); }
             catch { tcp.Dispose(); throw; }
+            }
+            string pc = TrustKey(address, port);
 
             var stream = tcp.GetStream();
             stream.ReadTimeout = 8000;
@@ -175,15 +208,26 @@ namespace TailRemote
             string? filesTo = null;
             try
             {
+                // The whole login within a time limit, not each read: a host trickling a byte every few seconds
+                // used to keep the login waiting for ever.
+                long loginBy = Environment.TickCount64 + Math.Max(answerMs, 8000) + 8000;
                 byte[] hello = new byte[Protocol.HelloBytes];
-                Protocol.ReadExactly(stream, hello.AsSpan(0, 4));
+                ReadWithin(stream, hello.AsSpan(0, 4), loginBy);
                 if (!hello.AsSpan(0, 4).SequenceEqual(Protocol.Magic))
                     throw new InvalidOperationException(hello.AsSpan(0, 3).SequenceEqual("TRM"u8)
                         ? "The other PC has a different Kova version, or the connection damaged its first message. Update both to the latest."
                         : "That is not a Kova host, or the connection damaged its first message.");
-                Protocol.ReadExactly(stream, hello.AsSpan(4));
+                ReadWithin(stream, hello.AsSpan(4), loginBy);
                 var sinceHello = Stopwatch.StartNew(); // the host's patience for the answer runs from about now
                 if (!Protocol.CheckOk(hello)) throw new InvalidOperationException(Protocol.DamagedLogin);
+                // Signed by the host's lasting identity, and the identity this PC knows for it: otherwise nothing
+                // is proven to it, so whoever answered in its place learns nothing to guess the password from.
+                if (!Protocol.HelloSignedOk(hello))
+                    throw new InvalidOperationException("That PC's first message was not signed properly, so nothing was sent to it. It may not be a Kova host, or the connection damaged it.");
+                byte[] identity = hello[Protocol.HelloIdentityAt..Protocol.HelloSignatureAt];
+                var (knownIdentity, ticket) = trust?.Known(pc) ?? (null, null);
+                if (knownIdentity != null && !knownIdentity.AsSpan().SequenceEqual(identity))
+                    throw new HostChangedException(pc, address.Trim(), knownIdentity, identity);
                 byte[] hostNonce = hello[4..20];
                 byte[] passwordKey = Protocol.DeriveKey(password, hello.AsSpan(Protocol.HelloSaltAt, Protocol.SaltBytes));
                 byte[] myNonce = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
@@ -196,6 +240,12 @@ namespace TailRemote
                     byte[] shared = Protocol.SharedSecret(exchange, hello.AsSpan(Protocol.HelloPublicAt, Protocol.PublicKeyBytes))
                         ?? throw new InvalidOperationException("That is not a Kova host, or the connection damaged its first message.");
                     Protocol.WritePublic(exchange, answer.AsSpan(Protocol.AnswerPublicAt, Protocol.PublicKeyBytes));
+                    // The ticket this host gave last time, masked with this login's own secret: never readable on the way.
+                    if (ticket is { Length: HostIdentity.TicketBytes })
+                    {
+                        byte[] pad = Protocol.TicketPad(shared, hostNonce, myNonce);
+                        for (int i = 0; i < HostIdentity.TicketBytes; i++) answer[Protocol.AnswerTicketAt + i] = (byte)(ticket[i] ^ pad[i]);
+                    }
                     key = Protocol.SessionKey(passwordKey, shared, hello, answer.AsSpan(0, Protocol.AnswerProofAt));
                     System.Security.Cryptography.CryptographicOperations.ZeroMemory(shared);
                 }
@@ -205,7 +255,7 @@ namespace TailRemote
                 stream.Write(answer);
 
                 byte[] reply = new byte[Protocol.ReplyBytes];
-                try { Protocol.ReadExactly(stream, reply); }
+                try { ReadWithin(stream, reply, loginBy); }
                 // The host hangs up without a word in two cases. On a damaged answer it does so at once.
                 // On a login over 8 seconds in all (a very slow line, or a busy host), it gave up waiting: that is not damage, and may even be a wrong password, so
                 // it must not be reported as damage (the window keeps trying again on damage).
@@ -214,10 +264,13 @@ namespace TailRemote
                 { throw new InvalidOperationException(LoginNotAwaited); }
                 catch (System.IO.EndOfStreamException) { throw new InvalidOperationException(Protocol.DamagedLogin); } // the host hung up on a damaged answer
                 if (!Protocol.CheckOk(reply)) throw new InvalidOperationException(Protocol.DamagedLogin);
+                if (reply[0] == Protocol.ReplyTurnedAway) throw new InvalidOperationException(TurnedAway);
                 if (reply[0] != 1) throw new InvalidOperationException("Wrong password.");
                 byte[] role = reply[1..2], token = reply[2..10], hostProof = reply[10..42];
                 if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(hostProof, Protocol.Proof(key, 'H', myNonce, hostNonce)))
                     throw new InvalidOperationException("That PC does not know the password, so nothing was sent to it. Check the address.");
+                // Logged in to it with the password: from now on this PC knows it by this identity.
+                if (knownIdentity == null) trust?.Remember(pc, identity, null);
                 // The host pings back every 2 seconds; 10 silent seconds means it is gone.
                 stream.ReadTimeout = 10_000;
 
@@ -236,8 +289,10 @@ namespace TailRemote
                 var c = new Client(tcp, stream, udp, token, player, new SecureLink(key, hostNonce, myNonce, isHost: false))
                 {
                     ListenOnly = role[0] == Protocol.RoleListen,
-                    _hostUdp = new IPEndPoint(hostEp.Address, port),
-                    _laneHost = hostEp, _laneKey = key, _hostNonce = hostNonce, _myNonce = myNonce,
+                    _hostUdp = new IPEndPoint(hostEp.Address, route != null ? hostEp.Port : port),
+                    _udpHead = relayId == null ? null : RelayHead(relayId),
+                    _laneHost = new LaneRoute(hostEp, route?.Name, identity), _laneKey = key, _hostNonce = hostNonce, _myNonce = myNonce,
+                    _trust = trust, _pc = pc, _identity = identity,
                 };
                 if (lockedStep >= 0)
                 {
@@ -269,10 +324,17 @@ namespace TailRemote
                     files.Rate = () => c._pace;
                     files.PeerName = address.Trim();
                     files.TextReceived = text => c.ClipboardReceived?.Invoke(text);
+                    // 4.4: the host never replaces this PC's clipboard unless this PC asked for it (Get the remote
+                    // clipboard): text sent unasked is kept in a file and offered, files go to Downloads. And with
+                    // AcceptUnasked off, nothing unasked is taken at all.
+                    files.ClipboardOnlyWhenAsked = true;
+                    files.AcceptUnasked = AcceptUnasked;
+                    files.UnaskedTextReceived = (text, path) => c.UnaskedClipboardReceived?.Invoke(text, path);
                     files.FilesReceived = paths => c.ClipboardFilesReceived?.Invoke(paths);
                     files.Progress = t => c.TransferProgress?.Invoke(t);
                     byte[] channel = files.Id;
-                    files.Dial = () => OpenLane(hostEp, token, channel, key, hostNonce, myNonce);
+                    var lanes = c._laneHost;
+                    files.Dial = () => OpenLane(lanes, token, channel, key, hostNonce, myNonce);
                 }
                 c.Status += status;
                 c.Start();
@@ -294,7 +356,73 @@ namespace TailRemote
         }
 
         // What a further lane (the remote screen) needs: where the host is, and this login's keys.
-        private IPEndPoint _laneHost = null!;
+        private LaneRoute _laneHost = null!;
+
+        /// <summary>Where a further lane goes: straight to the host, or through its relay by name; and the identity its hello must carry.</summary>
+        internal sealed record LaneRoute(IPEndPoint Host, string? RelayName, byte[] Identity);
+
+        // What this PC remembers about the host, so the ticket the host hands over is kept with its identity.
+        private IHostTrust? _trust;
+        private string _pc = "";
+        private byte[] _identity = Array.Empty<byte>();
+
+        /// <summary>Through a relay: the header every UDP packet carries (Wire.UdpHead), or null when connected directly.</summary>
+        private byte[]? _udpHead;
+
+        private static byte[] RelayHead(byte[] id)
+        {
+            byte[] h = new byte[KovaRelayWire.Wire.UdpHead];
+            h[0] = KovaRelayWire.Wire.Udp0; h[1] = KovaRelayWire.Wire.Udp1;
+            id.CopyTo(h, 2);
+            return h;
+        }
+
+        private void UdpSend(byte[] data, int length)
+        {
+            var head = _udpHead;
+            if (head == null) { _udp.Send(data, length, _hostUdp); return; }
+            byte[] p = new byte[head.Length + length];
+            head.CopyTo(p, 0);
+            Buffer.BlockCopy(data, 0, p, head.Length, length);
+            _udp.Send(p, p.Length, _hostUdp);
+        }
+
+        /// <summary>How a PC is remembered (its identity, its ticket, its file transfers): its address and port as typed.</summary>
+        internal static string TrustKey(string address, int port) => address.Trim().ToLowerInvariant() + ":" + port;
+
+        /// <summary>Reads exactly buffer.Length bytes, all of them before the deadline.</summary>
+        private static void ReadWithin(NetworkStream s, Span<byte> buffer, long deadline)
+        {
+            int got = 0;
+            while (got < buffer.Length)
+            {
+                long left = deadline - Environment.TickCount64;
+                if (left <= 0) throw new System.IO.IOException("The login took too long.", new SocketException((int)SocketError.TimedOut));
+                s.ReadTimeout = (int)Math.Min(left, int.MaxValue);
+                int n = s.Read(buffer[got..]);
+                if (n <= 0) throw new System.IO.EndOfStreamException();
+                got += n;
+            }
+        }
+
+        /// <summary>Opens a lane's connection: straight to the host, or through the relay, which pairs it like any other.</summary>
+        private static TcpClient LaneDial(LaneRoute route)
+        {
+            if (route.RelayName != null) return Relay.Dial(route.Host, route.RelayName, 5000, out _);
+            var tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
+            tcp.Client.DualMode = true;
+            try { if (!tcp.ConnectAsync(TestLaneAddress ?? route.Host.Address, route.Host.Port).Wait(5000)) throw new TimeoutException(); }
+            catch { tcp.Dispose(); throw; }
+            return tcp;
+        }
+
+        /// <summary>A lane's hello: undamaged, signed, and by the same host the main connection logged in to.</summary>
+        private static void CheckLaneHello(byte[] hello, LaneRoute route)
+        {
+            if (!hello.AsSpan(0, 4).SequenceEqual(Protocol.Magic) || !Protocol.CheckOk(hello)) throw new InvalidOperationException(Protocol.DamagedLogin);
+            if (!Protocol.HelloSignedOk(hello) || !hello.AsSpan(Protocol.HelloIdentityAt, HostIdentity.PublicBytes).SequenceEqual(route.Identity))
+                throw new InvalidOperationException("A lane reached a different PC.");
+        }
         private byte[] _laneKey = null!, _hostNonce = null!, _myNonce = null!;
 
         /// <summary>The host can show its screen to this PC: it is new enough, and this PC controls it (not listen-only).</summary>
@@ -316,18 +444,17 @@ namespace TailRemote
         }
 
         /// <summary>A video lane: proven with this login's key, on keys of its own (both PCs' fresh values). Null if it could not be opened.</summary>
-        private static (TcpClient, SecureLink)? OpenVideoLane(IPEndPoint host, byte[] token, byte[] key, byte[] hostNonce, byte[] myNonce)
+        private static (TcpClient, SecureLink)? OpenVideoLane(LaneRoute host, byte[] token, byte[] key, byte[] hostNonce, byte[] myNonce)
         {
-            var tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
-            tcp.Client.DualMode = true;
+            TcpClient tcp;
+            try { tcp = LaneDial(host); } catch { return null; }
             try
             {
-                if (!tcp.ConnectAsync(TestLaneAddress ?? host.Address, host.Port).Wait(5000)) throw new TimeoutException();
                 var s = tcp.GetStream();
                 s.ReadTimeout = 5000;
                 byte[] hello = new byte[Protocol.HelloBytes];
                 Protocol.ReadExactly(s, hello);
-                if (!hello.AsSpan(0, 4).SequenceEqual(Protocol.Magic) || !Protocol.CheckOk(hello)) throw new InvalidOperationException(Protocol.DamagedLogin);
+                CheckLaneHello(hello, host);
                 byte[] laneValue = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
                 byte[] channel = new byte[16];
                 byte[] answer = new byte[Protocol.AnswerBytes];
@@ -395,18 +522,17 @@ namespace TailRemote
         /// key is the main login's session key; the host's value is the nonce in this lane's own
         /// hello (bytes 4 to 20), the same bytes the host uses, never the main login's.
         /// </summary>
-        private static (TcpClient, SecureLink)? OpenLane(IPEndPoint host, byte[] token, byte[] channel, byte[] key, byte[] hostNonce, byte[] myNonce)
+        private static (TcpClient, SecureLink)? OpenLane(LaneRoute host, byte[] token, byte[] channel, byte[] key, byte[] hostNonce, byte[] myNonce)
         {
-            var tcp = new TcpClient(AddressFamily.InterNetworkV6);
-            tcp.Client.DualMode = true;
+            TcpClient tcp;
+            try { tcp = LaneDial(host); } catch { return null; }
             try
             {
-                if (!tcp.ConnectAsync(TestLaneAddress ?? host.Address, host.Port).Wait(5000)) throw new TimeoutException();
                 var s = tcp.GetStream();
                 s.ReadTimeout = 5000;
                 byte[] hello = new byte[Protocol.HelloBytes];
                 Protocol.ReadExactly(s, hello);
-                if (!hello.AsSpan(0, 4).SequenceEqual(Protocol.Magic) || !Protocol.CheckOk(hello)) throw new InvalidOperationException(Protocol.DamagedLogin);
+                CheckLaneHello(hello, host);
                 byte[] laneValue = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
                 byte[] answer = new byte[Protocol.AnswerBytes];
                 Protocol.FileMagic.CopyTo(answer, 0);
@@ -689,11 +815,11 @@ namespace TailRemote
             set
             {
                 if (_muted == value) return;
-                bool paused = _muted || _soundOff;
+                bool paused = SoundPaused;
                 _muted = value;
                 // Not even a few kilobits nobody hears: the host sends no sound at all until unmuted,
                 // which saves the data on a phone connection. The UDP hello and its ping carry on.
-                if ((_muted || _soundOff) != paused) try { Write(new[] { Protocol.AudioPause, (byte)(_muted || _soundOff ? 1 : 0) }); } catch { }
+                TellPause(paused);
                 SendNvdaWant(); // the remote NVDA's text follows the sound: none while muted
             }
         }
@@ -709,14 +835,44 @@ namespace TailRemote
             set
             {
                 if (_soundOff == value) return;
-                bool paused = _muted || _soundOff;
+                bool paused = SoundPaused;
                 _soundOff = value;
-                if ((_muted || _soundOff) != paused) try { Write(new[] { Protocol.AudioPause, (byte)(_muted || _soundOff ? 1 : 0) }); } catch { }
+                TellPause(paused);
             }
         }
         private volatile bool _soundOff;
 
-        // ---- The host's NVDA as text (its Speech Viewer and Braille Viewer, read there) ----
+        /// <summary>
+        /// Whether the host sends this PC no sound: muted, or NVDA as text only. But text only while the host has the
+        /// Kova Helper add-on: without it, NVDA's speech comes only through the sound, so the sound carries on.
+        /// </summary>
+        private bool SoundPaused => _muted || (_soundOff && _helperThere != false);
+
+        private void TellPause(bool was)
+        {
+            bool now = SoundPaused;
+            if (now != was) try { Write(new[] { Protocol.AudioPause, (byte)(now ? 1 : 0) }); } catch { }
+        }
+
+        // Whether the host said the Kova Helper add-on is talking to it (null: not said yet).
+        private volatile int _helperState = -1;
+        private bool? _helperThere => _helperState < 0 ? null : _helperState == 1;
+
+        /// <summary>File, Install the Kova Helper on the remote PC: the host installs it into its NVDA and says how it went (NvdaNote).</summary>
+        public bool InstallNvdaHelperThere()
+        {
+            if (_closed || ListenOnly || !CanNvda) return false;
+            Write(new[] { Protocol.NvdaHelperInstall });
+            return true;
+        }
+
+        /// <summary>The host said whether its Kova Helper add-on is there (true) or not (false). Raised on the network thread, on each change.</summary>
+        public event Action<bool>? NvdaHelperThere;
+
+        /// <summary>Everything the host's NVDA did, from its Kova Helper add-on: speech, cut-offs, beeps, sounds, braille. Raised on the network thread.</summary>
+        public event Action<NvdaEvent>? NvdaEventArrived;
+
+        // ---- The host's NVDA as text (from the Kova Helper add-on there) ----
 
         /// <summary>The host can send its NVDA's speech and braille as text.</summary>
         public bool CanNvda => (_peerFeatures & Protocol.FeatureNvda) != 0;
@@ -839,7 +995,7 @@ namespace TailRemote
             try
             {
                 _link.SealMic(p, payload);
-                _udp.Send(p, Protocol.MicHeadBytes + payload + SecureLink.TagSize, _hostUdp);
+                UdpSend(p, Protocol.MicHeadBytes + payload + SecureLink.TagSize);
             }
             catch { }
             return true;
@@ -876,6 +1032,10 @@ namespace TailRemote
         /// False when the connection has closed, so nothing was asked for.
         public bool Fetch(IEnumerable<string> paths)
         {
+            var asked = paths.ToList();
+            paths = asked;
+            // Only what was asked for is taken (FileChannel.AcceptUnasked): the answer is expected now.
+            _files?.ExpectFetch(asked);
             if (_closed) return false;
             Write(Protocol.TextMessage(Protocol.Fetch, string.Join('\n', paths)));
             return true;
@@ -918,6 +1078,7 @@ namespace TailRemote
             long prev = Interlocked.Read(ref _lastClipboardRequestAt);
             if (now - prev < Protocol.ClipboardPullThrottleMs) return false;
             if (Interlocked.CompareExchange(ref _lastClipboardRequestAt, now, prev) != prev) return false;
+            _files?.ExpectClipboard(); // the host's clipboard may replace this one: asked for just now
             Write(stackalloc byte[] { Protocol.ClipboardRequest });
             return true;
         }
@@ -939,6 +1100,16 @@ namespace TailRemote
                 while (!_closed)
                 {
                     byte[] m = _link.Receive(_stream);
+                    // Words from the host are read aloud: anything that size is not words, and a hostile host could
+                    // tie up this PC's screen reader with megabytes of them. (The file lanes carry big things.)
+                    if (m.Length > MaxSaidMessage && m[0] is Protocol.NvdaEventMsg or Protocol.NvdaNote or Protocol.MicNote or Protocol.Message or Protocol.HealthAlert or Protocol.WakeInfo)
+                        continue;
+                    if (m.Length == 1 + HostIdentity.TicketBytes && m[0] == Protocol.DeviceTicket)
+                    {
+                        // Kept with the host's identity: shown next time, it gets this PC in while strangers are turned away.
+                        try { _trust?.Remember(_pc, _identity, m[1..]); } catch { }
+                        continue;
+                    }
                     if (m.Length == 9 && m[0] == Protocol.Pong)
                     {
                         long sent = BitConverter.ToInt64(m, 1);
@@ -952,18 +1123,29 @@ namespace TailRemote
                     }
                     else if (m.Length >= 2 && m[0] == Protocol.HealthAlert)
                         HealthSaid(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1));
-                    else if (m.Length >= 2 && m[0] == Protocol.NvdaSpeech)
+                    else if (m.Length >= 2 && m[0] == Protocol.NvdaEventMsg)
                     {
-                        // Only while still wanted: lines already on their way when it was turned off are not said.
-                        if (_nvdaText && !_muted) NvdaSpoke?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1).Split('\n', StringSplitOptions.RemoveEmptyEntries));
+                        // Only while still wanted and heard: what was already on its way when it was turned off is not said.
+                        if (_nvdaText && !_muted && NvdaEvent.Decode(m.AsSpan(1)) is NvdaEvent ev)
+                        {
+                            NvdaEventArrived?.Invoke(ev);
+                            if (ev.Kind == NvdaEventKind.Speak && ev.SpokenText.Length > 0) NvdaSpoke?.Invoke(ev.SpokenText.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+                            else if (ev.Kind == NvdaEventKind.Braille) NvdaBraille?.Invoke(ev.Text);
+                        }
                     }
-                    else if (m.Length >= 1 && m[0] == Protocol.NvdaBraille)
+                    else if (m.Length == 2 && m[0] == Protocol.NvdaAvailable)
                     {
-                        if (_nvdaText && !_muted) NvdaBraille?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1));
+                        bool there = m[1] == 1;
+                        bool paused = SoundPaused;
+                        if (Interlocked.Exchange(ref _helperState, there ? 1 : 0) != (there ? 1 : 0))
+                        {
+                            TellPause(paused); // without the add-on, the sound carries NVDA's speech even in text-only mode
+                            if (_nvdaText) NvdaHelperThere?.Invoke(there);
+                        }
                     }
                     else if (m.Length >= 2 && m[0] == Protocol.NvdaNote)
                     {
-                        if (_nvdaText) NvdaNote?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1));
+                        NvdaNote?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1)); // only ever sent when asked for: NVDA wanted, or the add-on installed
                     }
                     else if (m.Length >= 2 && m[0] == Protocol.MicNote)
                     {
@@ -1103,8 +1285,15 @@ namespace TailRemote
                     continue;
                 }
                 if (any.Port != _hostUdp.Port) continue; // only TailRemote's port (any of the host's addresses)
+                if (_udpHead is byte[] head)
+                {
+                    // Through the relay: only this pairing's packets, with the header taken off.
+                    if (d.Length <= head.Length || !d.AsSpan(0, head.Length).SequenceEqual(head)) continue;
+                    d = d[head.Length..];
+                }
                 Interlocked.Increment(ref _rxPackets);
                 Interlocked.Add(ref _rxBytes, d.Length);
+                Interlocked.Add(ref _udpBytesTotal, d.Length);
                 if (TestDropPercent > 0 && Random.Shared.Next(100) < TestDropPercent) continue;
                 if (TestKbps > 0 && _jitterClock.ElapsedMilliseconds > 3000 && (TestKbpsUntil == 0 || _jitterClock.ElapsedMilliseconds < TestKbpsUntil * 1000))
                 {
@@ -1529,6 +1718,10 @@ namespace TailRemote
 
         // ---- The once-a-second log line (only while logging is on) ----
         private int _rxPackets, _rxBytes, _keysSent, _rxDamaged;
+        private long _udpBytesTotal;
+
+        /// <summary>Every byte received over UDP (sound) since connecting: for measuring what a mode costs.</summary>
+        public long UdpBytesReceived => Interlocked.Read(ref _udpBytesTotal);
 
         private void LogSecond()
         {
@@ -1572,7 +1765,7 @@ namespace TailRemote
                     lastHello = now;
                     BitConverter.TryWriteBytes(hello.AsSpan(9), Stopwatch.GetTimestamp()); // the host sends it straight back
                     _link.SignHello(hello); // the host ignores a hello without it
-                    try { _udp.Send(hello, hello.Length, _hostUdp); } catch { }
+                    try { UdpSend(hello, hello.Length); } catch { }
                 }
                 bool holding;
                 lock (_down) holding = _down.Count > 0;

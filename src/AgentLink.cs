@@ -29,11 +29,7 @@ namespace TailRemote
         // answers (i32 request, u8 1 + the update, or u8 0: no picture to take). 'X' (i32 viewer): that
         // viewer has gone.
         private const byte VideoMessage = (byte)'V', VideoForgetMessage = (byte)'X', VideoReplyMessage = (byte)'v';
-        // NVDA as text, which only the agent can read (its viewers are in the signed-in session): 'N' (u8 flags,
-        // Protocol.NvdaSpeechFlag...) says what the controlling PCs want; the agent answers with 'n': u8 kind
-        // (1 lines spoken, 2 braille, 3 a problem, empty when it is gone) and UTF-8.
-        private const byte NvdaWantMessage = (byte)'N', NvdaTextMessage = (byte)'n';
-        public const byte NvdaKindLines = 1, NvdaKindBraille = 2, NvdaKindProblem = 3;
+        // 'N' and 'n' were NVDA's Speech Viewer text (4.3): the Kova Helper add-on talks to the service itself now. Never reuse them.
 
         /// <summary>The agent did not have the picture ready in time: too much at this step, not "no picture" (Host steps down).</summary>
         public static readonly byte[] TooSlow = new byte[1];
@@ -147,18 +143,6 @@ namespace TailRemote
                 _out.TryAdd((Wake, Array.Empty<byte>())); // full: the writer is busy and sends them before its next one
             }
 
-            private volatile byte _nvdaFlags;
-
-            /// <summary>What of NVDA the controlling PCs want now; kept, and told again to each new agent (a sign in, a switch of user).</summary>
-            public void Nvda(byte flags)
-            {
-                _nvdaFlags = flags;
-                if (_pipe != null) _out.TryAdd((NvdaWantMessage, new[] { flags }));
-            }
-
-            /// <summary>NVDA's text from the agent (AgentLink.NvdaKind*, UTF-8). Raised on the link's read thread.</summary>
-            public Action<byte, string>? NvdaText;
-
             /// <summary>What the agent read from its clipboard, in answer to GetClipboard. Raised on the link's read thread.</summary>
             public Action<string>? ClipboardText;
             public Action<string[]>? ClipboardFiles;
@@ -195,7 +179,6 @@ namespace TailRemote
                         {
                             case ClipTextMessage: ClipboardText?.Invoke(Encoding.UTF8.GetString(p)); break;
                             case ClipFilesMessage: ClipboardFiles?.Invoke(Encoding.UTF8.GetString(p).Split('\n', StringSplitOptions.RemoveEmptyEntries)); break;
-                            case NvdaTextMessage when n >= 1 && n <= 1 << 20: NvdaText?.Invoke(p[0], Encoding.UTF8.GetString(p, 1, n - 1)); break;
                         }
                     }
                 }
@@ -261,8 +244,6 @@ namespace TailRemote
                         EndWaitsNotOn(pipe);
                         var linked = pipe;
                         new Thread(() => ReadLoop(linked)) { IsBackground = true, Name = "Kova agent link in" }.Start();
-                        // A new agent knows nothing yet of what the controlling PCs want of NVDA.
-                        if (_nvdaFlags != 0) _out.TryAdd((NvdaWantMessage, new[] { _nvdaFlags }));
                         ServiceHost.Log("The agent in the signed-in session is connected.");
                     }
                     catch (Exception e)
@@ -309,25 +290,9 @@ namespace TailRemote
         /// which are written straight back to the service: the answer to a GetMessage.
         /// </summary>
         public static void Run(Action<ushort, ushort, bool, bool> key, Action<byte, int, int> mouse, Action<string> text, Action<string[]> files,
-            Action<Action<string>, Action<string[]>>? getClipboard = null, ScreenVideo? screen = null, NvdaViewers? nvda = null)
+            Action<Action<string>, Action<string[]>>? getClipboard = null, ScreenVideo? screen = null)
         {
             byte[] head = new byte[5];
-            // NVDA's text goes to whichever link is up now (none while the service restarts: dropped, it is live speech).
-            Action<byte, byte[]>? nvdaTo = null;
-            void NvdaOut(byte kind, string s)
-            {
-                byte[] utf = Encoding.UTF8.GetBytes(s);
-                byte[] m = new byte[1 + utf.Length];
-                m[0] = kind;
-                utf.CopyTo(m, 1);
-                Volatile.Read(ref nvdaTo)?.Invoke(NvdaTextMessage, m);
-            }
-            if (nvda != null)
-            {
-                nvda.Spoke += lines => NvdaOut(NvdaKindLines, string.Join("\n", lines));
-                nvda.Braille += b => NvdaOut(NvdaKindBraille, b);
-                nvda.Problem += why => NvdaOut(NvdaKindProblem, why ?? "");
-            }
             // Pictures are taken on a thread of their own (below normal: keys first), one at a time, never
             // holding up the keys read here. It follows the desktop with the keyboard, like the keys.
             var pictures = new BlockingCollection<Action>(64);
@@ -397,8 +362,6 @@ namespace TailRemote
                     newest.Clear();
                     int thisLink = Interlocked.Increment(ref link);
                     if (screen != null) { Volatile.Write(ref forgetAll, 1); pictures.TryAdd(() => { }); }
-                    if (nvda != null) { nvda.ReadSpeech = nvda.ReadBraille = false; } // until this service says what it wants
-                    Volatile.Write(ref nvdaTo, Reply);
                     while (true)
                     {
                         Protocol.ReadExactly(pipe, head);
@@ -437,10 +400,6 @@ namespace TailRemote
                                     });
                                     break;
                                 }
-                            case NvdaWantMessage when n == 1 && nvda != null:
-                                nvda.ReadSpeech = (p[0] & Protocol.NvdaSpeechFlag) != 0;
-                                nvda.ReadBraille = (p[0] & Protocol.NvdaBrailleFlag) != 0;
-                                break;
                             case VideoForgetMessage when n == 4 && screen != null:
                                 {
                                     int viewer = BitConverter.ToInt32(p, 0);
@@ -454,8 +413,6 @@ namespace TailRemote
                 }
                 catch
                 {
-                    Volatile.Write(ref nvdaTo, null);
-                    if (nvda != null) nvda.ReadSpeech = nvda.ReadBraille = false; // nobody to send it to: piling up is never sent later
                     Thread.Sleep(500); // the service is starting or restarting: try again soon
                 }
             }

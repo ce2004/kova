@@ -431,7 +431,10 @@ namespace TailRemote
                     if (hr == unchecked((int)0xC00D6D61)) { if (!TypeOutput()) return false; continue; } // the stream's format changed
                     if (hr < 0) return false;
                     if (!_typed || ob.pSample == IntPtr.Zero) continue;
-                    Mf.ReadNv12(ob.pSample, _stride, _rows, (nv12, stride, rows) => Yuv.Nv12ToBgra(nv12, stride, rows, Math.Min(width, _w), Math.Min(height, _h), width, bgra));
+                    int w = Math.Min(width, _w), h = Math.Min(height, _h);
+                    // The sizes come from the stream the other PC sent: a picture the decoder's buffer cannot hold is
+                    // refused (false asks for a key frame) instead of reading past the end of it.
+                    if (!Mf.ReadNv12(ob.pSample, _stride, _rows, w, h, (nv12, stride, rows) => Yuv.Nv12ToBgra(nv12, stride, rows, w, h, width, bgra))) return false;
                     got = true;
                 }
                 finally { if (ob.pSample != IntPtr.Zero) Marshal.Release(ob.pSample); }
@@ -659,30 +662,60 @@ namespace TailRemote
             finally { Marshal.Release(buffer); }
         }
 
-        /// <summary>The picture in a decoded sample, NV12, with its real row length (from IMF2DBuffer when there is one).</summary>
-        public static void ReadNv12(IntPtr sample, int stride, int rows, Action<IntPtr, int, int> use)
+        public static readonly Guid IID_IMF2DBuffer2 = new("33ae5ea6-4316-436f-8ddd-d73d22f829ec");
+
+        /// <summary>
+        /// Whether an NV12 picture of rows rows (w by h of it read) at this pitch fits in available bytes: the pitch is
+        /// positive and at least the width, h is within rows, and the whole picture (rows of brightness, then half as
+        /// many of colour, rounded up) is there.
+        /// </summary>
+        public static bool Nv12Fits(long available, long pitch, int rows, int w, int h)
+        {
+            if (pitch <= 0 || w <= 0 || h <= 0 || rows <= 0 || pitch < w || h > rows) return false;
+            long need = pitch * rows + pitch * ((rows + 1L) / 2);
+            return available >= need;
+        }
+
+        /// <summary>
+        /// The picture in a decoded sample, NV12, with its real row length (from IMF2DBuffer2 when there is one), handed to
+        /// use only when the buffer really holds rows rows at that pitch. False when it does not, or it could not be read.
+        /// </summary>
+        public static bool ReadNv12(IntPtr sample, int stride, int rows, int w, int h, Action<IntPtr, int, int> use)
         {
             IntPtr buffer;
-            if (Call(sample, 40, 0, (IntPtr)(&buffer)) < 0) return; // GetBufferByIndex
+            if (Call(sample, 40, 0, (IntPtr)(&buffer)) < 0) return false; // GetBufferByIndex
             try
             {
-                Guid iid = IID_IMF2DBuffer;
+                // IMF2DBuffer2 (not plain IMF2DBuffer): its Lock2DSize also says where the buffer ends, so the picture
+                // can be checked against it. Slots from mfobjects.h: IUnknown 0-2, Lock2D 3, Unlock2D 4, ... Lock2DSize 10.
+                Guid iid = IID_IMF2DBuffer2;
                 if (Marshal.QueryInterface(buffer, ref iid, out IntPtr b2) >= 0)
                 {
                     try
                     {
-                        byte* line; int pitch;
-                        if (Call(b2, 3, (IntPtr)(&line), (IntPtr)(&pitch)) >= 0) // Lock2D
+                        byte* line, start; int pitch; uint length;
+                        if (Call(b2, 10, 1u, (IntPtr)(&line), (IntPtr)(&pitch), (IntPtr)(&start), (IntPtr)(&length)) >= 0) // Lock2DSize, read
                         {
-                            try { use((IntPtr)line, pitch, rows); return; }
+                            try
+                            {
+                                long available = (long)(start + length) - (long)line; // from the first row to the buffer's end
+                                if (line < start || !Nv12Fits(available, pitch, rows, w, h)) return false;
+                                use((IntPtr)line, pitch, rows);
+                                return true;
+                            }
                             finally { Call(b2, 4); } // Unlock2D
                         }
                     }
                     finally { Marshal.Release(b2); }
                 }
                 byte* p; uint max, cur;
-                if (Call(buffer, 3, (IntPtr)(&p), (IntPtr)(&max), (IntPtr)(&cur)) < 0) return;
-                try { use((IntPtr)p, stride, rows); }
+                if (Call(buffer, 3, (IntPtr)(&p), (IntPtr)(&max), (IntPtr)(&cur)) < 0) return false; // Lock
+                try
+                {
+                    if (!Nv12Fits(cur, stride, rows, w, h)) return false;
+                    use((IntPtr)p, stride, rows);
+                    return true;
+                }
                 finally { Call(buffer, 4); }
             }
             finally { Marshal.Release(buffer); }
@@ -704,6 +737,7 @@ namespace TailRemote
         public static int Call(IntPtr o, int i, uint a, IntPtr b, IntPtr c) => ((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr, IntPtr, int>)Slot(o, i))(o, a, b, c);
         public static int Call(IntPtr o, int i, uint a, uint b, IntPtr c, IntPtr d) => ((delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr, IntPtr, int>)Slot(o, i))(o, a, b, c, d);
         public static int Call(IntPtr o, int i, IntPtr a, uint b, uint c, uint d, IntPtr e) => ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, uint, IntPtr, int>)Slot(o, i))(o, a, b, c, d, e);
+        public static int Call(IntPtr o, int i, uint a, IntPtr b, IntPtr c, IntPtr d, IntPtr e) => ((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr, IntPtr, IntPtr, IntPtr, int>)Slot(o, i))(o, a, b, c, d, e);
         public static void CallVoid(IntPtr o, int i, IntPtr a) => ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, void>)Slot(o, i))(o, a);
         public static void CallVoid(IntPtr o, int i, IntPtr a, IntPtr b) => ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, void>)Slot(o, i))(o, a, b);
         public static void CallVoid(IntPtr o, int i, IntPtr a, uint b) => ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, void>)Slot(o, i))(o, a, b);

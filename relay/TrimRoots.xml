@@ -1,0 +1,12 @@
+<!--
+  Kept whole by the trimmer (release builds only), the same as Kova's TrimRoots.xml. WinForms' UI Automation
+  (what NVDA reads) reaches these COM interop types only from Windows; trimmed away, every control in the
+  relay's window showed up as an unnamed pane and UI Automation threw TypeLoadException.
+-->
+<linker>
+  <assembly fullname="System.Private.CoreLib">
+    <namespace fullname="System.Runtime.InteropServices.ComTypes" preserve="all" />
+    <namespace fullname="System.Runtime.InteropServices" preserve="all" />
+  </assembly>
+  <assembly fullname="System.Runtime.InteropServices" preserve="all" />
+</linker>

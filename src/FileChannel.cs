@@ -52,8 +52,8 @@ namespace TailRemote
         // receiver does not wait a week holding its files open. (Added in 4.1.4; older copies never answer.)
         private const byte Have = 0x69;
         private const byte Note = 0x6A;     // u32 id, UTF-8 text: what the sender had to leave out (folders it could not open, links), for the receiver's result
-        private const byte KindFiles = 1, KindText = 2, KindDownloads = 3; // clipboard files, clipboard text, Send files
-        private const byte KindTo = 4; // Send files into a folder the controller chose in Get files (the offer carries it)
+        internal const byte KindFiles = 1, KindText = 2, KindDownloads = 3; // clipboard files, clipboard text, Send files
+        internal const byte KindTo = 4; // Send files into a folder the controller chose in Get files (the offer carries it)
         private const byte EndedWell = 0, EndedBadly = 1, EndedStopped = 2;
         // Only ever on a Stop: stopped because something newer was sent. The receiver ends it as stopped, and
         // puts none of what arrived on the clipboard (the newer copy goes there).
@@ -61,8 +61,11 @@ namespace TailRemote
 
         /// <summary>The most lanes at once.</summary>
         public const int MaxLanes = 16;
-        /// <summary>The most text a clipboard may carry: 512 MB.</summary>
-        public const long MaxText = 512L << 20;
+        /// <summary>
+        /// The most text a clipboard may carry: 64 MB (of UTF-8). Far more than anyone copies, and small enough
+        /// that a hostile PC offering it cannot make this one hold gigabytes of text and copies of it.
+        /// </summary>
+        public const long MaxText = 64L << 20;
         /// <summary>The most files and folders in one batch (the receiver keeps a slot for each).</summary>
         public const int MaxEntries = 1_000_000;
         private const int GiveUpMs = 60_000, StallMs = 10_000, QuietMs = 12_000, PingMs = 3_000, OfferPartBytes = 1 << 20, HaveMs = 5_000;
@@ -90,6 +93,92 @@ namespace TailRemote
         /// runs as its user. Made as SYSTEM, they could go anywhere, System32 included.
         /// </summary>
         public Func<System.Security.Principal.WindowsIdentity?>? FolderUser;
+
+        /// <summary>
+        /// May clipboard text, clipboard files and Send files arrive here without this side asking for them
+        /// (ExpectClipboard, ExpectFetch)? True: the other PC's user may send at any time (people at both PCs).
+        /// False: a batch nobody here asked for is turned away before anything is written, and its sender
+        /// told why. The host leaves it true (its controllers send to it); the controlling PC sets it from a setting.
+        /// </summary>
+        public bool AcceptUnasked { get; set; } = true;
+
+        /// <summary>
+        /// The controlling PC: clipboard text and files arrive on this PC's clipboard only when this side asked
+        /// (ExpectClipboard) in the last 30 seconds. Anything else the other PC sends for the clipboard never
+        /// replaces it (it could swap a copied command for its own just before it is pasted): files go to
+        /// Downloads\Kova like Send files, and text is saved there as a .txt file and handed to UnaskedTextReceived.
+        /// False (the host): everything for the clipboard goes there, as before.
+        /// </summary>
+        public bool ClipboardOnlyWhenAsked { get; set; }
+
+        /// <summary>
+        /// Text the other PC sent for the clipboard without being asked (ClipboardOnlyWhenAsked): the text, and
+        /// the file in Downloads\Kova it was saved to (null if it could not be saved). Not put on the clipboard.
+        /// </summary>
+        public Action<string, string?>? UnaskedTextReceived;
+
+        private readonly object _askGate = new();
+        private long _clipboardAskedUntil; // under _askGate: until when one clipboard batch is expected
+        private readonly List<(HashSet<string> Names, long Until)> _fetches = new(); // under _askGate: Get files asked for
+        private long _toldUnaskedAt = long.MinValue / 2; // the last "turned away" said here (at most one every 10 s)
+        private const int ClipboardAskMs = 30_000, FetchAskMs = 120_000;
+
+        /// <summary>The user here pressed Get the remote PC's clipboard: one clipboard batch may come in the next 30 seconds.</summary>
+        public void ExpectClipboard()
+        {
+            lock (_askGate) _clipboardAskedUntil = Now + ClipboardAskMs;
+        }
+
+        /// <summary>
+        /// The user here asked Get files for these paths on the other PC: a Send files batch whose top-level names
+        /// are theirs (as the other PC names them: "D drive" for a whole drive, "name (2)" for a second of the same
+        /// name) may come in the next 2 minutes. Once it has begun it carries on however long it takes.
+        /// </summary>
+        public void ExpectFetch(IEnumerable<string> remotePaths)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var given = remotePaths.Select(TopName).ToList();
+            foreach (string n in given)
+            {
+                names.Add(n);
+                // The sender names a second item of the same name "name (2)" and so on.
+                for (int i = 2; i <= given.Count; i++) names.Add(Marked(n, " (" + i + ")"));
+            }
+            if (names.Count == 0) return;
+            lock (_askGate)
+            {
+                _fetches.RemoveAll(f => f.Until < Now);
+                if (_fetches.Count >= 16) _fetches.RemoveAt(0);
+                _fetches.Add((names, Now + FetchAskMs));
+            }
+        }
+
+        /// <summary>Was a clipboard batch asked for? Takes the request (one batch each).</summary>
+        private bool TakeClipboardAsk()
+        {
+            lock (_askGate)
+            {
+                if (_clipboardAskedUntil == 0 || Now > _clipboardAskedUntil) return false;
+                _clipboardAskedUntil = 0;
+                return true;
+            }
+        }
+
+        /// <summary>Was a Send files batch with these top-level names asked for (Get files)? Takes the request.</summary>
+        private bool TakeFetchAsk(ICollection<string> firsts)
+        {
+            lock (_askGate)
+            {
+                _fetches.RemoveAll(f => f.Until < Now);
+                int i = _fetches.FindIndex(f => firsts.All(f.Names.Contains));
+                if (i < 0) return false;
+                _fetches.RemoveAt(i);
+                return true;
+            }
+        }
+
+        /// <summary>Said to the sender of a batch turned away because nobody here asked for it.</summary>
+        internal const string NotAsked = "The other PC did not ask for this, so it was not taken.";
 
         /// <summary>Said when the service cannot act for anyone: nobody is signed in on the host PC.</summary>
         public const string NobodySignedIn = "Nobody is signed in on the remote PC, so its files cannot be reached. Sign in there first.";
@@ -125,6 +214,11 @@ namespace TailRemote
             public bool Cancelled;
             /// <summary>No connection to the other PC right now: waiting for it to come back.</summary>
             public bool Waiting;
+            /// <summary>
+            /// Arriving: this side asked for it (ExpectClipboard, or ExpectFetch for Send files). False for anything
+            /// the other PC sent of its own accord, and for everything going out.
+            /// </summary>
+            public bool Asked;
             /// <summary>The other PC's address (several transfers can go at once, one per controlling PC).</summary>
             public string Peer = "";
             public string What = "";
@@ -505,7 +599,7 @@ namespace TailRemote
                 case Ready when m.Length == 5: OnReady(BitConverter.ToUInt32(m, 1)); break;
                 case Got when m.Length == 21: OnGot(lane, m); break;
                 case Finished when m.Length >= 6:
-                    if (_out is Out o && o.Id == BitConverter.ToUInt32(m, 1)) EndOut(o, m[5], Said(m, 6, m.Length - 6), tell: false);
+                    if (_out is Out o && o.Id == BitConverter.ToUInt32(m, 1)) EndOut(o, m[5], Theirs(Said(m, 6, m.Length - 6)), tell: false);
                     break;
                 case Stop when m.Length >= 6: OnStop(BitConverter.ToUInt32(m, 1), m[5], Said(m, 6, m.Length - 6)); break;
                 case Ask when m.Length == 5: OnAsk(lane, BitConverter.ToUInt32(m, 1)); break;
@@ -515,7 +609,8 @@ namespace TailRemote
                     lock (_inGate)
                     {
                         uint noteId = BitConverter.ToUInt32(m, 1);
-                        string said = Said(m, 5, m.Length - 5);
+                        // Room for Kova's own three sentences about what was left out; always said as "On the other PC, ...".
+                        string said = Clean(Encoding.UTF8.GetString(m, 5, m.Length - 5), 2 * MaxSaid);
                         if (_in is In b && b.Id == noteId) b.Note = said;
                         else _note = (noteId, said); // comes just before its list: kept for the batch it belongs to
                     }
@@ -554,11 +649,49 @@ namespace TailRemote
             return m;
         }
 
-        // Words from the other PC, to be shown here: never more than a sentence or two, whatever it sent.
-        private static string Said(byte[] m, int at, int bytes)
+        // Words from the other PC, to be shown (and spoken) here: never more than a sentence or two, whatever it
+        // sent, and nothing in them that could hide or reorder what NVDA reads out.
+        private static string Said(byte[] m, int at, int bytes) => Clean(Encoding.UTF8.GetString(m, at, Math.Max(0, bytes)), MaxSaid);
+
+        /// <summary>How much of the other PC's own words is shown: a hostile PC must not get to say a speech's worth.</summary>
+        internal const int MaxSaid = 200;
+
+        /// <summary>
+        /// Text from the other PC made fit to show and speak: control characters, line breaks and invisible
+        /// formatting characters (direction marks that make "fdp.exe" show as "exe.pdf") become spaces, and it is
+        /// cut to max characters with "..." at the end.
+        /// </summary>
+        internal static string Clean(string s, int max)
         {
-            string s = Encoding.UTF8.GetString(m, at, Math.Max(0, bytes));
-            return s.Length > 2000 ? s[..2000] : s;
+            var sb = new StringBuilder(Math.Min(s.Length, max + 8));
+            bool space = false;
+            foreach (char c in s)
+            {
+                bool odd = char.GetUnicodeCategory(c) is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format
+                    or System.Globalization.UnicodeCategory.LineSeparator or System.Globalization.UnicodeCategory.ParagraphSeparator;
+                char ch = odd || char.IsWhiteSpace(c) ? ' ' : c;
+                if (ch == ' ' && (space || sb.Length == 0)) continue; // runs of spaces said once
+                space = ch == ' ';
+                sb.Append(ch);
+                if (sb.Length > max) break;
+            }
+            string t = sb.ToString().TrimEnd();
+            return t.Length > max ? Cut(t, max - 3).TrimEnd() + "..." : t;
+        }
+
+        /// <summary>
+        /// The other PC's reason, as this side shows it: cleaned and cut short (Clean), and plainly its words. Kova's
+        /// own reasons from there already begin by saying where they come from; anything else gets "The other PC
+        /// said:" in front, so a hostile PC cannot make Kova itself seem to say something ("Kova: type your password").
+        /// </summary>
+        internal static string Theirs(string said)
+        {
+            string s = Clean(said, MaxSaid);
+            if (s.Length == 0) return s;
+            if (s is "Stopped." or "Something newer was sent.") return s;
+            foreach (string from in new[] { "The other PC ", "The remote PC ", "Nobody is signed in on the remote PC", "Nothing to get: " })
+                if (s.StartsWith(from, StringComparison.Ordinal)) return s;
+            return "The other PC said: " + s;
         }
 
         // ---- Sending ----
@@ -861,7 +994,7 @@ namespace TailRemote
                 Remember(id, outcome, why);
             }
             DiagLog.Write("files: " + why);
-            try { Progress?.Invoke(new Transfer { What = what, Clipboard = kind is KindFiles or KindText, Peer = PeerName, Finished = true, Failed = true, Cancelled = outcome == EndedStopped, Result = why }); } catch { }
+            try { Progress?.Invoke(new Transfer { What = what, Clipboard = kind is KindFiles or KindText, Peer = PeerName, Finished = true, Failed = true, Cancelled = outcome == EndedStopped, Result = Theirs(why) }); } catch { }
         }
 
         /// <summary>
@@ -1013,6 +1146,25 @@ namespace TailRemote
             return p.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + p[2..] : @"\\?\" + p;
         }
 
+        /// <summary>
+        /// May a controlling PC's Get files (a folder to list, files to fetch) name this path? Only a plain path on one
+        /// of this PC's drives: a letter, a colon and a backslash ("C:\", "D:\Folder\file.txt"). Never a share
+        /// (\\server\share: the host, the service included, would sign in to that server as the signed-in user and hand
+        /// it their password's hash), never a device or \\?\ path (\\?\GLOBALROOT reaches shadow copies and raw disks),
+        /// never "C:folder" (relative to wherever the process happens to be), never a second colon (a file's hidden
+        /// streams) or a wildcard.
+        /// </summary>
+        internal static bool RemotePathOk(string? path)
+        {
+            if (string.IsNullOrEmpty(path) || path.Length > 32_000) return false;
+            if (path.Length < 3 || !char.IsAsciiLetter(path[0]) || path[1] != ':' || path[2] != '\\') return false;
+            if (path.IndexOf(':', 2) >= 0 || path.IndexOf('/') >= 0 || path.IndexOfAny(new[] { '*', '?', '"', '<', '>', '|', '\0' }) >= 0) return false;
+            if (path.Any(char.IsControl)) return false;
+            // Nothing that could turn back into a share or a device once Windows tidies it ("C:\..\..\" stays on C:,
+            // but a doubled backslash inside is refused rather than reasoned about).
+            return path.IndexOf(@"\\", 2, StringComparison.Ordinal) < 0;
+        }
+
         /// <summary>Sends clipboard text. Blocking. Replaces any batch still going.</summary>
         public void SendText(string text)
         {
@@ -1024,6 +1176,20 @@ namespace TailRemote
         /// <param name="checkCount">false: even more entries than this side would ever offer, to see the receiver refuse them.</param>
         internal void TestSendEntries(List<(string Rel, byte[]? Data)> entries, string what = "test", bool checkCount = true) =>
             SendBatch(KindFiles, what, entries.Select(e => new Entry(e.Rel, e.Data?.Length ?? -1, null, e.Data)).ToList(), Interlocked.Increment(ref _requests), checkCount: checkCount);
+
+        /// <summary>
+        /// Test only (--securitytest): offers one entry of any kind and length and sends nothing more, as a hostile
+        /// PC could (a huge clipboard text that never comes, a file bigger than the free space).
+        /// </summary>
+        internal void TestOfferOnly(byte kind, string rel, long length)
+        {
+            var part = new MemoryStream();
+            var w = new BinaryWriter(part);
+            byte[] path = Encoding.UTF8.GetBytes(rel);
+            w.Write(Offer); w.Write(Interlocked.Increment(ref _nextId)); w.Write(kind); w.Write(1); w.Write(Math.Max(0, length)); w.Write(0);
+            w.Write(length); w.Write((ushort)path.Length); w.Write(path);
+            if (_lanes is { Length: > 0 } lanes) Tell(lanes[0], part.ToArray());
+        }
 
         /// <summary>Stops what is being sent and what is being received, if anything.</summary>
         public void CancelSending()
@@ -1353,6 +1519,11 @@ namespace TailRemote
         {
             public required uint Id;
             public required byte Kind;
+            // The kind as the sender offered it: clipboard files nobody asked for are received as Send files
+            // (Kind), and a list sent again must still be known as this batch's.
+            public byte OfferKind;
+            public bool Asked; // this side asked for it (ExpectClipboard, ExpectFetch)
+            public bool Unasked; // for the clipboard, but not asked for, on a PC that keeps its clipboard (ClipboardOnlyWhenAsked)
             public required (string Rel, long Length)?[] Entries;
             public string? Into; // KindTo: the folder the controller chose, already checked
             public System.Security.Principal.WindowsIdentity? MakeAs; // from the service: made as this user (FolderUser); let go when the batch ends
@@ -1382,7 +1553,9 @@ namespace TailRemote
             public SafeFileHandle?[] Handles = Array.Empty<SafeFileHandle?>();
             public long[] Got = Array.Empty<long>();
             public HashSet<long>?[] Claimed = Array.Empty<HashSet<long>?>();
-            public byte[]? Text;
+            // Clipboard text, in pieces of TextChunk bytes, each made only when data for it lands: an offer of 64 MB
+            // that never sends a byte costs next to nothing.
+            public byte[]?[]? Text;
             public readonly SortedSet<int> Active = new(); // files partly arrived (for the per-file progress)
             public readonly object[] Making = Enumerable.Range(0, 64).Select(_ => new object()).ToArray(); // a file being made holds one of these, not the whole batch
             public long Total, Done;
@@ -1393,6 +1566,9 @@ namespace TailRemote
             public int Fixed; // names changed to ones Windows allows (Validate)
             public string? FixedFrom; // the first of them, to say
             public int FixedAt = -1; // and its entry, whose name in the end (Finals) is said: a clash can make it "name (2)"
+            public int Defused; // files given ".txt" so Explorer cannot act on them just by showing the folder (Validate)
+            public string? DefusedFrom;
+            public int DefusedAt = -1;
 
             /// <summary>What the result adds: names changed here, and what the sender left out. Empty if nothing.</summary>
             public string Notes()
@@ -1403,6 +1579,13 @@ namespace TailRemote
                     string given = FixedAt >= 0 && FixedAt < Finals.Length && Finals[FixedAt] is string f ? Path.GetFileName(f)
                         : FixedAt >= 0 && Entries[FixedAt]?.Rel is string rel ? rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..] : "";
                     s += " Some names had to change to suit Windows: \"" + FixedFrom + "\" is now \"" + given + "\"" + (Fixed > 1 ? ", and " + (Fixed - 1) + " more" : "") + ".";
+                }
+                if (Defused > 0)
+                {
+                    string given = DefusedAt >= 0 && DefusedAt < Finals.Length && Finals[DefusedAt] is string f ? Path.GetFileName(f)
+                        : DefusedAt >= 0 && Entries[DefusedAt]?.Rel is string rel ? rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..] : "";
+                    s += " \"" + DefusedFrom + "\" was saved as \"" + given + "\"" + (Defused > 1 ? ", and " + (Defused - 1) + " more like it got .txt added" : "") +
+                        ", because Windows can act on files like that just by showing the folder they are in. Remove the .txt only if you trust it.";
                 }
                 if (Note is { Length: > 0 } n) s +=" On the other PC, " + char.ToLowerInvariant(n[0]) + n[1..];
                 return s;
@@ -1485,6 +1668,15 @@ namespace TailRemote
                 if (_in is In cur && cur.Id == id) b = cur;
                 else
                 {
+                    // Clipboard text and files: asked for (Get the remote PC's clipboard) or not. Not asked for, and
+                    // this PC takes nothing unasked: turned away before anything is made. Send files is judged by
+                    // its names once the whole list is here (OnOffer, below).
+                    bool asked = false;
+                    if (refusal == null && kind is KindText or KindFiles)
+                    {
+                        asked = TakeClipboardAsk();
+                        if (!asked && !AcceptUnasked) refusal = NotAsked;
+                    }
                     // A part of a batch already taken is never refused (its controller may be reconnecting).
                     if (refusal != null)
                     {
@@ -1492,11 +1684,18 @@ namespace TailRemote
                         makeAs?.Dispose();
                         Remember(id, EndedBadly, refusal);
                         Tell(lane, FinishedMessage(id, EndedBadly, refusal));
+                        // Said off this lock (and off the lane's thread): the window's handler must never run under it.
+                        if (refusal == NotAsked) ThreadPool.QueueUserWorkItem(_ => TellTurnedAway(kind == KindText ? "clipboard text" : "files for the clipboard"));
                         return;
                     }
                     old = _in;
-                    b = new In { Id = id, Kind = kind, Entries = new (string, long)?[count], Into = into, MakeAs = makeAs };
-                    b.T.Clipboard = kind is KindFiles or KindText;
+                    // Clipboard files not asked for, on a PC that keeps its clipboard: received as Send files are, into
+                    // Downloads\Kova, never onto the clipboard. Text not asked for is kept aside the same way (Complete).
+                    bool unasked = ClipboardOnlyWhenAsked && !asked && kind is KindText or KindFiles;
+                    byte keptAs = unasked && kind == KindFiles ? KindDownloads : kind;
+                    b = new In { Id = id, Kind = keptAs, OfferKind = kind, Asked = asked, Unasked = unasked, Entries = new (string, long)?[count], Into = into, MakeAs = makeAs };
+                    b.T.Asked = asked;
+                    b.T.Clipboard = keptAs is KindFiles or KindText;
                     b.T.Peer = PeerName;
                     if (kind == KindText) b.T.What = "clipboard text";
                     if (_note is var (noteId, said) && noteId == id) { b.Note = said; _note = null; }
@@ -1510,7 +1709,7 @@ namespace TailRemote
             {
                 lock (b.Gate)
                 {
-                    if (b.Ended || b.Kind != kind) return;
+                    if (b.Ended || b.OfferKind != kind) return;
                     b.LastActivity = Now;
                     if (b.Prepared) ready = true;
                     else
@@ -1532,9 +1731,25 @@ namespace TailRemote
                                 b.Have++;
                             }
                         }
-                        if (b.Have == count) { Prepare(b); ready = true; }
+                        if (b.Have == count)
+                        {
+                            // Send files: asked for (Get files, by these names) or sent of the other PC's own accord.
+                            if (b.OfferKind == KindDownloads)
+                            {
+                                b.Asked = b.T.Asked = TakeFetchAsk(Firsts(b));
+                                if (!b.Asked && !AcceptUnasked) throw new NotAskedException();
+                            }
+                            Prepare(b);
+                            ready = true;
+                        }
                     }
                 }
+            }
+            catch (NotAskedException)
+            {
+                // Nothing was made yet: the list is only judged once all of it is here, before Prepare.
+                EndIn(b, EndedBadly, "Turned away " + b.T.What + " from the other PC: you did not ask for it.", NotAsked, lane, tell: true);
+                return;
             }
             catch (Exception e)
             {
@@ -1549,6 +1764,39 @@ namespace TailRemote
             if (empty) Complete(b, lane);
         }
 
+        /// <summary>Thrown while a Send files list is read: nobody here asked for it, and this PC takes nothing unasked.</summary>
+        private sealed class NotAskedException : Exception { }
+
+        /// <summary>
+        /// The batch's top-level names as the sender gave them (under b.Gate, the whole list here), and its name
+        /// for the Files line from them: the one name, or "3 items".
+        /// </summary>
+        private static HashSet<string> Firsts(In b)
+        {
+            var firsts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in b.Entries) { string rel = e!.Value.Rel; int cut = rel.IndexOfAny(new[] { '\\', '/' }); firsts.Add(cut < 0 ? rel : rel[..cut]); }
+            b.T.What = firsts.Count == 1 ? Shown(firsts.First()) : firsts.Count + " items";
+            return firsts;
+        }
+
+        /// <summary>
+        /// A received name as it may be said before it is checked: hidden characters (direction marks and the
+        /// like) as "_", as Suited makes them, and no longer than a name can be.
+        /// </summary>
+        private static string Shown(string name)
+        {
+            if (name.Length > 255) name = Cut(name, 255) + "...";
+            return name.Any(Hidden) ? new string(name.Select(c => Hidden(c) ? '_' : c).ToArray()) : name;
+        }
+
+        /// <summary>
+        /// A character that hides or reorders what is shown: control characters, line breaks, and invisible
+        /// formatting such as right-to-left marks ("invoice", U+202E, "fdp.exe" shows as "invoiceexe.pdf"). The
+        /// joiners emoji and some scripts need inside a name (U+200C, U+200D) are kept: they cannot move an extension.
+        /// </summary>
+        private static bool Hidden(char c) => c is not ('\u200C' or '\u200D') && char.GetUnicodeCategory(c) is System.Globalization.UnicodeCategory.Control
+            or System.Globalization.UnicodeCategory.Format or System.Globalization.UnicodeCategory.LineSeparator or System.Globalization.UnicodeCategory.ParagraphSeparator;
+
         /// <summary>Makes the folders and empty files (under b.Gate). Throws if anything is wrong, such as a path that leaves the folder.</summary>
         private static void Prepare(In b)
         {
@@ -1562,16 +1810,15 @@ namespace TailRemote
             b.Total = b.Entries.Sum(e => Math.Max(0, e!.Value.Length));
             if (b.Kind == KindText)
             {
-                if (count != 1 || b.Length(0) < 0 || b.Length(0) > MaxText) throw new InvalidDataException("The other PC copied more text than Kova can carry (512 MB).");
-                b.Text = new byte[b.Length(0)];
+                if (count != 1 || b.Length(0) < 0 || b.Length(0) > MaxText) throw new InvalidDataException("the other PC copied more text than Kova can carry (" + (MaxText >> 20) + " MB).");
+                // Only the list of pieces now (a few hundred bytes); each piece is made when its data arrives.
+                b.Text = new byte[]?[(int)((b.Length(0) + TextChunk - 1) / TextChunk)];
             }
             else
             {
                 // Named before anything is checked, so a batch refused here still says what it was (and a
                 // Get files waiting for it can tell it is the one it asked for).
-                var firsts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var e in b.Entries) { string rel = e!.Value.Rel; int cut = rel.IndexOfAny(new[] { '\\', '/' }); firsts.Add(cut < 0 ? rel : rel[..cut]); }
-                b.T.What = firsts.Count == 1 ? firsts.First() : firsts.Count + " items";
+                Firsts(b);
                 string folder;
                 if (b.Kind == KindFiles)
                     // Its own folder, even when several PCs send at the same moment.
@@ -1621,6 +1868,49 @@ namespace TailRemote
             b.Clock.Start();
         }
 
+        private const int TextChunk = 1 << 20;
+
+        /// <summary>Clipboard text's pieces (b.Text) for the bytes at offset, made if they are not yet. Under b.Gate.</summary>
+        private static byte[]?[] TextFor(In b, long offset, int n)
+        {
+            var chunks = b.Text!;
+            long length = b.Length(0);
+            if (n > 0)
+                for (long c = offset / TextChunk; c <= (offset + n - 1) / TextChunk; c++)
+                    chunks[c] ??= new byte[(int)Math.Min(TextChunk, length - c * TextChunk)];
+            return chunks;
+        }
+
+        /// <summary>Copies a piece of clipboard text into its place (it can fall across two of b.Text's pieces).</summary>
+        private static void CopyText(byte[]?[] chunks, long offset, ReadOnlySpan<byte> data)
+        {
+            while (data.Length > 0)
+            {
+                var chunk = chunks[offset / TextChunk]!;
+                int at = (int)(offset % TextChunk), n = Math.Min(data.Length, chunk.Length - at);
+                data[..n].CopyTo(chunk.AsSpan(at));
+                data = data[n..];
+                offset += n;
+            }
+        }
+
+        /// <summary>The text from its pieces, made straight into the string: no second copy of all of it on the way.</summary>
+        private static string TextOf(byte[]?[] chunks)
+        {
+            // Counted by decoding once into a small scratch buffer: a character split across two pieces must be
+            // counted as the real decoding below will make it, which only a decoder that keeps its place does.
+            var count = Encoding.UTF8.GetDecoder();
+            char[] scratch = new char[TextChunk + 2];
+            int chars = 0;
+            for (int i = 0; i < chunks.Length; i++) chars += count.GetChars(chunks[i] ?? Array.Empty<byte>(), scratch, i == chunks.Length - 1);
+            return string.Create(chars, chunks, (into, cs) =>
+            {
+                var decode = Encoding.UTF8.GetDecoder();
+                int at = 0;
+                for (int i = 0; i < cs.Length; i++) at += decode.GetChars(cs[i] ?? Array.Empty<byte>(), into[at..], i == cs.Length - 1);
+            });
+        }
+
         // A hostile or broken PC must not be able to fill this PC's memory with names: at most this
         // much in one batch (a million files of ordinary depth come nowhere near it).
         private const long MaxNameBytes = 256L << 20;
@@ -1650,6 +1940,14 @@ namespace TailRemote
                     string was = rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..], now = suited[(suited.LastIndexOf('\\') + 1)..];
                     if (was != now && b.Fixed++ == 0) { b.FixedFrom = was; b.FixedAt = i; } // counted once each, not again for what is inside a renamed folder
                     b.Entries[i] = (rel = suited, length);
+                }
+                // A file Explorer acts on merely by showing the folder it is in (a shortcut or .url whose icon is on
+                // another server, desktop.ini, a search connector) could make this PC sign in to that server: given
+                // ".txt", and said, so it is only ever opened on purpose.
+                if (length >= 0 && Defused(rel) is string safe)
+                {
+                    if (b.Defused++ == 0) { b.DefusedFrom = rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..]; b.DefusedAt = i; }
+                    b.Entries[i] = (rel = safe, length);
                 }
                 // Said plainly: a name Windows cannot make (CON, NUL.txt, one ending in a dot) is not an escape attempt.
                 foreach (string part in rel.Split('\\', '/')) if (BadName(part) is string bad) throw new InvalidDataException(bad);
@@ -1695,8 +1993,15 @@ namespace TailRemote
             }
             try
             {
-                long? free = b.As(() => FreeSpace(folder));
-                if (free is long f && b.Total > f) throw new InvalidDataException("there is not enough free space on the receiving PC: it needs " + Size(b.Total) + ", and " + Size(f) + " is free.");
+                // Never filled to the last byte: a hostile PC (or a mistake) must not leave Windows and every other
+                // program with no room. Kept free: 2 GB, or a twentieth of the drive if that is more.
+                if (b.As(() => FreeSpace(folder)) is { } space)
+                {
+                    var (f, size) = space;
+                    long keep = Math.Max(2L << 30, size / 20);
+                    if (b.Total > f - keep)
+                        throw new InvalidDataException("there is not enough free space on the receiving PC: it needs " + Size(b.Total) + ", and " + Size(f) + " is free, of which Kova always leaves " + Size(keep) + " for Windows and other programs.");
+                }
             }
             catch (InvalidDataException) { throw; }
             catch { } // a drive Windows will not describe: the writes themselves say if it is full
@@ -1740,12 +2045,13 @@ namespace TailRemote
         /// Free space where the files really go (null if Windows will not say): a folder can be another drive
         /// mounted there, and a user can have a quota, so not simply its drive letter's free space.
         /// </summary>
-        private static long? FreeSpace(string folder)
+        internal static (long Free, long Size)? FreeSpace(string folder)
         {
             // The folder itself may not be made yet (Downloads, Kova): the nearest one that is.
             for (string? d = folder; d != null; d = Path.GetDirectoryName(d))
                 if (Directory.Exists(d))
-                    return GetDiskFreeSpaceExW(d.EndsWith('\\') ? d : d + "\\", out ulong free, out _, out _) ? (long)Math.Min(free, long.MaxValue) : null;
+                    return GetDiskFreeSpaceExW(d.EndsWith('\\') ? d : d + "\\", out ulong free, out ulong total, out _)
+                        ? ((long)Math.Min(free, long.MaxValue), (long)Math.Min(total, long.MaxValue)) : null;
             return null;
         }
 
@@ -1822,7 +2128,11 @@ namespace TailRemote
                         if (!filePaths.Add(path)) throw new InvalidDataException("the same file sent twice in one offer");
                         string dir = Path.GetDirectoryName(path)!;
                         if (made.Add(dir)) Directory.CreateDirectory(dir); // each folder once, not once per file
-                        if (length == 0) using (File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.Write)) { } // may be reserved already (Downloads)
+                        if (length == 0)
+                        {
+                            using (File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.Write)) { } // may be reserved already (Downloads)
+                            MarkFromInternet(path); // an empty file is all there is of it, but it is still from the other PC
+                        }
                         else partialPath ??= SafePath(b.Folder!, partialRel!) ?? throw new InvalidDataException("a path that leaves the folder");
                     }
                     if (tops.Add(top)) b.Tops.Add(top); // this batch's own (a fresh name), so it is thrown away if the batch fails
@@ -1848,6 +2158,8 @@ namespace TailRemote
                 return;
             }
             SafeFileHandle? h = null, closing = null;
+            bool text = b.Kind == KindText;
+            byte[]?[]? chunks = null;
             bool repeat = false, busy = false, whole = false, report = false, complete = false;
             Exception? failed = null;
             try
@@ -1862,13 +2174,14 @@ namespace TailRemote
                     if ((uint)e >= (uint)b.Entries.Length || offset < 0 || n < 0 || n > b.Length(e) || offset > b.Length(e) - n) throw new InvalidDataException("a piece that does not fit");
                     // A piece sent again (its confirmation was lost with a lane): confirmed, not written twice.
                     repeat = b.Got[e] >= b.Length(e) || !(b.Claimed[e] ??= new HashSet<long>()).Add(offset);
-                    h = repeat || b.Text != null ? null : b.Handles[e];
+                    h = repeat || text ? null : b.Handles[e];
+                    if (text && !repeat) chunks = TextFor(b, offset, n); // its memory is made only now that its data is here
                     // Counted until this piece is written (and its file renamed, if it was the last piece): an
                     // end waits for it, or what arrived was judged while this write was still landing.
                     b.Busy++;
                     busy = true;
                 }
-                if (!repeat && b.Text == null && h == null)
+                if (!repeat && !text && h == null)
                 {
                     // Its first piece: the file is made now, outside the batch's lock, so the lanes make
                     // files side by side. Only this file's lock is held while it is made.
@@ -1880,6 +2193,9 @@ namespace TailRemote
                             // Its folder was made while preparing.
                             // As the user in a chosen folder (b.As): this is where a file with content is really made.
                             h = b.As(() => File.OpenHandle(b.Paths[e], FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read | FileShare.Delete));
+                            // Marked as from the internet before any of it is written, so SmartScreen and Office's
+                            // Protected View treat it as they would a download. The mark goes with it when it is renamed.
+                            b.As(() => MarkFromInternet(b.Paths[e]));
                             lock (b.Gate)
                             {
                                 if (b.Ended) { h.Dispose(); return; }
@@ -1890,7 +2206,7 @@ namespace TailRemote
                 }
                 if (!repeat)
                 {
-                    if (b.Text != null) m.AsSpan(17, n).CopyTo(b.Text.AsSpan((int)offset));
+                    if (text) CopyText(chunks!, offset, m.AsSpan(17, n));
                     else RandomAccess.Write(h!, m.AsSpan(17, n), offset);
                 }
                 lock (b.Gate)
@@ -1905,7 +2221,7 @@ namespace TailRemote
                             b.Handles[e] = null;
                             b.Claimed[e] = null;
                             b.Active.Remove(e);
-                            whole = b.Text == null;
+                            whole = !text;
                         }
                         else b.Active.Add(e);
                         b.Done += n;
@@ -1922,7 +2238,7 @@ namespace TailRemote
                             b.LastReport = s;
                             b.T.BytesPerSecond = b.Speed;
                             b.T.Waiting = false;
-                            b.T.Files = b.Active.Take(32).Select(i => (b.Text != null ? "clipboard text" : Path.GetRelativePath(b.Folder!, b.Finals[i]), b.Got[i], b.Length(i))).ToArray();
+                            b.T.Files = b.Active.Take(32).Select(i => (text ? "clipboard text" : Path.GetRelativePath(b.Folder!, b.Finals[i]), b.Got[i], b.Length(i))).ToArray();
                             report = true;
                         }
                         if (b.Done == b.Total && !b.Completing) complete = b.Completing = true;
@@ -2059,7 +2375,7 @@ namespace TailRemote
             t.Done = b.Done;
             t.BytesPerSecond = b.Done / Math.Max(0.001, b.Moving > 0.5 ? b.Moving : b.Clock.Elapsed.TotalSeconds);
             if (b.Kind != KindText) lock (b.Gate) t.What = b.Tops.Count == 1 ? b.Tops[0] : b.Tops.Count + " items"; // a name taken meanwhile became "name (2)"
-            string? text = null;
+            string? text = null, unaskedText = null;
             string[]? paths = null;
             if (b.Kind == KindFiles)
             {
@@ -2074,12 +2390,28 @@ namespace TailRemote
                     }).ToArray();
                 t.Result = "The other PC sent " + t.What + Summary(b.Entries.Select(e => e!.Value)) + " to your clipboard, at " + Speed(t.BytesPerSecond) + ". Press Control V to paste.";
             }
-            else if (b.Kind is KindDownloads or KindTo) t.Result = "Received " + t.What + Summary(b.Entries.Select(e => e!.Value)) + At(t) + ". It is in " + Where(b.Folder!) + ".";
+            else if (b.Kind is KindDownloads or KindTo)
+            {
+                t.Result = "Received " + t.What + Summary(b.Entries.Select(e => e!.Value)) + At(t) + ". It is in " + Where(b.Folder!) + ".";
+                // Clipboard files this PC did not ask for: kept in Downloads instead of replacing its clipboard.
+                if (b.Unasked) t.Result = "The other PC sent " + t.What + Summary(b.Entries.Select(e => e!.Value)) + " for your clipboard without being asked, so your clipboard was left as it was. It is in " + Where(b.Folder!) + ".";
+            }
             else
             {
-                text = Encoding.UTF8.GetString(b.Text!);
+                text = TextOf(b.Text!);
                 b.Text = null;
                 t.Result = "Received the clipboard text.";
+            }
+            string? keptText = null;
+            if (text != null && b.Unasked)
+            {
+                // Text this PC did not ask for never goes onto its clipboard (it could swap a copied command for
+                // its own just before it is pasted): saved where received files go, and offered (UnaskedTextReceived).
+                unaskedText = text;
+                text = null;
+                keptText = SaveUnaskedText(b, unaskedText);
+                t.Result = "The other PC sent some text without being asked, so your clipboard was left as it was. " +
+                    (keptText != null ? "The text is saved in " + Where(Path.GetDirectoryName(keptText)!) + " as " + Path.GetFileName(keptText) + "." : "It could not be saved.");
             }
             t.Result += b.Notes();
             if (unnamed > 0) t.Result +=" " + unnamed + (unnamed == 1 ? " file arrived whole but could not be given its own name, so it is still" : " files arrived whole but could not be given their own names, so they are still") + " called incomplete.";
@@ -2095,8 +2427,70 @@ namespace TailRemote
             Progress?.Invoke(t);
             if (paths != null) FilesReceived?.Invoke(paths);
             if (text != null) TextReceived?.Invoke(text);
+            if (unaskedText != null) try { UnaskedTextReceived?.Invoke(unaskedText, keptText); } catch { }
             b.MakeAs?.Dispose(); // the signed-in user's token, held only while the batch was going
             GiveBackMemory(b.Entries.Length, b.Total);
+        }
+
+        /// <summary>
+        /// Clipboard text nobody here asked for, saved in Downloads\Kova as "clipboard text from (the other PC).txt"
+        /// (never over anything: "(2)" and so on), marked as from the internet. Its path, or null if it could not be saved.
+        /// </summary>
+        private string? SaveUnaskedText(In b, string text)
+        {
+            try
+            {
+                string from = Suited(PeerName) ?? PeerName; // an address, but made safe like any received name
+                from = from.Replace('\\', '_').Trim();
+                if (from.Length == 0 || BadName(from) != null) from = "the other PC";
+                if (from.Length > 100) from = Cut(from, 100);
+                return b.As(() =>
+                {
+                    string folder = Downloads;
+                    Directory.CreateDirectory(folder);
+                    lock (ReserveGate)
+                    {
+                        string path = Path.Combine(folder, Unique(folder, "clipboard text from " + from + ".txt"));
+                        using (var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+                        using (var w = new StreamWriter(f, new UTF8Encoding(true)))
+                            w.Write(text);
+                        MarkFromInternet(path);
+                        return path;
+                    }
+                });
+            }
+            catch (Exception e) { DiagLog.Write("files: could not save text the other PC sent: " + e.Message); return null; }
+        }
+
+        private static readonly byte[] ZoneInternet = Encoding.ASCII.GetBytes("[ZoneTransfer]\r\nZoneId=3\r\n");
+
+        /// <summary>
+        /// Marks a received file as from the internet (its Zone.Identifier stream, as a browser does for a
+        /// download), so SmartScreen asks before it runs and Office opens it in Protected View. Call as the user
+        /// the file is made as. A drive with no such streams (FAT32, exFAT, some network drives) just goes without.
+        /// </summary>
+        internal static void MarkFromInternet(string path)
+        {
+            try
+            {
+                using var h = File.OpenHandle(path + ":Zone.Identifier", FileMode.Create, FileAccess.Write, FileShare.None);
+                RandomAccess.Write(h, ZoneInternet, 0);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Says here that something the other PC sent unasked was turned away (AcceptUnasked false): at most once every
+        /// 10 seconds, so a PC sending over and over cannot keep NVDA talking.
+        /// </summary>
+        private void TellTurnedAway(string what)
+        {
+            long now = Now;
+            if (now - Interlocked.Read(ref _toldUnaskedAt) < 10_000) return;
+            Interlocked.Exchange(ref _toldUnaskedAt, now);
+            string why = "Turned away " + what + " from the other PC: you did not ask for it.";
+            DiagLog.Write("files: " + why);
+            try { Progress?.Invoke(new Transfer { What = what, Clipboard = true, Peer = PeerName, Finished = true, Failed = true, Result = why }); } catch { }
         }
 
         /// <summary>
@@ -2281,7 +2675,7 @@ namespace TailRemote
             bool replaced = outcome == EndedReplaced;
             if (outcome != EndedBadly) outcome = EndedStopped; // a stop never means it arrived
             if (_in is In b && b.Id == id)
-                EndIn(b, outcome, why.Length > 0 ? why : "The other PC stopped sending " + b.T.What + ".", outcome == EndedStopped ? "Stopped." : why, null, tell: false, replaced: replaced);
+                EndIn(b, outcome, why.Length > 0 ? Theirs(why) : "The other PC stopped sending " + b.T.What + ".", outcome == EndedStopped ? "Stopped." : why, null, tell: false, replaced: replaced);
             else lock (_inGate) Remember(id, outcome, outcome == EndedStopped || why.Length == 0 ? "Stopped." : why);
         }
 
@@ -2340,6 +2734,9 @@ namespace TailRemote
             if (part.Length == 0 || part == "." || part == "..") return null;
             if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return "the name \"" + part + "\" contains a character Windows does not allow in names";
             if (part.EndsWith('.') || part.EndsWith(' ')) return "the name \"" + part + "\" ends in a dot or a space, which Windows does not allow";
+            // Not a name Windows refuses, but one that can show as another: a right-to-left mark makes
+            // "invoice(U+202E)fdp.exe" show as "invoiceexe.pdf". Suited makes such characters "_".
+            if (part.Any(Hidden)) return "the name \"" + Shown(part) + "\" has hidden characters that can disguise what kind of file it is";
             string stem = part.Split('.')[0].TrimEnd(' ');
             if (Reserved.Contains(stem, StringComparer.OrdinalIgnoreCase)) return "the name \"" + part + "\" is one Windows keeps for itself (like CON or NUL), so no file can have it";
             return null;
@@ -2359,7 +2756,7 @@ namespace TailRemote
                 string part = parts[i];
                 if (part.Length == 0 || part == "." || part == ".." || BadName(part) == null) continue;
                 char[] c = part.ToCharArray();
-                for (int j = 0; j < c.Length; j++) if (Array.IndexOf(Path.GetInvalidFileNameChars(), c[j]) >= 0) c[j] = '_';
+                for (int j = 0; j < c.Length; j++) if (Array.IndexOf(Path.GetInvalidFileNameChars(), c[j]) >= 0 || Hidden(c[j])) c[j] = '_';
                 string s = new string(c).TrimEnd('.', ' ');
                 if (s.Length == 0) s = "_";
                 int dot = s.IndexOf('.');
@@ -2369,6 +2766,19 @@ namespace TailRemote
                 changed = true;
             }
             return changed ? string.Join('\\', parts) : null;
+        }
+
+        // Files Explorer reads by itself when it shows the folder they are in (icons, folder settings, search
+        // locations), which can point it at another server: received with ".txt" added.
+        private static readonly string[] ActsOnShow = { ".url", ".lnk", ".scf", ".library-ms", ".searchconnector-ms" };
+
+        /// <summary>The path with ".txt" added to its file name if Explorer would act on that file just by showing it; else null.</summary>
+        internal static string? Defused(string rel)
+        {
+            string name = rel[(Math.Max(rel.LastIndexOf('\\'), rel.LastIndexOf('/')) + 1)..];
+            bool acts = string.Equals(name, "desktop.ini", StringComparison.OrdinalIgnoreCase)
+                || ActsOnShow.Any(x => name.EndsWith(x, StringComparison.OrdinalIgnoreCase));
+            return acts ? rel + ".txt" : null;
         }
 
         /// <summary>

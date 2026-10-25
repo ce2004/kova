@@ -899,7 +899,7 @@ namespace TailRemote
 
         /// <summary>
         /// The same, from length bytes of m at offset: straight from the buffer the line was read into.
-        /// Nothing of m is kept once this returns (pieces are copied out, video goes into the decoder), so
+        /// Nothing of m is kept once this returns (pieces are decoded and drawn, video goes into the decoder), so
         /// the caller may read the next update into it.
         /// </summary>
         public int Apply(byte[] m, int offset, int length)
@@ -918,45 +918,65 @@ namespace TailRemote
             // Each piece is at least one 64-pixel tile, so there are never more pieces than tiles: a flood of
             // tiny ones would all be held decoded at once.
             if (count > (long)((width + ScreenVideo.Tile - 1) / ScreenVideo.Tile) * ((height + ScreenVideo.Tile - 1) / ScreenVideo.Tile)) throw new InvalidDataException("a damaged picture");
-            var pieces = new List<(Rectangle At, Image Image)>(count);
-            long area = 0;
-            try
+            // First every piece's place and size, nothing decoded yet: a damaged update is refused before the picture
+            // shown is touched, and the pieces' compressed bytes together are capped (a whole 8K screen as PNG is far
+            // less), so one update cannot have GDI+ chew through hundreds of megabytes.
+            var pieces = new List<(Rectangle At, int Offset, int Length, bool Png)>(count);
+            long area = 0, bytes = 0;
+            for (int i = 0; i < count; i++)
             {
-                for (int i = 0; i < count; i++)
+                int x = r.ReadUInt16(), y = r.ReadUInt16(), w = r.ReadUInt16(), h = r.ReadUInt16(), n = r.ReadInt32();
+                long left = r.BaseStream.Length - r.BaseStream.Position;
+                if (n < 8 || n > left || w == 0 || h == 0 || x + w > width || y + h > height) throw new InvalidDataException("a damaged picture");
+                // The host's pieces never overlap, so together they cover the picture at most: more is a
+                // flood of pieces.
+                area += (long)w * h;
+                if (area > (long)width * height) throw new InvalidDataException("a damaged picture");
+                bytes += n;
+                if (bytes > MaxStillBytes) throw new InvalidDataException("a picture far too big");
+                int at = offset + (int)r.BaseStream.Position;
+                bool jpeg = m[at] == 0xFF && m[at + 1] == 0xD8, png = m[at] == 0x89 && m[at + 1] == 0x50 && m[at + 2] == 0x4E && m[at + 3] == 0x47;
+                if (!jpeg && !png) throw new InvalidDataException("a picture of a kind this version does not take");
+                // Its size as the picture itself says, checked before it is decoded: a small file can
+                // unpack to a huge picture, which decoding would set aside memory for first.
+                if (StoredSize(m.AsSpan(at, n), png) != (w, h)) throw new InvalidDataException("a picture of the wrong size");
+                pieces.Add((new Rectangle(x, y, w, h), at, n, png));
+                r.BaseStream.Position += n;
+            }
+            if (all)
+            {
+                // Back to still pictures for now: the H.264 frame buffer (up to 256 MB at 8K) is not held as well.
+                lock (_decoding) _decoded = null;
+            }
+            lock (Gate)
+            {
+                if (_disposed) return 0; // the window closed meanwhile: a new bitmap now would never be freed
+                if (Picture == null || Picture.Width != width || Picture.Height != height)
                 {
-                    int x = r.ReadUInt16(), y = r.ReadUInt16(), w = r.ReadUInt16(), h = r.ReadUInt16(), n = r.ReadInt32();
-                    long left = r.BaseStream.Length - r.BaseStream.Position;
-                    if (n < 8 || n > left || w == 0 || h == 0 || x + w > width || y + h > height) throw new InvalidDataException("a damaged picture");
-                    // The host's pieces never overlap, so together they cover the picture at most: more is a
-                    // flood of pieces that would all be held decoded at once.
-                    area += (long)w * h;
-                    if (area > (long)width * height) throw new InvalidDataException("a damaged picture");
-                    byte[] data = r.ReadBytes(n);
-                    bool jpeg = data[0] == 0xFF && data[1] == 0xD8, png = data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
-                    if (!jpeg && !png) throw new InvalidDataException("a picture of a kind this version does not take");
-                    // Its size as the picture itself says, checked before it is decoded: a small file can
-                    // unpack to a huge picture, which decoding would set aside memory for first.
-                    if (StoredSize(data, png) != (w, h)) throw new InvalidDataException("a picture of the wrong size");
-                    var img = Image.FromStream(new MemoryStream(data));
-                    pieces.Add((new Rectangle(x, y, w, h), img));
-                    if (img.Width != w || img.Height != h) throw new InvalidDataException("a picture of the wrong size");
+                    if (!all) throw new InvalidDataException("a change to a picture this PC does not have");
+                    Picture?.Dispose();
+                    Picture = null; // the old one freed before the new one is made, not both held at once
+                    Picture = new Bitmap(width, height, PixelFormat.Format32bppRgb);
                 }
+                // A whole picture of the same size is drawn over the one shown (its pieces cover all of it), so
+                // the window never shows an empty canvas in between.
+            }
+            // Then one piece at a time: decoded (outside the lock, so the window can still draw), drawn, and freed
+            // straight away, so at most one decoded piece is held next to the picture shown.
+            foreach (var (at, start, n, _) in pieces)
+            {
+                using var img = Image.FromStream(new MemoryStream(m, start, n, writable: false));
+                if (img.Width != at.Width || img.Height != at.Height) throw new InvalidDataException("a picture of the wrong size");
                 lock (Gate)
                 {
-                    if (_disposed) return 0; // the window closed meanwhile: a new bitmap now would never be freed
-                    if (Picture == null || all || Picture.Width != width || Picture.Height != height)
-                    {
-                        if (!all) throw new InvalidDataException("a change to a picture this PC does not have");
-                        Picture?.Dispose();
-                        Picture = new Bitmap(width, height, PixelFormat.Format32bppRgb);
-                    }
+                    if (_disposed) return 0;
+                    if (Picture == null || Picture.Width != width || Picture.Height != height) throw new InvalidDataException("a change to a picture this PC does not have");
                     using var g = Graphics.FromImage(Picture);
                     g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
                     g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                    foreach (var (at, img) in pieces) g.DrawImage(img, at, new Rectangle(0, 0, img.Width, img.Height), GraphicsUnit.Pixel);
+                    g.DrawImage(img, at, new Rectangle(0, 0, img.Width, img.Height), GraphicsUnit.Pixel);
                 }
             }
-            finally { foreach (var (_, img) in pieces) img.Dispose(); }
             return count;
         }
 
@@ -1002,17 +1022,20 @@ namespace TailRemote
         /// <summary>The biggest picture taken, either way (an 8K screen fits): bigger is a damaged or hostile update.</summary>
         private const long MaxArea = 8192L * 8192;
 
+        /// <summary>The most compressed bytes one still-picture update may carry, all its pieces together.</summary>
+        internal const long MaxStillBytes = 32L * 1024 * 1024;
+
         /// <summary>
         /// The width and height a PNG or JPEG says it has, read from its header without decoding it; (-1, -1)
         /// when it cannot be read (then the piece is refused).
         /// </summary>
-        private static (int W, int H) StoredSize(byte[] d, bool png)
+        private static (int W, int H) StoredSize(ReadOnlySpan<byte> d, bool png)
         {
             if (png)
             {
                 // The signature, then the IHDR chunk, which must come first: width and height big-endian.
                 if (d.Length < 24 || d[12] != 'I' || d[13] != 'H' || d[14] != 'D' || d[15] != 'R') return (-1, -1);
-                long pw = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(16)), ph = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(20));
+                long pw = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.Slice(16)), ph = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(d.Slice(20));
                 return pw > ushort.MaxValue || ph > ushort.MaxValue ? (-1, -1) : ((int)pw, (int)ph);
             }
             // JPEG: the segments after the start, each a marker and a length, up to the frame header (SOF).

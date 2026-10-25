@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -41,7 +42,11 @@ namespace TailRemote
         public bool CatchUpBySpeed { get; set; }
         public bool AnnounceQuality { get; set; }
         public bool AnnounceHealth { get; set; } = true;
-        public bool MuteWhenNotControlling { get; set; }
+        /// <summary>Mute Kova when not in focus (4.4): while no Kova window is in front, nothing from the remote PC is heard (sound, NVDA speech, braille) and the host sends no sound.</summary>
+        public bool MuteWhenNotFocused { get; set; }
+        /// <summary>The old name of MuteWhenNotFocused (up to 4.3): read once into it, never written again.</summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public bool? MuteWhenNotControlling { get => null; set { if (value is bool b) MuteWhenNotFocused = b; } }
         public bool RideOutStalls { get; set; } = true;
         /// <summary>Piano tones for connecting, clipboard, files and the rest (Sounds.cs).</summary>
         public bool Sounds { get; set; } = true;
@@ -52,6 +57,91 @@ namespace TailRemote
         /// <summary>Sound quality: -1 follows the connection (Variable); otherwise the bitrate step it is locked to.</summary>
         public int SoundQuality { get; set; } = -1;
         public System.Collections.Generic.List<SavedPc> SavedPcs { get; set; } = new();
+
+        /// <summary>Host: this PC's lasting identity (HostIdentity), a private key, DPAPI-protected. Made the first time it hosts.</summary>
+        public string HostIdentityEnc { get; set; } = "";
+
+        /// <summary>
+        /// Controlling: the PCs this one has logged in to, by Client.TrustKey: each one's lasting identity (hex) and
+        /// the device ticket it gave (DPAPI-protected). Replaced whole on every change, never edited in place: the
+        /// network threads change it while the window may be saving it.
+        /// </summary>
+        public System.Collections.Generic.Dictionary<string, KnownHost> KnownHosts { get; set; } = new();
+
+        /// <summary>Host: also be reachable through a Kova Relay, under RelayName.</summary>
+        public bool RelayHosting { get; set; }
+        public string RelayAddress { get; set; } = "";
+        public int RelayPort { get; set; } = 47200;
+        public string RelayName { get; set; } = "";
+
+
+        /// <summary>Controlling: take text and files the remote PC sends without being asked (never onto the clipboard by itself either way).</summary>
+        public bool AcceptUnasked { get; set; } = true;
+
+        private static readonly object TrustGate = new();
+
+        /// <summary>This PC's identity as a host: the one kept, or a new one (saved by the caller with the settings).</summary>
+        public HostIdentity LoadOrMakeIdentity()
+        {
+            try
+            {
+                if (HostIdentityEnc.Length > 0 && HostIdentity.FromPkcs8(Convert.FromBase64String(Unprotect(HostIdentityEnc))) is { } kept) return kept;
+            }
+            catch { }
+            var made = HostIdentity.Create();
+            HostIdentityEnc = Protect(Convert.ToBase64String(made.ExportPkcs8()));
+            return made;
+        }
+
+        /// <summary>IHostTrust for the controlling side, kept in these settings (TrustChanged asks the window to save).</summary>
+        public IHostTrust Trust => new KnownHostsTrust(this);
+
+        /// <summary>Raised (on a network thread) when a host's identity or ticket was remembered: the window saves.</summary>
+        [JsonIgnore] public Action? TrustChanged;
+
+        private sealed class KnownHostsTrust : IHostTrust
+        {
+            private readonly Settings _s;
+            public KnownHostsTrust(Settings s) => _s = s;
+
+            public (byte[]? Identity, byte[]? Ticket) Known(string pc)
+            {
+                if (!_s.KnownHosts.TryGetValue(pc, out var k) || k == null) return (null, null);
+                byte[]? id = null, ticket = null;
+                try { id = Convert.FromHexString(k.Identity); } catch { }
+                try { if (k.TicketEnc.Length > 0) ticket = Convert.FromBase64String(Unprotect(k.TicketEnc)); } catch { }
+                return (id is { Length: HostIdentity.PublicBytes } ? id : null, ticket);
+            }
+
+            public void Remember(string pc, byte[] identity, byte[]? ticket)
+            {
+                lock (TrustGate)
+                {
+                    var all = new System.Collections.Generic.Dictionary<string, KnownHost>(_s.KnownHosts);
+                    string hex = Convert.ToHexString(identity);
+                    all.TryGetValue(pc, out var old);
+                    // A ticket belongs to the identity that gave it: a new identity starts without one.
+                    string keepTicket = old != null && old.Identity == hex ? old.TicketEnc : "";
+                    all.Remove(pc); // added again at the end: the PCs at the front are the ones least recently used
+                    all[pc] = new KnownHost { Identity = hex, TicketEnc = ticket != null ? Protect(Convert.ToBase64String(ticket)) : keepTicket };
+                    // A sane bound: PCs connected to once years ago go first.
+                    if (all.Count > 500) foreach (var k in all.Keys.Take(all.Count - 500).ToList()) all.Remove(k);
+                    _s.KnownHosts = all;
+                }
+                _s.TrustChanged?.Invoke();
+            }
+        }
+
+        /// <summary>Forgets what this PC knows about a host (the person accepted its new identity: it is learnt again at the next login).</summary>
+        public void ForgetHost(string pc)
+        {
+            lock (TrustGate)
+            {
+                var all = new System.Collections.Generic.Dictionary<string, KnownHost>(KnownHosts);
+                all.Remove(pc);
+                KnownHosts = all;
+            }
+        }
 
         [JsonIgnore]
         public string ListenPassword
@@ -112,7 +202,15 @@ namespace TailRemote
         public string ResumeState { get; set; } = "";
 
         // KOVA_SETTINGS_DIR: test copies keep their settings apart from the real ones.
-        private static string Dir => Environment.GetEnvironmentVariable("KOVA_SETTINGS_DIR") is { Length: > 0 } test ? test : Names.UserDir;
+        // Never for a copy running as administrator or SYSTEM (4.4): HKCU\Environment, which any program the user runs can
+        // write, reaches elevated processes too, and would point them at settings of its making. (Such a copy does not
+        // start at all while the switch is set: Program.Main. A test copy must never fall back on the real settings.)
+        private static string Dir => TestDir ?? (Names.TestSwitch("KOVA_SETTINGS_DIR") is { Length: > 0 } test ? test
+            : Environment.GetEnvironmentVariable("KOVA_SETTINGS_DIR") is { Length: > 0 } ? throw new InvalidOperationException("A test copy's settings folder is set, but this copy runs as administrator, so it would use the real settings. It does not.")
+            : Names.UserDir);
+
+        /// <summary>Tests only, set in-process (the self-test): where settings are kept instead of the real folder.</summary>
+        internal static string? TestDir;
         internal static string FilePath => Path.Combine(Dir, "settings.json");
         // Save() writes here first, then atomically replaces FilePath, so a crash or power loss
         // mid-write can never leave a half-written settings.json as the live file.
@@ -143,6 +241,7 @@ namespace TailRemote
             copy.ListenPasswordEnc = ListenPassword;
             foreach (var pc in copy.SavedPcs) pc.PasswordEnc = Unprotect(pc.PasswordEnc);
             copy.KnownPorts = new();   // this PC's firewall history, not the next one's
+            copy.HostIdentityEnc = "";  // this PC's identity as a host: another PC must never take it on
             copy.HostedPort = 0;
             copy.ResumeState = "";
             byte[] plain = JsonSerializer.SerializeToUtf8Bytes(copy);
@@ -182,6 +281,7 @@ namespace TailRemote
             foreach (var pc in s.SavedPcs) pc.PasswordEnc = Protect(pc.PasswordEnc);
             // As Export leaves them out: another PC's firewall history and what it was doing as it closed.
             s.KnownPorts = new();
+            s.HostIdentityEnc = "";
             s.HostedPort = 0;
             s.ResumeState = "";
             return s;
@@ -195,10 +295,12 @@ namespace TailRemote
         {
             var ports = KnownPorts;
             int hosted = HostedPort;
+            string identity = HostIdentityEnc; // this PC's own identity as a host stays: controlling PCs know it by it
             foreach (var p in typeof(Settings).GetProperties())
                 if (p.CanWrite && p.CanRead && !Attribute.IsDefined(p, typeof(JsonIgnoreAttribute))) p.SetValue(this, p.GetValue(other));
             foreach (int port in ports) if (!KnownPorts.Contains(port)) KnownPorts.Add(port);
             HostedPort = hosted;
+            HostIdentityEnc = identity;
         }
 
         /// <summary>
@@ -241,6 +343,8 @@ namespace TailRemote
             SoundChoices ??= new();
             KnownPorts ??= new();
             SavedPcs ??= new();
+            KnownHosts ??= new();
+            HostIdentityEnc ??= ""; RelayAddress ??= ""; RelayName ??= "";
             SavedPcs.RemoveAll(pc => pc == null);
             foreach (var pc in SavedPcs) { pc.Address ??= ""; pc.PasswordEnc ??= ""; }
             return this;
@@ -400,5 +504,15 @@ namespace TailRemote
     internal sealed class WrongBackupPasswordException : System.Security.Cryptography.CryptographicException
     {
         public WrongBackupPasswordException() : base("Wrong password for that backup, or the file is damaged.") { }
+    }
+}
+
+namespace TailRemote
+{
+    /// <summary>A host this PC has logged in to: its lasting identity (hex) and the device ticket it gave (DPAPI-protected).</summary>
+    internal sealed class KnownHost
+    {
+        public string Identity { get; set; } = "";
+        public string TicketEnc { get; set; } = "";
     }
 }

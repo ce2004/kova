@@ -79,11 +79,14 @@ namespace TailRemote
                 Run(Schtasks, "/Delete /TN \"" + TaskName + "\" /F");
                 return 0;
             }
+            // As administrator only when ordinary users cannot change this copy (4.4): a task that runs, elevated and with
+            // no prompt, a file any program the user runs could replace, was a silent way to administrator rights.
+            string level = ServiceHost.ProtectedFromUsers(exe) ? "Highest" : "Limited";
             // Not schtasks /Create: its tasks stop after 3 days and refuse to start on battery.
             string ps = (account != null ? "$u = '" + Quoted(account) + "'; " : "$u = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ") +
                 "$a = New-ScheduledTaskAction -Execute '" + Quoted(exe) + "' -Argument '" + Names.InstanceArgs + "--host'; " +
                 "$t = New-ScheduledTaskTrigger -AtLogOn -User $u; " +
-                "$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest; " +
+                "$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel " + level + "; " +
                 "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; " +
                 "Register-ScheduledTask -TaskName '" + TaskName + "' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null";
             return Run(PowerShell, "-NoProfile -NonInteractive -Command \"" + ps + "\"");

@@ -147,6 +147,25 @@ namespace TailRemote
             finally { CloseHandle(token); }
         }
 
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        private static extern bool WTSQuerySessionInformationW(IntPtr server, uint session, int infoClass, out IntPtr buffer, out uint bytes);
+        [DllImport("wtsapi32.dll")]
+        private static extern void WTSFreeMemory(IntPtr memory);
+        private const int WTSSessionInfoEx = 25;
+
+        /// <summary>
+        /// Whether a session's screen is locked (or nobody is signed in there). WTSINFOEXW: Level (4 bytes), then
+        /// SessionId, SessionState, SessionFlags: WTS_SESSIONSTATE_LOCK is 0, UNLOCK 1, -1 unknown (taken as not
+        /// locked: refusing then would only stop a PC whose state Windows will not say).
+        /// </summary>
+        public static bool SessionLocked(uint session)
+        {
+            if (session == 0xFFFFFFFF) return true;
+            if (!WTSQuerySessionInformationW(IntPtr.Zero, session, WTSSessionInfoEx, out IntPtr buf, out uint n)) return false;
+            try { return n >= 16 && Marshal.ReadInt32(buf, 12) == 0; }
+            finally { WTSFreeMemory(buf); }
+        }
+
         /// <summary>The signed-in user's profile folder in a session, or null if nobody is signed in.</summary>
         public static string? UserProfile(uint session)
         {

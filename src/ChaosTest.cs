@@ -30,6 +30,7 @@ namespace TailRemote
         public static int Run()
         {
             Host.WrongPasswordDelayMs = 0;
+            Host.TestLocked = false; // Get files as if signed in: this VPS's console is usually locked
             Names.TestPipes = "Chaos"; // never the real service's pipes, on a PC that runs it
             if (Environment.GetEnvironmentVariable("CHAOS_TRACE") != null) DiagLog.Enabled = true;
             if (Directory.Exists(Root)) Directory.Delete(Root, true);
@@ -294,6 +295,7 @@ namespace TailRemote
                     string[]? toHost = null, toClient = null;
                     host.ClipboardFilesReceived += p => toHost = p;
                     ctrl.ClipboardFilesReceived += p => toClient = p;
+                    ctrl.Files!.ExpectClipboard(); // 4.4: a controller takes the host's clipboard only when it asked for it (Get the remote clipboard)
                     var t1 = Task.Run(() => ctrl.Files!.SendFiles(new[] { a }));
                     var t2 = Task.Run(() => host.ControllerFiles!.SendFiles(new[] { b }));
                     Task.WaitAll(t1, t2);
@@ -688,6 +690,7 @@ namespace TailRemote
                     var hostSaid = new System.Collections.Concurrent.ConcurrentBag<FileChannel.Transfer>();
                     Action<FileChannel.Transfer> note = t => { if (t.Finished && t.Outgoing && t.What == "to-everyone.bin") hostSaid.Add(t); };
                     host.TransferProgress += note;
+                    foreach (var c in everyone) c.Files!.ExpectClipboard(); // 4.4: a controller takes the host's clipboard only when it asked for it (Get the remote clipboard)
                     host.SendClipboardFiles(new[] { file });
                     for (int i = 0; i < 3000 && (got.Count < 10 || hostSaid.Count < 10); i++) Thread.Sleep(20);
                     host.TransferProgress -= note;
@@ -828,11 +831,13 @@ namespace TailRemote
                     ctrl.ClipboardFilesReceived += tookFiles;
                     for (int i = 0; i < 200 && !(window.Connected && window.HasController); i++) Thread.Sleep(20);
                     if (!window.Connected || !window.HasController) return "FAIL: the window never linked up (connected " + window.Connected + ")";
+                    ctrl.Files!.ExpectClipboard(); // 4.4: a controller takes the host's clipboard only when it asked for it (Get the remote clipboard)
                     window.SendClipboard("from the window, through the agent");
                     ctrl.SendClipboard("from the controller, to the window");
                     // Each side's next send would replace its text still on the way, so the files wait for it.
                     for (int i = 0; i < 500 && (toWindow == null || toController == null); i++) Thread.Sleep(20);
                     string file = Big("via-service.bin", 3);
+                    ctrl.Files!.ExpectClipboard();
                     window.SendClipboardFiles(new[] { file });
                     for (int i = 0; i < 500 && controllerFiles == null; i++) Thread.Sleep(20);
                     // Checked before the next one: in this test both sides share one holding folder, and
@@ -1301,37 +1306,34 @@ namespace TailRemote
                 }
             });
 
-            Scenario("hosting as the service: the remote NVDA's wants reach the agent and its lines come back, a listener's microphone is never played", 30, () =>
+            Scenario("the remote NVDA (Kova Helper add-on): speech, a cut-off, a beep and braille reach a controller in order, never a listener; without the add-on the controller is told; a listener's microphone is never played", 30, () =>
             {
-                // The service's way (Agent.StartHosting): the host asks the agent through the pipe, the agent's NVDA reader
-                // answers. The reader is in test mode: it never looks at this PC's real NVDA windows.
-                AgentLink.TestAnyOwner = true;
-                string pipes = Names.TestPipes;
-                Names.TestPipes = pipes + "Nvda"; // a pipe of its own: the other agent scenarios' servers are still listening on theirs
-                var server = new AgentLink.Server();
-                var nvda = new NvdaViewers(null, null, testOnly: true);
-                new Thread(() => AgentLink.Run((_, _, _, _) => { }, (_, _, _) => { }, _ => { }, _ => { }, null, null, nvda)) { IsBackground = true }.Start();
-                Thread.Sleep(1500); // the agent connects on this scenario's own pipe
-                Names.TestPipes = pipes;
-                var svc = new Host(Port + 8, Password, ListenPassword, _ => { }) { NvdaRequest = server.Nvda };
-                server.NvdaText = (kind, t) => { if (kind == AgentLink.NvdaKindLines) svc.NvdaLines(t.Split('\n', StringSplitOptions.RemoveEmptyEntries)); };
+                var svc = new Host(Port + 8, Password, ListenPassword, _ => { });
                 try
                 {
                     using var c = Client.Connect("127.0.0.1", Port + 8, Password, new Player(Player.NoDevice, _ => { }), _ => { });
                     using var l = Client.Connect("127.0.0.1", Port + 8, ListenPassword, new Player(Player.NoDevice, _ => { }), _ => { });
-                    var heard = new System.Collections.Concurrent.ConcurrentQueue<string>();
-                    c.NvdaSpoke += lines => { foreach (var x in lines) heard.Enqueue(x); };
-                    for (int i = 0; i < 100 && c.HostVersion == null; i++) Thread.Sleep(20);
-                    Thread.Sleep(1500); // the agent connects
+                    var got = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    int listenerGot = 0;
+                    bool? there = null;
+                    c.NvdaEventArrived += ev => got.Enqueue(ev.Kind + ":" + (ev.Kind == NvdaEventKind.Speak ? ev.SpokenText : ev.Kind == NvdaEventKind.Braille ? ev.Text : ev.Kind == NvdaEventKind.Beep ? ev.Hz.ToString() : ""));
+                    c.NvdaHelperThere += x => there = x;
+                    l.NvdaEventArrived += _ => Interlocked.Increment(ref listenerGot);
+                    for (int i = 0; i < 100 && (c.HostVersion == null || l.HostVersion == null); i++) Thread.Sleep(20);
+                    svc.TestHelperConnected = false;
                     c.NvdaText = true;
-                    for (int i = 0; i < 100 && !nvda.ReadSpeech; i++) Thread.Sleep(20);
-                    if (!nvda.ReadSpeech) return "FAIL: the agent was never told to read NVDA's speech";
-                    nvda.TestSpeak(new[] { "Start button", "Search box, edit" });
-                    for (int i = 0; i < 100 && heard.Count < 2; i++) Thread.Sleep(20);
-                    if (string.Join("|", heard) != "Start button|Search box, edit") return "FAIL: the controller heard " + string.Join("|", heard);
-                    c.NvdaText = false;
-                    for (int i = 0; i < 100 && nvda.ReadSpeech; i++) Thread.Sleep(20);
-                    if (nvda.ReadSpeech) return "FAIL: the agent kept reading once nobody wanted it";
+                    l.NvdaText = true;
+                    for (int i = 0; i < 100 && there == null; i++) Thread.Sleep(20);
+                    if (there != false) return "FAIL: the controller was not told the remote PC has no Kova Helper";
+                    svc.NvdaEventNow(NvdaEvent.Speak(new NvdaSpeechPart("Start button"), new NvdaSpeechPart("H", 30, Capital: true)));
+                    svc.NvdaEventNow(NvdaEvent.Cancel());
+                    svc.NvdaEventNow(NvdaEvent.Beep(880, 40, 50, 50));
+                    svc.NvdaEventNow(NvdaEvent.Braille("btn Start"));
+                    for (int i = 0; i < 100 && got.Count < 4; i++) Thread.Sleep(20);
+                    Thread.Sleep(200);
+                    string all = string.Join("|", got);
+                    if (got.Count != 4 || !all.StartsWith("Speak:Start button") || !all.Contains("|Cancel:|Beep:880|Braille:btn Start")) return "FAIL: the controller got " + all;
+                    if (listenerGot != 0) return "FAIL: a listen-only login got the remote NVDA";
                     // A listener's microphone packets, sent by hand: never played (it may only listen).
                     int mic = 0;
                     MicIn.TestHeard = (_, t) => Interlocked.Add(ref mic, t);
@@ -1344,11 +1346,10 @@ namespace TailRemote
                         if (mic != 0) return "FAIL: a listener's microphone was played";
                     }
                     finally { MicIn.TestHeard = null; }
-                    return "lines said on the agent came to the controller, it stopped reading when nobody wanted them, and a listener's microphone was refused";
+                    return "speech, a cut-off, a beep and braille came in order to the controller only, it was told the add-on was missing, and a listener's microphone was refused";
                 }
-                finally { svc.Dispose(); nvda.Dispose(); }
+                finally { svc.Dispose(); }
             });
-
             Scenario("the connection drops before the window is listening: it still hears about it", 30, () =>
             {
                 // A second host of its own, so stopping it disturbs nothing else.
@@ -1368,7 +1369,7 @@ namespace TailRemote
             Scenario("six wrong passwords, then the right one", 30, () =>
             {
                 int refused = 0;
-                for (int i = 0; i < 6; i++) try { using var c = Connect("wrong" + i); } catch (Exception e) when (e.Message.StartsWith("Wrong password") || e.Message == Protocol.DamagedLogin || e.Message.Contains("closed")) { refused++; }
+                for (int i = 0; i < 6; i++) try { using var c = Connect("wrong" + i); } catch (Exception e) when (e.Message.StartsWith("Wrong password") || e.Message == Client.TurnedAway || e.Message == Protocol.DamagedLogin || e.Message.Contains("closed")) { refused++; }
                 string right;
                 try { using var c = Connect(Password); right = "the right one got in (it should have been blocked for a minute)"; }
                 catch (Exception e) { right = "the right one was blocked for now: " + e.Message; }

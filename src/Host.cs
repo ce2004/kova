@@ -22,6 +22,38 @@ namespace TailRemote
         // starts: a reconnecting PC works its key out again once, and nothing precomputed for one
         // host, or for an earlier run of this one, is any use.
         private readonly byte[] _salt = RandomNumberGenerator.GetBytes(Protocol.SaltBytes);
+
+        /// <summary>This host's lasting identity (HostIdentity): signs every hello, makes device tickets, registers on a relay.</summary>
+        public HostIdentity Identity { get; }
+        private readonly bool _ownIdentity;
+
+        // ---- Hosting through a Kova Relay (Relay.cs) ----
+        private RelayHost? _relay;
+
+        /// <summary>Also reachable through this relay, under this name (null: not, or no longer).</summary>
+        public void UseRelay(Relay.Target? target)
+        {
+            var old = Interlocked.Exchange(ref _relay, null);
+            old?.Dispose();
+            if (target == null || _stop) return;
+            _relay = new RelayHost(target, this, Identity, (b, n, ep) => { try { _udp.Send(b, n, Dual(ep)); } catch { } }, msg => { _status(msg); RelayStatus?.Invoke(msg); });
+        }
+
+        /// <summary>What happens with the relay, in a sentence (registered, refused, lost and trying again), each said once: the window speaks it.</summary>
+        public event Action<string>? RelayStatus;
+
+        /// <summary>Whether this host is registered on its relay right now.</summary>
+        public bool RelayRegistered => _relay?.Registered == true;
+
+        // The UDP socket is IPv6 with IPv4 mapped in: an IPv4 relay is written the mapped way.
+        private static IPEndPoint Dual(IPEndPoint ep) => ep.AddressFamily == AddressFamily.InterNetwork ? new IPEndPoint(ep.Address.MapToIPv6(), ep.Port) : ep;
+
+        /// <summary>Sends to a controlling PC: straight there, or back through the relay it came by.</summary>
+        private void UdpSend(byte[] data, int length, IPEndPoint to)
+        {
+            if (Relay.RouteOf(to.Address) is { } r) r.Via.SendUdp(r.Id, data, length);
+            else _udp.Send(data, length, to);
+        }
         private readonly byte[] _key;
         private readonly byte[]? _listenKey;
         private readonly Action<string> _status;
@@ -126,8 +158,11 @@ namespace TailRemote
         private string? _captureDevice;
 
         /// <summary>captureDevice: the output whose sound is sent, or null for Windows' default.</summary>
-        public Host(int port, string password, string? listenPassword, Action<string> status, string? captureDevice = null)
+        public Host(int port, string password, string? listenPassword, Action<string> status, string? captureDevice = null, HostIdentity? identity = null)
         {
+            // Lasting identity: the window and the service pass the one they keep; tests get a throwaway one.
+            _ownIdentity = identity == null;
+            Identity = identity ?? HostIdentity.Create();
             // Checked here, with a message to show: TcpListener throws ArgumentOutOfRange, which nothing translated.
             if (port < 1 || port > 65535) throw new InvalidOperationException("Port " + port + " is not a port number. Choose a port from 1 to 65535.");
             _captureDevice = captureDevice;
@@ -246,81 +281,74 @@ namespace TailRemote
             if (step >= 0 && owner != null) Tell(owner, Protocol.MicQuality, new[] { (byte)step });
         }
 
-        // ---- This PC's NVDA as text: NVDA's own Speech Viewer and Braille Viewer, hidden and read (NvdaViewers) ----
+        // ---- This PC's NVDA, through the Kova Helper add-on (NvdaHelper, NvdaEvent; 4.4) ----
+        // NVDA hands everything it speaks, its cut-offs, beeps, sounds and braille straight to Kova over a local pipe.
+        // (Up to 4.3 Kova read NVDA's Speech Viewer, hidden, which needed administrator rights and was slower: gone.)
 
-        /// <summary>
-        /// The service's way to its agent, which reads NVDA's viewers at the screen: called with what the controlling
-        /// PCs want (Protocol.NvdaSpeechFlag...). Null (the window): this process reads them itself, if it may.
-        /// </summary>
-        public Action<byte>? NvdaRequest { get; init; }
-        private NvdaViewers? _nvda;
-        private byte _nvdaFlags;
-        private string? _nvdaProblem; // why NVDA's text cannot come right now, or null
+        private NvdaHelper.Server? _helper;
+        private int _helperInstalling;
+
+        /// <summary>The window's menu: where the add-on stands, connected or not.</summary>
+        internal NvdaHelper.Server? NvdaHelperServer => _helper;
         private readonly object _nvdaGate = new();
 
-        public const string NvdaNotElevated = "The remote PC's NVDA speech can only come through when Kova there runs as the Windows service, or as administrator with Start hosting when Windows starts.";
+        /// <summary>Tests only: stands in for whether the add-on is talking to this host (null: ask the pipe).</summary>
+        internal bool? TestHelperConnected;
+
+        /// <summary>Whether the Kova Helper add-on is talking to this host right now.</summary>
+        public bool NvdaHelperConnected => TestHelperConnected ?? _helper?.Connected == true;
 
         /// <summary>
-        /// The window hosting: NVDA's viewers are kept hidden for as long as this PC hosts, whoever is connected, so they
-        /// never show up on its screen or in Alt Tab. Only an administrator's Kova may hide NVDA's windows (Windows keeps
-        /// other programs off them), so a plain one never touches them and says why to a PC that asks.
+        /// Listens for the Kova Helper add-on (no network: a pipe only NVDA in the session at the screen may use). The window
+        /// and the service both call it; no administrator rights are needed.
         /// </summary>
-        public void StartNvdaHere()
+        public void StartNvdaHelper()
         {
-            if (NvdaRequest != null) return;
             lock (_nvdaGate)
             {
-                if (_nvda != null || _stop) return;
-                if (!Startup.IsElevated()) { _nvdaProblem = NvdaNotElevated; return; }
-                var v = new NvdaViewers(m => DiagLog.Write("host: " + m), null);
-                v.Spoke += NvdaLines;
-                v.Braille += NvdaBrailleNow;
-                v.Problem += NvdaProblemNow;
-                _nvda = v;
+                if (_helper != null || _stop) return;
+                var h = new NvdaHelper.Server(m => DiagLog.Write("host: " + m));
+                h.Event += NvdaEventNow;
+                h.ConnectedChanged += _ => TellNvdaAvailable(null);
+                _helper = h;
             }
         }
 
-        /// <summary>The flags every PC wants together changed: the reader is told.</summary>
-        private void NvdaWantsChanged()
+        /// <summary>Tells every controller that wants NVDA (or just this one) whether the add-on is there to send it.</summary>
+        private void TellNvdaAvailable(Session? only)
         {
-            byte f = 0;
-            Action<byte>? request;
-            lock (_nvdaGate)
-            {
-                // Worked out under the lock: two threads (a reader, a session ending) must not store an older answer last.
-                foreach (var x in AllSessions()) f |= x.NvdaWant;
-                if (f == _nvdaFlags) return;
-                _nvdaFlags = f;
-                request = NvdaRequest;
-                if (_nvda != null) { _nvda.ReadSpeech = (f & Protocol.NvdaSpeechFlag) != 0; _nvda.ReadBraille = (f & Protocol.NvdaBrailleFlag) != 0; }
-                request?.Invoke(f); // in order, under the lock (it only queues the message to the agent)
-            }
+            byte[] m = { Protocol.NvdaAvailable, (byte)(NvdaHelperConnected ? 1 : 0) };
+            foreach (var s in only != null ? new[] { only } : AllSessions())
+                if (s.Role == Protocol.RoleControl && s.NvdaWant != 0) Queue(s, m);
         }
 
-        /// <summary>Lines NVDA spoke here: to every PC that wants them, in order.</summary>
+        /// <summary>
+        /// One thing NVDA did here, to every controller that wants it, in order, on its own small message (never behind
+        /// big writes: files and the screen have lanes of their own). Controllers only: a listen-only password is for
+        /// hearing the sound, and the text (braille above all) can say more than the sound does.
+        /// </summary>
+        public void NvdaEventNow(NvdaEvent ev)
+        {
+            NvdaEventSeen?.Invoke(ev);
+            byte[] body = ev.Encode();
+            byte[] m = new byte[1 + body.Length];
+            m[0] = Protocol.NvdaEventMsg;
+            body.CopyTo(m, 1);
+            byte flag = ev.Kind == NvdaEventKind.Braille ? Protocol.NvdaBrailleFlag : Protocol.NvdaSpeechFlag;
+            foreach (var s in AllSessions()) if (s.Role == Protocol.RoleControl && (s.NvdaWant & flag) != 0) Queue(s, m);
+        }
+
+        /// <summary>Tests and logs: everything NVDA handed over here, as it came.</summary>
+        public event Action<NvdaEvent>? NvdaEventSeen;
+
+        /// <summary>Lines spoken here, as the add-on would hand them over (tests, and anything that only has words).</summary>
         public void NvdaLines(string[] lines)
         {
-            if (lines.Length == 0) return;
-            byte[] m = Protocol.TextMessage(Protocol.NvdaSpeech, string.Join("\n", lines));
-            foreach (var s in AllSessions()) if ((s.NvdaWant & Protocol.NvdaSpeechFlag) != 0) Queue(s, m);
+            foreach (string line in lines) if (line.Length > 0) NvdaEventNow(NvdaEvent.Speak(new NvdaSpeechPart(line.Length > NvdaEvent.MaxText ? line[..NvdaEvent.MaxText] : line)));
         }
 
         /// <summary>What this PC's braille display shows now.</summary>
-        public void NvdaBrailleNow(string text)
-        {
-            byte[] m = Protocol.TextMessage(Protocol.NvdaBraille, text);
-            foreach (var s in AllSessions()) if ((s.NvdaWant & Protocol.NvdaBrailleFlag) != 0) Queue(s, m);
-        }
-
-        /// <summary>Why NVDA's text cannot come (null: it can again). Said to every PC that wants it, when it changes.</summary>
-        public void NvdaProblemNow(string? why)
-        {
-            string? was;
-            lock (_nvdaGate) { was = _nvdaProblem; _nvdaProblem = why; }
-            if (was == why) return;
-            string say = why ?? "The remote PC's NVDA speech is coming through now.";
-            foreach (var s in AllSessions()) if (s.NvdaWant != 0) Queue(s, Protocol.TextMessage(Protocol.NvdaNote, say));
-        }
+        public void NvdaBrailleNow(string text) => NvdaEventNow(NvdaEvent.Braille(text.Length > NvdaEvent.MaxText ? text[..NvdaEvent.MaxText] : text));
 
         /// <summary>Into the PC's own NVDA queue, sent by one pool thread at a time; a PC far behind loses its oldest lines.</summary>
         private static void Queue(Session s, byte[] m)
@@ -356,7 +384,7 @@ namespace TailRemote
             _wifi?.Dispose();
             _screenSource?.Dispose();
             _mic.Dispose();
-            lock (_nvdaGate) { _nvda?.Dispose(); _nvda = null; }
+            lock (_nvdaGate) { _helper?.Dispose(); _helper = null; }
             try { _listener.Stop(); } catch { }
             try { _udp.Dispose(); } catch { }
             LoopbackCapture? c;
@@ -373,6 +401,8 @@ namespace TailRemote
             }
             // Stopping the capture waits for its thread (up to 2 seconds): never on the caller's (window's) thread.
             if (c != null) ThreadPool.QueueUserWorkItem(_ => c.Dispose());
+            _relay?.Dispose();
+            if (_ownIdentity) Identity.Dispose();
         }
 
         /// <summary>
@@ -508,6 +538,58 @@ namespace TailRemote
             return any;
         }
 
+        /// <summary>
+        /// The block a device ticket's wrong passwords are counted against: one of its own, made from the ticket's
+        /// random half (fd6b: a private range no real controlling PC comes from), so a ticket shared by nobody else
+        /// gets its own five guesses a minute, and a stolen one buys no more than that.
+        /// </summary>
+        private static IPAddress TicketBlock(ReadOnlySpan<byte> id)
+        {
+            byte[] b = new byte[16];
+            b[0] = 0xfd; b[1] = 0x6b;
+            id[..6].CopyTo(b.AsSpan(2));
+            return new IPAddress(b);
+        }
+
+        // Wrong passwords that came with a valid ticket, in the last day (a stolen ticket gets five a minute of its own,
+        // but all tickets together get no more than this a day before they stop counting). Under _guesses.
+        private readonly Queue<long> _ticketFails = new();
+        private const int TicketFailsPerDay = 200;
+
+        private void TicketFailed()
+        {
+            long now = Environment.TickCount64;
+            lock (_guesses) { _ticketFails.Enqueue(now); while (_ticketFails.Count > TicketFailsPerDay + 1) _ticketFails.Dequeue(); }
+        }
+
+        private bool TicketsTrusted()
+        {
+            long now = Environment.TickCount64;
+            lock (_guesses)
+            {
+                while (_ticketFails.Count > 0 && now - _ticketFails.Peek() >= 86_400_000) _ticketFails.Dequeue();
+                return _ticketFails.Count < TicketFailsPerDay;
+            }
+        }
+
+        private byte[] TicketMessage()
+        {
+            byte[] t = Identity.NewTicket();
+            byte[] m = new byte[1 + t.Length];
+            m[0] = Protocol.DeviceTicket;
+            t.CopyTo(m, 1);
+            return m;
+        }
+
+        /// <summary>Who an address is, in words for the status line: a ticket's block or a relayed PC is not shown as a made-up address.</summary>
+        internal string Who(IPAddress a)
+        {
+            byte[] b = a.GetAddressBytes();
+            if (b.Length == 16 && b[0] == 0xfd && b[1] == 0x6b) return "a PC that connected here before";
+            if (RelayHost.RealAddress(a) is string real) return real + " (through the relay)";
+            return a.ToString();
+        }
+
         /// <summary>This address block has logged in before: it keeps reserved handshake slots during a flood.</summary>
         private void MarkKnown(IPAddress a)
         {
@@ -557,8 +639,11 @@ namespace TailRemote
         // (a botnet, or many IPv6 blocks): past this many wrong passwords in a minute from blocks
         // that have never logged in, every such block is turned away at once until the minute is up.
         // PCs that have logged in before carry on as normal.
-        private const int StrangerFailsPerMinute = 30;
-        private readonly Queue<long> _strangerFails = new(); // when each recent one came; under _guesses
+        // 4.4: and past 200 in an hour, or 1,000 in a day, until that hour or day is over. 30 a minute alone still let
+        // a patient guesser try about 43,000 passwords a day. PCs that logged in before (address block or device
+        // ticket) are never held up by this, so turning strangers away for a day costs a real user nothing.
+        private const int StrangerFailsPerMinute = 30, StrangerFailsPerHour = 200, StrangerFailsPerDay = 1000;
+        private readonly Queue<long> _strangerFails = new(); // when each recent one came (a day's worth at most); under _guesses
 
         // Each refusal waits out WrongPasswordDelayMs on its own thread, after giving its login slot
         // back, so nothing else bounds how many are waiting. Past this many, a new login from a block
@@ -570,8 +655,15 @@ namespace TailRemote
         /// <summary>Call under _guesses.</summary>
         private bool StrangersLocked(long now)
         {
-            while (_strangerFails.Count > 0 && now - _strangerFails.Peek() >= 60_000) _strangerFails.Dequeue();
-            return _strangerFails.Count >= StrangerFailsPerMinute;
+            while (_strangerFails.Count > 0 && now - _strangerFails.Peek() >= 86_400_000) _strangerFails.Dequeue();
+            if (_strangerFails.Count >= StrangerFailsPerDay) return true;
+            int hour = 0, minute = 0;
+            foreach (long at in _strangerFails)
+            {
+                if (now - at < 3_600_000) hour++;
+                if (now - at < 60_000) minute++;
+            }
+            return minute >= StrangerFailsPerMinute || hour >= StrangerFailsPerHour;
         }
 
         private bool Known(IPAddress a)
@@ -647,10 +739,10 @@ namespace TailRemote
                     bool wasLocked = StrangersLocked(now);
                     _strangerFails.Enqueue(now);
                     if (!wasLocked && StrangersLocked(now))
-                        return "Too many wrong passwords from many places: PCs that have not connected before are turned away for a minute.";
+                        return "Too many wrong passwords from many places: PCs that have not connected here before are turned away for a while. PCs that have connected before still get in.";
                 }
-                return g.Fails == 1 ? "Refused " + a + ": wrong password."
-                     : g.Fails == 5 ? "Refused " + a + " for a minute: too many wrong passwords."
+                return g.Fails == 1 ? "Refused " + Who(a) + ": wrong password."
+                     : g.Fails == 5 ? "Refused " + Who(a) + " for a minute: too many wrong passwords."
                      : null;
             }
         }
@@ -834,23 +926,30 @@ namespace TailRemote
                 catch { if (_stop) return; Thread.Sleep(20); continue; }
                 var ra = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
                 if (ra.IsIPv4MappedToIPv6) ra = ra.MapToIPv4();
-                if (Blocked(ra)) { try { tcp.Dispose(); } catch { } continue; } // a guessing address is turned away before any work
+                // A guessing address is no longer turned away here, before a word is read: its file and screen lanes
+                // (proven with the session key) and PCs holding a device ticket must still get in. Serve refuses its
+                // logins once it has read the answer; the handshake caps (BeginHandshake) still bound what it can hold.
                 // Out of threads or memory under a flood: drop this one, never the whole host.
                 try { new Thread(() => Serve(tcp)) { IsBackground = true, Name = "Kova session" }.Start(); }
                 catch { try { tcp.Dispose(); } catch { } }
             }
         }
 
-        private void Serve(TcpClient tcp)
+        /// <summary>
+        /// One connection, from its hello to the end of its session. relayedAs: a connection that came through
+        /// a Kova Relay (RelayHost), with the address it stands for (RelayHost.Stand): every limit and
+        /// match by address then works on the controlling PC's own address, not the relay's.
+        /// </summary>
+        internal void Serve(TcpClient tcp, IPAddress? relayedAs = null)
         {
-            var remote = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
+            var remote = relayedAs ?? ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
             if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
             Session? s = null;
             bool handedOff = false, counted = false;
             try
             {
-                // Refused at once, holding nothing: too many logins under way, or this address keeps guessing.
-                if (Blocked(remote) || !BeginHandshake(remote, tcp)) { tcp.Dispose(); return; }
+                // Refused at once, holding nothing: too many logins under way from here, or in all.
+                if (!BeginHandshake(remote, tcp)) { tcp.Dispose(); return; }
                 counted = true;
                 // The deadline is kept by the reads themselves (ReadBefore): a timer on the thread pool fired
                 // late whenever the pool was busy, and a login trickled in a byte at a time stayed open 26 s.
@@ -861,12 +960,8 @@ namespace TailRemote
 
                 byte[] nonce = RandomNumberGenerator.GetBytes(16);
                 using var exchange = Protocol.NewExchange();
-                byte[] hello = new byte[Protocol.HelloBytes];
-                Protocol.Magic.CopyTo(hello, 0);
-                nonce.CopyTo(hello, 4);
-                _salt.CopyTo(hello, Protocol.HelloSaltAt);
-                Protocol.WritePublic(exchange, hello.AsSpan(Protocol.HelloPublicAt, Protocol.PublicKeyBytes));
-                Protocol.AddCheck(hello);
+                // Signed with this host's lasting identity: the controlling PC checks it is the PC it knows before it proves anything.
+                byte[] hello = Protocol.MakeHello(nonce, _salt, exchange, Identity);
                 stream.Write(hello);
 
                 byte[] answer = new byte[Protocol.AnswerBytes];
@@ -953,7 +1048,6 @@ namespace TailRemote
                     handedOff = true;
                     return;
                 }
-                if (Volatile.Read(ref _refusing) >= MaxRefusing && !Known(remote)) { tcp.Dispose(); return; } // see MaxRefusing
                 byte[] clientNonce = answer[4..20];
                 byte role = 0;
                 byte[]? key = null;
@@ -963,7 +1057,35 @@ namespace TailRemote
                     ? Protocol.SharedSecret(exchange, answer.AsSpan(Protocol.AnswerPublicAt, Protocol.PublicKeyBytes))
                     : null;
                 exchange.Dispose(); // this login's private key is done with: nothing can recreate the secret now
-                if (shared != null && !StartGuess(remote)) { CryptographicOperations.ZeroMemory(shared); tcp.Dispose(); return; }
+                // A PC that logged in before shows the ticket it was given: it gets in while strangers are being turned
+                // away, and its wrong passwords are counted against its ticket, not its (perhaps shared) address. The
+                // ticket travels masked with this login's own secret (Protocol.TicketPad), so nobody watching the line,
+                // and no relay, can read it and use it. Past a day's budget of wrong passwords that came with tickets,
+                // tickets stop counting for anything until the day is over.
+                byte[] ticket = answer[Protocol.AnswerTicketAt..(Protocol.AnswerTicketAt + HostIdentity.TicketBytes)];
+                bool ticketed = false;
+                if (shared != null)
+                {
+                    byte[] pad = Protocol.TicketPad(shared, nonce, clientNonce);
+                    for (int i = 0; i < ticket.Length; i++) ticket[i] ^= pad[i];
+                    ticketed = Identity.TicketOk(ticket) && TicketsTrusted();
+                }
+                IPAddress guessFrom = ticketed ? TicketBlock(ticket.AsSpan(0, 16)) : remote;
+                if (ticketed) MarkKnown(guessFrom);
+                // This address (or ticket) keeps guessing, or strangers are being turned away: said so (no password is
+                // checked, so this tells a guesser nothing), so the controlling PC stops trying instead of trying again.
+                if (Blocked(guessFrom) || (Volatile.Read(ref _refusing) >= MaxRefusing && !Known(guessFrom)))
+                {
+                    if (shared != null) CryptographicOperations.ZeroMemory(shared);
+                    EndHandshake(remote, tcp); counted = false;
+                    byte[] away = new byte[Protocol.ReplyBytes];
+                    away[0] = Protocol.ReplyTurnedAway;
+                    Protocol.AddCheck(away);
+                    try { stream.Write(away); } catch { }
+                    tcp.Dispose();
+                    return;
+                }
+                if (shared != null && !StartGuess(guessFrom)) { CryptographicOperations.ZeroMemory(shared); tcp.Dispose(); return; }
                 bool guessing = shared != null;
                 try
                 {
@@ -980,11 +1102,12 @@ namespace TailRemote
                     { role = Protocol.RoleListen; key = listen; }
                 }
                 }
-                finally { if (guessing) EndGuess(remote); } // never left counted: five leaks would lock that address out until hosting restarts
+                finally { if (guessing) EndGuess(guessFrom); } // never left counted: five leaks would lock that address out until hosting restarts
                 if (key == null)
                 {
                     EndHandshake(remote, tcp); counted = false; // give the slot back before the slow part, so guesses cannot hold slots
-                    string? note = WrongPassword(remote);
+                    if (ticketed) TicketFailed();
+                    string? note = WrongPassword(guessFrom);
                     if (note != null) _status(note);
                     Interlocked.Increment(ref _refusing);
                     try
@@ -1021,6 +1144,8 @@ namespace TailRemote
                 s.Link.Send(s.Stream, Protocol.FeaturesMessage(SecureAttention != null ? Protocol.FeatureSecureAttention : 0));
                 // How to wake this PC later (its network cards), and anything about it already worth knowing.
                 if (role == Protocol.RoleControl && Wake.Describe() is { Length: > 0 } cards) Send(s, Protocol.WakeInfo, cards);
+                // A fresh ticket for next time (kept by the controlling PC with this host's identity).
+                if (role == Protocol.RoleControl) s.Link.Send(s.Stream, TicketMessage());
                 if (role == Protocol.RoleControl && Volatile.Read(ref _lastHealth) is HealthSample health)
                     foreach (string line in HealthWatch.Standing(health)) Send(s, Protocol.HealthAlert, line);
                 EndHandshake(remote, tcp);
@@ -1554,6 +1679,7 @@ namespace TailRemote
                         {
                             byte[] id = m[1..5];
                             string path = System.Text.Encoding.UTF8.GetString(m, 5, m.Length - 5);
+                            if (FilesRefusal(path) is string no) { SendListing(s, id, "E\t" + no + "\n"); break; }
                             // One listing at a time per PC: a flood of them (each waits up to a second and a
                             // half on the drives) tied up the host's pool threads, and every other PC's
                             // clipboard and Get files waited minutes behind it. Asked again while one is being
@@ -1578,7 +1704,10 @@ namespace TailRemote
                             string[] paths = System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1).Split('\n', StringSplitOptions.RemoveEmptyEntries);
                             FileChannel? files;
                             lock (_gate) files = s.Files;
-                            if (files == null) Protocol.SendMessage(s.Link, s.Stream, "The file connection is not open yet. Try again in a moment.");
+                            string? refused = null;
+                            foreach (string one in paths) if ((refused = FilesRefusal(one)) != null) break;
+                            if (files != null && refused != null) { var f2 = files; string why = refused; ThreadPool.QueueUserWorkItem(_ => { try { f2.Refuse(paths, why); } catch { } }); }
+                            else if (files == null) Protocol.SendMessage(s.Link, s.Stream, "The file connection is not open yet. Try again in a moment.");
                             else if (paths.Length > 0)
                             {
                                 // A thread of its own, not the pool's (a batch holds it until it has been sent), and a
@@ -1639,6 +1768,16 @@ namespace TailRemote
                         });
                         break;
                     case Protocol.SpeedTestRequest when IsController(s):
+                        // A minute apart at most (4.4): each test moves up to 1.5 GB, and back-to-back tests could run
+                        // up a metered line's bill.
+                        {
+                            long nowTest = Environment.TickCount64, lastTest = Interlocked.Read(ref _lastSpeedTest);
+                            if (nowTest - lastTest < 60_000 || Interlocked.CompareExchange(ref _lastSpeedTest, nowTest, lastTest) != lastTest)
+                            {
+                                try { s.Link.Send(s.Stream, Protocol.TextMessage(Protocol.SpeedResult, "The remote PC ran a speed test less than a minute ago. Try again in a minute.")); } catch { }
+                                break;
+                            }
+                        }
                         _ = System.Threading.Tasks.Task.Run(async () =>
                         {
                             _status("Running an internet speed test, as the controlling PC asked.");
@@ -1653,7 +1792,8 @@ namespace TailRemote
                         try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Native.SystemTool("shutdown.exe"), "/r /t 0") { CreateNoWindow = true, UseShellExecute = false }); }
                         catch (Exception e) { Broadcast("The remote PC could not restart: " + e.Message); }
                         break;
-                    case Protocol.ClipboardRequest when IsController(s):
+                    case Protocol.ClipboardRequest when IsController(s) && !ScreenLocked():
+                        // Not while this PC is locked (4.4): the Kova password must not be a way round the Windows one.
                         // Only a controller may pull the clipboard; a listener never reaches here.
                         // Coalesce a flood of rapid pulls (a mashed or held Ctrl+Shift+B, or an old
                         // controller with no throttle): each pull reads the clipboard and fans a
@@ -1682,18 +1822,35 @@ namespace TailRemote
                     case Protocol.FilePace when m.Length == 5:
                         Volatile.Write(ref s.Pace, Math.Max(16 << 10, BitConverter.ToUInt32(m, 1) * 1024.0));
                         break;
-                    case Protocol.NvdaWant when m.Length == 2:
+                    case Protocol.NvdaWant when m.Length == 2 && s.Role == Protocol.RoleControl: // never a listener (4.4)
                         {
                             byte want = (byte)(m[1] & (Protocol.NvdaSpeechFlag | Protocol.NvdaBrailleFlag));
                             byte was = s.NvdaWant;
                             s.NvdaWant = want;
-                            NvdaWantsChanged();
-                            string? problem;
-                            lock (_nvdaGate) problem = _nvdaProblem;
-                            // Asked for it just now: told at once if it cannot come (a missing viewer is found out by the reader).
-                            if (was == 0 && want != 0 && problem != null) Queue(s, Protocol.TextMessage(Protocol.NvdaNote, problem));
+                            // Asked for it just now: told at once whether the Kova Helper is here to send it.
+                            if (was == 0 && want != 0) TellNvdaAvailable(s);
                             break;
                         }
+                    case Protocol.NvdaHelperInstall when m.Length == 1 && IsController(s):
+                        // The controlling PC chose File, Install the Kova Helper on the remote PC: installed (or updated) into the
+                        // NVDA of whoever is at this PC's screen, then that NVDA restarts. One at a time; the answer is said there.
+                        if (Interlocked.CompareExchange(ref _helperInstalling, 1, 0) == 0)
+                            ThreadPool.QueueUserWorkItem(_ =>
+                            {
+                                string said;
+                                try
+                                {
+                                    var st = NvdaHelper.GetState(_helper);
+                                    said = st.ConfigDir == null ? "The remote PC could not install the Kova Helper: " + st.Problem
+                                        : st.IsInstalled && !st.UpdateAvailable ? "The remote PC already has the Kova Helper NVDA add-on" + (NvdaHelperConnected ? ", and it is working." : ". It starts working when NVDA there restarts.")
+                                        : "The remote PC: " + NvdaHelper.Apply(st.IsInstalled ? NvdaHelperAction.Update : NvdaHelperAction.Install, remote: true, log: m2 => DiagLog.Write("host: " + m2));
+                                }
+                                catch (Exception e) { said = "The remote PC could not install the Kova Helper: " + e.Message; }
+                                finally { Volatile.Write(ref _helperInstalling, 0); }
+                                Queue(s, Protocol.TextMessage(Protocol.NvdaNote, said));
+                            });
+                        else Queue(s, Protocol.TextMessage(Protocol.NvdaNote, "The remote PC is already installing the Kova Helper."));
+                        break;
                     case Protocol.MicState when m.Length == 2:
                         if (m[1] == 0) MicOff(s);
                         break;
@@ -1719,6 +1876,39 @@ namespace TailRemote
                     (id, path) = s.ListQueue.Dequeue();
                 }
             }
+        }
+
+        private long _lastSpeedTest = long.MinValue / 2;
+
+        /// <summary>
+        /// Whether the screen of the session whose files and clipboard a controlling PC would reach is locked:
+        /// the console's for the service (which acts as whoever is signed in there), this process's own for a
+        /// window. While it is, Get files and the clipboard pull are refused (4.4): before, someone with only the
+        /// Kova password could read the signed-in user's files at the lock screen.
+        /// </summary>
+        /// <summary>Tests only: true or false stands in for whether the screen is locked (this VPS's console usually is); null asks Windows.</summary>
+        internal static bool? TestLocked;
+
+        private bool ScreenLocked()
+        {
+            if (TestLocked is bool test) return test;
+            try
+            {
+                uint session = FileUser != null ? NativeService.WTSGetActiveConsoleSessionId() : (uint)System.Diagnostics.Process.GetCurrentProcess().SessionId;
+                return NativeService.SessionLocked(session);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Why Get files may not read this path now, or null if it may.</summary>
+        private string? FilesRefusal(string path)
+        {
+            if (ScreenLocked()) return "The remote PC is locked. Sign in there first, then try again.";
+            // Only this PC's own drives (C:\ and so on). A network path (\\server\share) made Windows sign in to
+            // that server as the user, handing a stranger's server the user's password hash; device paths (\\?\, \\.\)
+            // reached past what Get files is for.
+            if (path.Length > 0 && !FileChannel.RemotePathOk(path)) return "Get files only reads this PC's own drives, not network or device paths.";
+            return null;
         }
 
         private void ListOne(Session s, byte[] id, string path)
@@ -1860,7 +2050,7 @@ namespace TailRemote
             ReleaseHeld(s);
             MicOff(s);
             // Worked out again once it has left the list of sessions (End is called under _gate, before Rebuild).
-            if (s.NvdaWant != 0) { s.NvdaWant = 0; ThreadPool.QueueUserWorkItem(_ => NvdaWantsChanged()); }
+            s.NvdaWant = 0;
             if (s.Files is FileChannel f)
             {
                 // Kept for the controller's next connection (a dropped one comes straight back),
@@ -1954,7 +2144,7 @@ namespace TailRemote
                 try
                 {
                     s.Link.SealAudio(a, payload);
-                    _udp.Send(a, 5 + payload + SecureLink.TagSize, to);
+                    UdpSend(a, 5 + payload + SecureLink.TagSize, to);
                     Interlocked.Increment(ref _txPackets);
                     Interlocked.Add(ref _txBytes, 5 + payload + SecureLink.TagSize);
                 }
@@ -1970,6 +2160,8 @@ namespace TailRemote
                 byte[] d;
                 try { d = _udp.Receive(ref any); }
                 catch { if (_stop) return; Thread.Sleep(20); continue; }
+                // From the relay: its header off, and the sender becomes the relayed PC's stand-in address.
+                if (_relay is RelayHost via && !via.Unwrap(ref d, ref any)) continue;
                 if (d.Length >= Protocol.MinMicPacketBytes && d[0] == Protocol.UdpMic)
                 {
                     if (d.Length <= Protocol.MicHeadBytes + 1 + Protocol.MaxOpusBytes + SecureLink.TagSize)
@@ -1999,7 +2191,7 @@ namespace TailRemote
                 pong[0] = Protocol.UdpPong;
                 d.AsSpan(9, 8).CopyTo(pong.AsSpan(1));
                 s.Link.SignHello(pong);
-                try { _udp.Send(pong, pong.Length, s.AudioTo); } catch { }
+                try { UdpSend(pong, pong.Length, s.AudioTo); } catch { }
             }
         }
     }

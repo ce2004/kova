@@ -29,14 +29,24 @@ namespace TailRemote
     {
         public const string DeviceName = "Kova";
 
-        // Newest first; a missing pack answers 404 at once and the next is tried.
-        private static readonly string[] PackUrls =
+        // Newest first; a missing pack answers 404 at once and the next is tried. Each with the SHA-256 of the
+        // exact zip Kova was checked with (downloaded 2026-10-25): the signed installer runs from the folder the zip
+        // is unpacked into, next to every other file in it, so a changed zip (vb-audio.com broken into, say) could
+        // put a DLL there for the genuine installer to load. Only checking the installer's signature missed that.
+        // A zip that does not match is not unpacked, and the next pack is tried; a new pack needs a Kova update.
+        private static readonly (string Url, string Sha256)[] Packs =
         {
-            "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack47.zip",
-            "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip",
-            "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
-            "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip",
+            ("https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip", "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"),
+            ("https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip", "66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd"),
         };
+
+        /// <summary>Is this the exact zip Kova knows for that pack?</summary>
+        internal static bool KnownPack(string url, byte[] zip)
+        {
+            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(zip));
+            foreach (var p in Packs) if (p.Url == url && string.Equals(p.Sha256, hash, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
 
         private static readonly Guid PkeyDevice = new("a45c254e-df1c-4efd-8020-67d146a850e0");    // pid 2: the endpoint's own name
         private static readonly Guid PkeyInterface = new("026e516e-b814-414b-83cd-856d6fef4822"); // pid 2: the driver's name
@@ -251,7 +261,8 @@ namespace TailRemote
                 report("Downloading VB-Cable from vb-audio.com.", retrying ? SetupForm.ShowOnly : 0);
                 try
                 {
-                    foreach (string url in PackUrls)
+                    bool changed = false; // a pack was there, but not the zip Kova knows
+                    foreach (var (url, _) in Packs)
                     {
                         using var resp = await h.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
                         if (resp.StatusCode == HttpStatusCode.NotFound) continue;
@@ -278,8 +289,12 @@ namespace TailRemote
                         }
                         // A connection that closed early looks like the end: never hand on half a download.
                         if (total > 0 && ms.Length != total) throw new IOException("The download from vb-audio.com was cut short.");
-                        return ms.ToArray();
+                        byte[] zip = ms.ToArray();
+                        if (KnownPack(url, zip)) return zip;
+                        changed = true; // never unpacked or run: the next pack is tried
                     }
+                    if (changed)
+                        throw new InvalidOperationException("The VB-Cable download from vb-audio.com is not the one this Kova knows, so it was not opened or run. VB-Audio may have updated it; check for a Kova update and try again.");
                     throw new InvalidOperationException("vb-audio.com no longer has the VB-Cable download where Kova expects it. Check for a Kova update.");
                 }
                 catch (Exception e) when (e is HttpRequestException || e is IOException || (e is TaskCanceledException && !ct.IsCancellationRequested))

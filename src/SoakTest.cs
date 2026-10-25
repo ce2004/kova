@@ -30,6 +30,7 @@ namespace TailRemote
         public static int Run(int minutes)
         {
             Host.WrongPasswordDelayMs = 0;
+            Host.TestLocked = false; // Get files as if signed in: this VPS's console is usually locked
             Names.TestPipes = "Soak";
             if (Directory.Exists(Root)) Directory.Delete(Root, true);
             Directory.CreateDirectory(Root);
@@ -116,6 +117,7 @@ namespace TailRemote
                     if (!Wait(() => ctrl.Files != null && host.ControllerFiles != null, 10_000)) return "the file connection never opened";
                     ctrl.Files!.SendFiles(new[] { up });
                     if (!Wait(() => atHost != null, 20_000)) return "a file sent to the host never arrived";
+                    ctrl.Files!.ExpectClipboard(); // 4.4: the controller takes the host's clipboard files only when it asked
                     host.ControllerFiles!.SendFiles(new[] { down });
                     if (!Wait(() => atClient != null, 20_000)) return "a file sent from the host never arrived";
                 }

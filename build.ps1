@@ -49,6 +49,13 @@ foreach ($a in $Arch) {
     }
     else { "$a built and installed: $exe" }
 
+    # Kova Relay (relay\, 4.4): its own small exe beside Kova's. Not swapped in place: stop a running relay first.
+    $relayPub = "relay\obj\publish\$a"
+    & $dotnet publish relay\KovaRelay.csproj -c Release -r "win-$a" -o $relayPub "-p:BaseOutputPath=relay\obj\pubout\$a\" --nologo -v:q @quick
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    Copy-Item "$relayPub\KovaRelay.exe" (Join-Path $dest 'KovaRelay.exe') -Force
+    "$a relay built: " + (Join-Path $dest 'KovaRelay.exe')
+
     # The replaced copy has exited by now: delete it, and the folders once empty.
     if (Test-Path $oldDir) {
         Get-ChildItem $oldDir -File | ForEach-Object { try { Remove-Item $_.FullName -Force } catch { } }

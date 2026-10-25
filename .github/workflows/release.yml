@@ -36,6 +36,10 @@ jobs:
             dotnet publish kova.csproj -c Release -r "win-$arch" -o "out/$arch" -p:Version=${{ steps.ver.outputs.version }}
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             Copy-Item "out/$arch/Kova.exe" "dist/Kova-$arch.exe"
+            # Kova Relay: its own small exe, the same version.
+            dotnet publish relay/KovaRelay.csproj -c Release -r "win-$arch" -o "out/relay-$arch" -p:Version=${{ steps.ver.outputs.version }} -p:BaseOutputPath=relay/obj/pubout/
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Copy-Item "out/relay-$arch/KovaRelay.exe" "dist/KovaRelay-$arch.exe"
           }
           Get-ChildItem dist
 
@@ -45,6 +49,39 @@ jobs:
           $p = Start-Process dist/Kova-x64.exe -ArgumentList '--selftest' -PassThru -Wait
           Get-Content "$env:TEMP/tailremote-selftest.txt"
           exit $p.ExitCode
+
+      - name: Security test (x64)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/Kova-x64.exe -ArgumentList '--securitytest' -PassThru -Wait
+          Get-Content "$env:TEMP/kova-securitytest.txt"
+          exit $p.ExitCode
+
+      - name: Relay self-test (x64)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/KovaRelay-x64.exe -ArgumentList '--selftest' -PassThru -Wait
+          Get-Content "$env:TEMP/kova-relay-selftest.txt"
+          exit $p.ExitCode
+
+      # The signed list of files (Updater.SigningKeys): every file's SHA-256 and the version, signed with the
+      # private key kept in the KOVA_SIGNING_KEY secret. Kova 4.4 and later install only releases that carry it.
+      - name: Signed list of files
+        shell: pwsh
+        env:
+          KOVA_SIGNING_KEY: ${{ secrets.KOVA_SIGNING_KEY }}
+        run: |
+          $files = [ordered]@{}
+          foreach ($f in Get-ChildItem dist -Filter *.exe | Sort-Object Name) { $files[$f.Name] = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          $json = [ordered]@{ version = '${{ steps.ver.outputs.version }}'; files = $files } | ConvertTo-Json -Compress
+          [IO.File]::WriteAllText("dist/kova-release.json", $json, (New-Object Text.UTF8Encoding($false)))
+          if ([string]::IsNullOrEmpty($env:KOVA_SIGNING_KEY)) { "No signing key in this repository's secrets: the list is left unsigned, to be signed by hand before the release is published."; exit 0 }
+          $ec = [Security.Cryptography.ECDsa]::Create()
+          $read = 0
+          $ec.ImportPkcs8PrivateKey([Convert]::FromBase64String($env:KOVA_SIGNING_KEY), [ref]$read)
+          $sig = $ec.SignData([IO.File]::ReadAllBytes("dist/kova-release.json"), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+          [IO.File]::WriteAllText("dist/kova-release.json.sig", [Convert]::ToBase64String($sig))
+          Get-Content dist/kova-release.json
 
       # This version's lines from CHANGES.txt: plain text, one change per line.
       - name: Release notes
@@ -58,9 +95,14 @@ jobs:
           [ -s notes.txt ] || { echo "CHANGES.txt has no section for this version"; exit 1; }
           cat notes.txt
 
+      # Without a signature the release is made as a draft: nobody is offered an update that Kova would refuse anyway,
+      # until the list is signed by hand (see CLAUDE.md) and the draft is published.
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create '${{ github.ref_name }}' dist/Kova-arm64.exe dist/Kova-x64.exe --title "Kova ${{ steps.ver.outputs.version }}" --notes-file notes.txt
+        run: |
+          $assets = @(Get-ChildItem dist | ForEach-Object { $_.FullName })
+          $draft = if (Test-Path dist/kova-release.json.sig) { @() } else { @('--draft') }
+          gh release create '${{ github.ref_name }}' @assets --title "Kova ${{ steps.ver.outputs.version }}" --notes-file notes.txt @draft

@@ -41,7 +41,7 @@ namespace TailRemote
     internal static class Protocol
     {
         public const int DefaultPort = 47120;
-        public static readonly byte[] Magic = "TRM9"u8.ToArray(); // 9: file lanes prove the session key, signed audio pongs (2.3.0); 8 added the key exchange
+        public static readonly byte[] Magic = "TRMA"u8.ToArray(); // A (4.4): the host signs its hello with its lasting identity, the answer carries a device ticket; 9: file lanes prove the session key (2.3.0)
         /// <summary>A file lane (FileChannel): "TRFA", session token (8), channel id (16), the lane's fresh random value (16), LaneProof (32), padded, then the check.</summary>
         public static readonly byte[] FileMagic = "TRFA"u8.ToArray();
         public const int LaneProofAt = 44;
@@ -86,6 +86,7 @@ namespace TailRemote
         public const byte MouseMove = 0, MouseWheel = 1, MouseSideWheel = 2;
         public const byte WakeRequest = 16; // 6-byte network card address: send a Wake-on-LAN packet on the host's network (Wake)
         public const byte NvdaWant = 17;  // u8 flags (NvdaSpeechFlag, NvdaBrailleFlag): what of the host's NVDA this PC wants as text; 0 = nothing
+        public const byte NvdaHelperInstall = 19; // the controller asks the host to install (or update) the Kova Helper NVDA add-on there; the answer is an NvdaNote
         public const byte MicState = 18;  // u8 1 = this PC's microphone is on (its packets follow over UDP), 0 = off: the host lets go of the device at once
         public const byte NvdaSpeechFlag = 1, NvdaBrailleFlag = 2;
         public const byte ClipboardRequest = 13; // the controller asks the host to send its clipboard here (text or files), like Send the clipboard but pulled
@@ -107,9 +108,11 @@ namespace TailRemote
         public const byte HealthAlert = 0x89; // UTF-8 sentence: something about the host PC worth saying (HealthWatch)
         public const byte MicNote = 0x8A;     // UTF-8 sentence about this PC's microphone on the host (where it plays, or why it cannot)
         public const byte MicQuality = 0x8B;  // u8: the bitrate step the host wants the microphone sent at (it follows how the microphone arrives)
-        public const byte NvdaSpeech = 0x8C;  // UTF-8 lines the host's NVDA spoke, one per line (NvdaViewers)
-        public const byte NvdaBraille = 0x8D; // UTF-8: what the host's braille display shows now
-        public const byte NvdaNote = 0x8E;    // UTF-8 sentence: why the host's NVDA text cannot come (no Speech Viewer, not allowed to hide it)
+        // 0x8C and 0x8D were NVDA's Speech Viewer text and braille (4.3): never reuse them.
+        public const byte NvdaNote = 0x8E;    // UTF-8 sentence about the host's NVDA text (installing the Kova Helper there, and how it went)
+        public const byte NvdaEventMsg = 0x90; // one thing the host's NVDA did (NvdaEvent.Encode: speech with pitch and capitals, a cut-off, a beep, a sound, braille), from the Kova Helper add-on
+        public const byte NvdaAvailable = 0x91; // u8 1 = the Kova Helper add-on is talking to the host, so NVDA comes as text; 0 = it is not (only the sound carries NVDA)
+        public const byte DeviceTicket = 0x8F; // 32 bytes (HostIdentity.NewTicket): shown in later logins, it lets this PC in while strangers are being turned away
         public const byte Leaving = 0x83; // u8 why (Leaving*), then UTF-8 detail (the new version when updating): sent just before the host closes on purpose
         // 0x84 was CaptureBurst (1.7.x): no longer sent, never reuse it
 
@@ -182,9 +185,55 @@ namespace TailRemote
         // wrong password, and the client simply tries again.
         public const int SaltBytes = 16, PublicKeyBytes = 65; // P-256, uncompressed: 4, X, Y
         public const int HelloSaltAt = 20, HelloPublicAt = 36;
-        public const int HelloBytes = HelloPublicAt + PublicKeyBytes + 4;    // magic 4, host nonce 16, salt 16, public key 65, check 4
-        public const int AnswerPublicAt = 20, AnswerProofAt = AnswerPublicAt + PublicKeyBytes;
-        public const int AnswerBytes = AnswerProofAt + 32 + 4; // magic 4, client nonce 16, public key 65, proof 32, check 4 (file lanes: magic, token 8, channel 16, lane value 16, zeros)
+        public const int HelloIdentityAt = HelloPublicAt + PublicKeyBytes, HelloSignatureAt = HelloIdentityAt + HostIdentity.PublicBytes;
+        // magic 4, host nonce 16, salt 16, key exchange public key 65, the host's lasting identity key 65, its signature of all that 64, check 4
+        public const int HelloBytes = HelloSignatureAt + HostIdentity.SignatureBytes + 4;
+        public const int AnswerPublicAt = 20, AnswerTicketAt = AnswerPublicAt + PublicKeyBytes, AnswerProofAt = AnswerTicketAt + HostIdentity.TicketBytes;
+        // magic 4, client nonce 16, public key 65, device ticket 32 (zeros if none), proof 32, check 4 (file lanes: magic, token 8, channel 16, lane value 16, LaneProof 32, zeros)
+        public const int AnswerBytes = AnswerProofAt + 32 + 4;
+
+        /// <summary>The first byte of a reply that turns a login away before any password is checked: too many wrong passwords from there for now.</summary>
+        public const byte ReplyTurnedAway = 2;
+
+        /// <summary>
+        /// What the device ticket is masked with in the answer: from this login's own key exchange secret (which a relay or
+        /// anyone watching cannot work out, the host's key exchange key being signed), so the ticket never travels readable.
+        /// </summary>
+        public static byte[] TicketPad(byte[] shared, ReadOnlySpan<byte> hostNonce, ReadOnlySpan<byte> clientNonce)
+        {
+            byte[] salt = new byte[hostNonce.Length + clientNonce.Length];
+            hostNonce.CopyTo(salt);
+            clientNonce.CopyTo(salt.AsSpan(hostNonce.Length));
+            return HKDF.DeriveKey(HashAlgorithmName.SHA256, shared, HostIdentity.TicketBytes, salt, "Kova ticket A"u8.ToArray());
+        }
+
+        /// <summary>What the host's identity signs in every hello: everything before the signature, labelled.</summary>
+        public static byte[] HelloSigned(ReadOnlySpan<byte> hello)
+        {
+            byte[] label = "Kova host hello A"u8.ToArray();
+            byte[] all = new byte[label.Length + HelloSignatureAt];
+            label.CopyTo(all, 0);
+            hello[..HelloSignatureAt].CopyTo(all.AsSpan(label.Length));
+            return all;
+        }
+
+        /// <summary>Fills a hello: magic, nonce, salt, key exchange key, identity, signature, check.</summary>
+        public static byte[] MakeHello(byte[] nonce, byte[] salt, ECDiffieHellman exchange, HostIdentity identity)
+        {
+            byte[] hello = new byte[HelloBytes];
+            Magic.CopyTo(hello, 0);
+            nonce.CopyTo(hello, 4);
+            salt.CopyTo(hello, HelloSaltAt);
+            WritePublic(exchange, hello.AsSpan(HelloPublicAt, PublicKeyBytes));
+            identity.Public.CopyTo(hello, HelloIdentityAt);
+            identity.Sign(HelloSigned(hello)).CopyTo(hello, HelloSignatureAt);
+            AddCheck(hello);
+            return hello;
+        }
+
+        /// <summary>Whether a hello carries a valid signature by the identity in it (checked before anything is proven to it).</summary>
+        public static bool HelloSignedOk(byte[] hello) =>
+            hello.Length == HelloBytes && HostIdentity.Verify(hello.AsSpan(HelloIdentityAt, HostIdentity.PublicBytes), HelloSigned(hello), hello.AsSpan(HelloSignatureAt, HostIdentity.SignatureBytes));
         public const int ReplyBytes = 46;  // ok 1, role 1, token 8, host proof 32, check 4 (a refusal is the same size)
 
         /// <summary>Fills the last 4 bytes with a check of everything before them.</summary>

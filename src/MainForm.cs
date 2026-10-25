@@ -12,7 +12,7 @@ namespace TailRemote
 
         // The window is blank: everything is in the menu bar (Alt), File, Clipboard and Settings.
         private readonly MenuChoice _mode = new("&Mode");
-        private readonly MenuText _address = new("&Address", "The other PC's Tailscale name, IP address or internet address:");
+        private readonly MenuText _address = new("&Address", "The other PC's Tailscale name, IP address or internet address. For a PC that hosts through a Kova Relay, its name on the relay, then @, then the relay's address, like office-pc@relay.example.com:");
         private readonly MenuText _port = new("&Port", "The port (the same on both PCs; 47120 unless you changed it):");
         private readonly MenuText _password = new("Pass&word", "The password (at least 6 characters, the same on both PCs):", secret: true);
         private readonly MenuChoice _device = new("&Output device");
@@ -24,6 +24,11 @@ namespace TailRemote
         private readonly MenuItem _savePc = new("Save t&his PC");
         private readonly MenuItem _forgetPc = new("&Forget the chosen saved PC") { WhyNot = "Choose a saved PC first, in Saved PCs." };
         private readonly MenuText _listenPassword = new("&Listen-only password", "A second password that lets someone hear this PC but not control it. Leave it empty for none:", secret: true);
+        // Host: also reachable through a Kova Relay (KovaRelay.exe), for when other PCs cannot reach this one directly.
+        private readonly MenuItem _relayHost = Menus.Check("Hos&t through a relay too, for PCs that cannot reach this one directly");
+        private readonly MenuText _relayAddress = new("Relay addr&ess", "The Kova Relay's address, with its port after a colon if it is not 47200, like relay.example.com or relay.example.com:47200:");
+        private readonly MenuText _relayName = new("Relay &name", "The name of this PC on the relay, like office-pc: 1 to 40 letters, digits, dashes, dots or underscores. Controlling PCs connect to it as name@relay:");
+
         private readonly MenuItem _sendClipboard = new("Send the clip&board") { ShortcutKeys = Keys.Control | Keys.B };
         private readonly MenuItem _sendFiles = new("Send f&iles") { ShortcutKeys = Keys.Control | Keys.I };
         private readonly MenuItem _sendFolder = new("Send a folder and everything in i&t") { ShortcutKeys = Keys.Control | Keys.T };
@@ -62,10 +67,19 @@ namespace TailRemote
         private readonly System.Collections.Generic.List<(string Id, string Name)> _micDevices = new(), _micOutputs = new();
         // The remote NVDA: heard through the remote PC's sound, said here as text (and brailled) with no remote sound, or both.
         private readonly MenuChoice _remoteNvda = new("Remote NVDA spea&king");
+        // The Kova Helper NVDA add-on (4.4): on this PC (what it says follows where it stands: install, update or remove),
+        // and on the remote PC from here.
+        private readonly MenuItem _helperHere = new(NvdaHelper.MenuText(new NvdaHelperState(null, null, NvdaHelper.CarriedVersion, false, false, null))) { WhyNot = "Already working on the Kova Helper." };
+        private readonly MenuItem _helperThere = new(NvdaHelper.RemoteMenuText) { WhyNot = "Connect to a PC first, with its control password." };
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
         private readonly MenuItem _getClipboard = new("Get the &remote PC's clipboard") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
+        // 4.4: text the remote PC sent without being asked never replaces this clipboard by itself; this puts it there.
+        private readonly MenuItem _takeSent = new("&Put the text the remote PC sent on this clipboard") { Enabled = false, WhyNot = "The remote PC has not sent any text that is waiting." };
+        private string? _sentText;
+        // Whether text and files the other PC sends without being asked are taken at all.
+        private readonly MenuItem _acceptUnasked = Menus.Check("Accept text and files the remote PC sends without bein&g asked");
         private readonly MenuItem _announceQuality = Menus.Check("A&nnounce when the sound quality changes");
-        private readonly MenuItem _muteLocal = Menus.Check("&Mute the remote PC while you are not controlling it (it stays connected)");
+        private readonly MenuItem _muteLocal = Menus.Check("&Mute Kova when not in focus (the remote PC's sound and NVDA speech; it stays connected)");
         private readonly MenuItem _rideOut = Menus.Check("Ride out &Wi-Fi scans: when the sound keeps stalling, hold enough to cover it (a little more delay until it stops)");
         private readonly MenuItem _switchTo = new("Switch &to PC");
         // Wake-on-LAN for saved PCs: sent from here and from every PC connected to, then it connects.
@@ -203,22 +217,23 @@ namespace TailRemote
             var file = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _streaming.Item, new ToolStripSeparator(),
+                _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 _mode.Menu, _saved.Menu, _address.Item, _port.Item, _password.Item, _listenPassword.Item, _copyAddress,
+                _relayHost, _relayAddress.Item, _relayName.Item,
                 _savePc, _forgetPc, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
             var clip = new MenuItem("&Clipboard");
             clip.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _transferStop, new ToolStripSeparator(), _pickReceiveFolder,
+                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _takeSent, _transferStop, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
             });
             var set = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
                 _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _remoteNvda.Menu, _micDevice.Menu, _micOutput.Menu, _speedUp, _sounds, new ToolStripSeparator(),
-                _startup, _service, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
+                _startup, _service, _portEditor, _audioSetup, _audioRemove, _helperHere, new ToolStripSeparator(),
                 _backup, _restore, _logging,
             });
             // Flow, not the usual single row: a row hides whatever does not fit, with no word to a
@@ -235,10 +250,15 @@ namespace TailRemote
             _password.Text = _settings.Password;
             _listenPassword.Text = _settings.ListenPassword;
             _logging.Checked = _settings.Logging;
+            _relayHost.Checked = _settings.RelayHosting;
+            _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
+            _relayName.Text = _settings.RelayName;
+            _acceptUnasked.Checked = _settings.AcceptUnasked;
+            Client.AcceptUnasked = _settings.AcceptUnasked;
             _speedUp.Checked = _settings.CatchUpBySpeed;
             _announceQuality.Checked = _settings.AnnounceQuality;
             _announceHealth.Checked = _settings.AnnounceHealth;
-            _muteLocal.Checked = _settings.MuteWhenNotControlling;
+            _muteLocal.Checked = _settings.MuteWhenNotFocused;
             _rideOut.Checked = _settings.RideOutStalls;
             ApplyReceiveFolder();
             Sounds.Key = Math.Clamp(_settings.SoundKey, 0, 11);
@@ -278,7 +298,15 @@ namespace TailRemote
                 if (_player != null) { _player.SetDevice(device); _playerDevice = device; }
             };
             _captureFrom.SelectedIndexChanged += (_, _) => CaptureChanged();
-            set.DropDownOpening += (_, _) => FillDevices();
+            set.DropDownOpening += (_, _) => { FillDevices(); _helperHere.Text = NvdaHelper.MenuText(NvdaHelper.GetState(_host?.NvdaHelperServer)); };
+            _helperHere.Click += (_, _) => Menus.AfterMenu(() => HelperHere());
+            _helperThere.Click += (_, _) => Menus.AfterMenu(() =>
+            {
+                if (_client is not Client c || c.ListenOnly) { Say("Connect to a PC first, with its control password."); return; }
+                if (!c.CanNvda) { Say("The remote PC's Kova is too old for the Kova Helper. Update it with File, Update the remote PC."); return; }
+                if (!NvdaHelperForm.AskRemote(this)) return;
+                Say(c.InstallNvdaHelperThere() ? "Asked the remote PC to install the Kova Helper. NVDA there restarts when it is in." : "The remote PC could not be asked.");
+            });
             _micItem.Click += (_, _) => ToggleMic();
             _micDevice.SelectedIndexChanged += (_, _) =>
             {
@@ -320,6 +348,11 @@ namespace TailRemote
             _go.Click += (_, _) => Menus.AfterMenu(() => Go());
             _address.Changed += SaveSettings;
             _port.Changed += PortChanged;
+            // A host's identity or ticket learnt on a network thread: saved from the window's thread.
+            _settings.TrustChanged = () => Later(SaveSettings);
+            _relayHost.CheckedChanged += (_, _) => Menus.AfterMenu(() => RelayChanged(ticked: true));
+            _relayAddress.Changed += () => RelayChanged(ticked: false);
+            _relayName.Changed += () => RelayChanged(ticked: false);
             _password.Changed += SaveSettings;
             _listenPassword.Changed += SaveSettings;
             _toggle.Click += (_, _) => Menus.AfterMenu(() => _keys?.Toggle());
@@ -330,6 +363,23 @@ namespace TailRemote
             _watch.Click += (_, _) => Menus.AfterMenu(() => ShowScreen());
             _getFiles.Click += (_, _) => Menus.AfterMenu(() => GetFiles());
             _getClipboard.Click += (_, _) => Menus.AfterMenu(() => GetClipboard());
+            _takeSent.Click += (_, _) => Menus.AfterMenu(() =>
+            {
+                if (_sentText is not string held) { Say("The remote PC has not sent any text that is waiting."); return; }
+                ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetDataObject(held, true, 2, 50)));
+                _sentText = null;
+                _takeSent.Enabled = false;
+                Say("The text the remote PC sent is on this clipboard.");
+            });
+            _acceptUnasked.CheckedChanged += (_, _) =>
+            {
+                if (_loadingSettings) return;
+                _settings.AcceptUnasked = _acceptUnasked.Checked;
+                Client.AcceptUnasked = _acceptUnasked.Checked;
+                SaveSettings();
+                Say(_acceptUnasked.Checked ? "Text and files the remote PC sends are kept, without replacing this clipboard." + (_client != null ? " From the next connection." : "")
+                    : "Only text and files you ask for are taken from the remote PC." + (_client != null ? " From the next connection." : ""));
+            };
             _speedHere.Click += (_, _) => Menus.AfterMenu(() => SpeedTestHere());
             _speedRemote.Click += (_, _) => Menus.AfterMenu(() => SpeedTestRemote());
             _backup.Click += (_, _) => Menus.AfterMenu(() => BackupSettings());
@@ -409,6 +459,8 @@ namespace TailRemote
             _device.Menu.Available = !host;
             _saved.Menu.Available = _savePc.Available = _forgetPc.Available = !host;
             _listenPassword.Item.Available = host;
+            _relayHost.Available = _relayAddress.Item.Available = _relayName.Item.Available = host;
+
             _copyAddress.Available = host;
             if (host) FillMyAddress();
             _captureFrom.Menu.Available = host;
@@ -419,8 +471,10 @@ namespace TailRemote
             _quality.Menu.Available = !host; // the host always sends the best unless asked for less
             _streaming.Item.Available = !host;
             _toggle.Available = !host;
+            _helperThere.Available = !host;
             _restart.Available = _updateRemote.Available = _remoteInfo.Available = _watch.Available = _getFiles.Available = _getClipboard.Available = _speedRemote.Available = _switchTo.Available = !host;
             _announceQuality.Available = _announceHealth.Available = _muteLocal.Available = _rideOut.Available = _wake.Available = !host;
+            _takeSent.Available = _acceptUnasked.Available = !host;
             _startup.Available = host;
             _service.Available = host;
             _startup.Enabled = !_service.Checked; // the service replaces the at-sign-in task
@@ -437,7 +491,7 @@ namespace TailRemote
             else _go.Text = _client == null && !_reconnecting ? "Co&nnect" : "Disco&nnect";
             bool canUse = _client != null && !_client.ListenOnly;
             string why = _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
-            foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote })
+            foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere })
             {
                 item.Enabled = canUse;
                 item.WhyNot = why;
@@ -496,6 +550,7 @@ namespace TailRemote
         {
             base.OnHandleCreated(e);
             _handle = Handle;
+            WatchForeground();
         }
 
         // ---- Send clipboard and Send files ----
@@ -624,7 +679,7 @@ namespace TailRemote
                         Later(() => Say("Nothing sent: the clipboard has only spaces or blank lines."));
                         break;
                     case ClipKind.Text:
-                        if ((long)text!.Length * 3 > FileChannel.MaxText) { Later(() => Say("That is too much text to send: over 512 megabytes.")); break; }
+                        if ((long)text!.Length * 3 > FileChannel.MaxText) { Later(() => Say("That is too much text to send: over 64 megabytes.")); break; }
                         Later(() =>
                         {
                             if (!CanSend(out var client, out var host, out var link)) return; // the connection may have closed meanwhile
@@ -834,10 +889,33 @@ namespace TailRemote
             if (_micOn && !c.ListenOnly && !c.CanMic) Speak("The remote PC's Kova is too old to take your microphone. Update it with File, Update the remote PC.");
         }
 
+        private bool _helperBusy;
+
+        /// <summary>Settings, Install (or Update, or Remove) the Kova Helper NVDA add-on: explained first, then done, NVDA restarting.</summary>
+        private async void HelperHere()
+        {
+            if (_helperBusy) { Say("Already working on the Kova Helper."); return; }
+            Doing("looking at the Kova Helper");
+            var st = NvdaHelper.GetState(_host?.NvdaHelperServer);
+            Log("Kova Helper: NVDA settings " + (st.ConfigDir ?? "not found") + ", installed " + (st.Installed ?? "no") + ", carried " + (st.Carried ?? "none") + ", offer " + st.Offer + (st.Problem != null ? ", problem: " + st.Problem : ""));
+            if (st.Offer == NvdaHelperAction.None) { Say("This copy of Kova does not carry the Kova Helper."); return; }
+            if (st.ConfigDir == null) { Say(st.Problem ?? "NVDA's settings could not be found on this PC."); return; }
+            var action = NvdaHelperForm.Ask(this, st);
+            if (action == NvdaHelperAction.None) return;
+            _helperBusy = true;
+            try { Say(await System.Threading.Tasks.Task.Run(() => NvdaHelper.Apply(action, log: DiagLog.Write))); }
+            catch (Exception e) { Say("The Kova Helper could not be changed: " + e.Message); }
+            finally { _helperBusy = false; }
+        }
+
+        // Read from the network thread (NvdaEvent.Perform): the menu's choice, kept where any thread may read it.
+        private volatile int _remoteNvdaMode;
+
         /// <summary>Settings, Remote NVDA speaking: its sound, its text here, or both.</summary>
         private void ApplyNvda(Client c)
         {
             int mode = Math.Max(0, _remoteNvda.SelectedIndex);
+            _remoteNvdaMode = mode;
             // Its sound is only given up for text a host can send: an older one would leave nothing at all.
             c.SoundOff = mode == 1 && c.CanNvda;
             c.NvdaText = mode >= 1;
@@ -1046,6 +1124,7 @@ namespace TailRemote
         internal static (string Address, int Port)? SplitPort(string text)
         {
             text = text.Trim();
+            if (text.Contains('@')) return null; // a relay address keeps its own port: name@relay:port (the Port setting is not the relay's)
             if (text.StartsWith('[') && text.IndexOf("]:", StringComparison.Ordinal) is int end and > 0)
                 return int.TryParse(text[(end + 2)..], out int p6) && p6 is > 0 and < 65536 ? (text[1..end], p6) : null;
             int colon = text.LastIndexOf(':');
@@ -1463,12 +1542,15 @@ namespace TailRemote
                 _port.Text = _settings.Port.ToString();
                 _password.Text = _settings.Password;
                 _listenPassword.Text = _settings.ListenPassword;
+                _relayHost.Checked = _settings.RelayHosting;
+                _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
+                _relayName.Text = _settings.RelayName;
                 _logging.Checked = _settings.Logging;
                 DiagLog.Enabled = _settings.Logging;
                 _speedUp.Checked = _settings.CatchUpBySpeed;
                 _announceQuality.Checked = _settings.AnnounceQuality;
                 _announceHealth.Checked = _settings.AnnounceHealth;
-                _muteLocal.Checked = _settings.MuteWhenNotControlling;
+                _muteLocal.Checked = _settings.MuteWhenNotFocused;
                 _rideOut.Checked = _settings.RideOutStalls;
                 _quality.SelectedIndex = Math.Clamp(_settings.SoundQuality + 1, 0, _quality.Count - 1);
                 _remoteNvda.SelectedIndex = Math.Clamp(_settings.RemoteNvda, 0, 2);
@@ -1768,6 +1850,12 @@ namespace TailRemote
             Program.ShowRequested += ShowRequested;
             Program.HostRequested += HostRequested;
             StartWatchdog();
+            // A newer Kova Helper inside this Kova than the one in NVDA here: updated now (once a run, in the background), said in plain words.
+            NvdaHelper.UpdateIfNeeded(s => Speech.Speak(s, interrupt: false), DiagLog.Write);
+            // A sign-in task set up before 4.4 runs this copy as administrator though ordinary programs can change it: this
+            // copy, started elevated by that task, sets the task up again without administrator rights (from the next sign-in).
+            if (_autoHost && Startup.IsElevated())
+                System.Threading.Tasks.Task.Run(() => { try { if (Startup.IsEnabled() && !ServiceHost.ProtectedFromUsers(Names.OwnExe)) { Startup.Apply(true, null); Log("The sign-in task no longer runs this copy as administrator: other programs can change its folder."); } } catch { } });
             _keys = new KeyCapture(() => _handle);
             _keys.ModeChanged += remote => Later(() => ModeChanged(remote));
             _keys.NotConnected += () => Later(() => Say("Not connected."));
@@ -1819,7 +1907,10 @@ namespace TailRemote
         private void ApplyMute()
         {
             if (_client is not Client c || c.ListenOnly) return;
-            bool mute = _muteLocal.Checked && _keys?.Remote != true;
+            // 4.4: by focus, not by whether the keys go to the remote PC: while no Kova window is in front (you are
+            // in another program on this PC), the remote PC's sound and its NVDA speech and braille stay silent, and
+            // the host sends no sound at all. Back the moment a Kova window comes to the front (ForegroundChanged).
+            bool mute = _muteLocal.Checked && !KovaInFront();
             if (mute == c.Muted) return;
             c.Muted = mute;
             if (mute) c.LockedStep = Protocol.OpusSteps.Length - 1;
@@ -1830,6 +1921,30 @@ namespace TailRemote
             }
             // Muting and unmuting move the quality on purpose: nothing to announce.
             _qualitySaid = c.AudioQuality;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        private delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventProc proc, uint pid, uint thread, uint flags);
+        private WinEventProc? _foregroundProc; // kept alive as long as the hook
+
+        /// <summary>Whether the window in front is one of this Kova's (the main window, the screen window, a box it opened).</summary>
+        private static bool KovaInFront()
+        {
+            IntPtr w = GetForegroundWindow();
+            if (w == IntPtr.Zero) return false;
+            GetWindowThreadProcessId(w, out uint pid);
+            return pid == (uint)Environment.ProcessId;
+        }
+
+        /// <summary>Follows which window is in front, the moment it changes (EVENT_SYSTEM_FOREGROUND), for Mute Kova when not in focus.</summary>
+        private void WatchForeground()
+        {
+            if (_foregroundProc != null) return; // once: the window's handle can be made again
+            _foregroundProc = (_, _, _, _, _, _, _) => ApplyMute();
+            // Out of context, on this (the window's) thread: called back here, through the message loop.
+            SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, _foregroundProc, 0, 0, 0x0000);
         }
 
         private void ModeChanged(bool remote)
@@ -1964,7 +2079,7 @@ namespace TailRemote
             _settings.CatchUpBySpeed = _speedUp.Checked;
             _settings.AnnounceQuality = _announceQuality.Checked;
             _settings.AnnounceHealth = _announceHealth.Checked;
-            _settings.MuteWhenNotControlling = _muteLocal.Checked;
+            _settings.MuteWhenNotFocused = _muteLocal.Checked;
             _settings.RideOutStalls = _rideOut.Checked;
             _settings.SoundQuality = _quality.SelectedIndex - 1;
             if (_micDevices.Count > 0) _settings.MicDevice = _micDevices[Math.Max(0, _micDevice.SelectedIndex)].Id;
@@ -2033,7 +2148,9 @@ namespace TailRemote
             try
             {
                 _host = new Host(port, _password.Text, listen, msg => Later(() => Log(msg)),
-                    _settings.CaptureDevice.Length == 0 ? null : _settings.CaptureDevice);
+                    _settings.CaptureDevice.Length == 0 ? null : _settings.CaptureDevice, HostIdentityHere());
+                _host.RelayStatus += msg => Later(() => Speak(msg)); // news about the relay: registered, a name taken, the relay gone
+                if (RelayTargetHere() is Relay.Target relay) _host.UseRelay(relay);
                 _host.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 _host.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 var hosting = _host;
@@ -2041,7 +2158,7 @@ namespace TailRemote
                 _host.TransferProgress += t => Later(() => ShowTransfer(t));
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
                 _host.MicDevice = _settings.MicOutput;
-                _host.StartNvdaHere(); // keeps NVDA's Speech Viewer and Braille Viewer hidden while hosting (as administrator)
+                _host.StartNvdaHelper(); // the Kova Helper NVDA add-on, if installed here, hands NVDA's speech to controlling PCs
                 Say("Hosting on port " + port + ". Waiting for a connection." + (listen.Length > 0 ? " Listening with the listen-only password is on." : ""));
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
@@ -2137,6 +2254,67 @@ namespace TailRemote
                 ChangeResult.Declined => "Windows Firewall was not changed: administrator permission was not given.",
                 _ => "Windows Firewall did not take the change. Port editor in Settings shows what is open.",
             });
+        }
+
+        private HostIdentity? _identity;
+
+        /// <summary>This PC's lasting identity as a host: the same one every time it hosts (made and saved the first time).</summary>
+        private HostIdentity HostIdentityHere()
+        {
+            if (_identity != null) return _identity;
+            string before = _settings.HostIdentityEnc;
+            _identity = _settings.LoadOrMakeIdentity();
+            if (_settings.HostIdentityEnc != before) SaveSettings();
+            return _identity;
+        }
+
+        /// <summary>Host through a relay was ticked or unticked, or its address or name changed: checked, saved, and used at once when hosting here.</summary>
+        private void RelayChanged(bool ticked)
+        {
+            if (_loadingSettings) return;
+            // The address as typed may carry the port: "relay.example.com:47300".
+            string typed = _relayAddress.Text.Trim();
+            if (typed.Length > 0)
+            {
+                if (Relay.Parse("x@" + typed, 47200, out string? problem) is not Relay.Target where)
+                {
+                    Later(() => _relayAddress.Ask(this, problem ?? "That is not a relay address."));
+                    return;
+                }
+                _settings.RelayAddress = where.RelayHost;
+                _settings.RelayPort = where.RelayPort;
+            }
+            else _settings.RelayAddress = "";
+            string name = _relayName.Text.Trim();
+            if (name.Length > 0 && !KovaRelayWire.Wire.NameOk(name)) { Later(() => _relayName.Ask(this, "That name cannot be used.")); return; }
+            _settings.RelayName = name;
+            _settings.RelayHosting = _relayHost.Checked;
+            SaveSettings();
+            if (_relayHost.Checked && _settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
+            if (_relayHost.Checked && _settings.RelayName.Length == 0) { Later(() => _relayName.Ask(this, "Choose this PC's name on the relay.")); return; }
+            var target = RelayTargetHere();
+            if (_host != null) _host.UseRelay(target);
+            if (target == null) { if (ticked) Say("This PC no longer hosts through a relay."); return; }
+            Say(_service.Checked ? "Press Apply settings to the service to host through the relay as " + target.Name + "."
+                : _host != null ? "Connecting to the relay as " + target.Name + "."
+                : "This PC will also be reachable through the relay as " + target.Name + " while it hosts. Controlling PCs connect to " + target + ".");
+        }
+
+        /// <summary>The service kept the identity it already had: this window takes it on, so hosting here later is the same PC to controlling PCs.</summary>
+        private void TakeServiceIdentity()
+        {
+            if (System.Threading.Interlocked.Exchange(ref ServiceHost.ServiceIdentity, null) is not string id) return;
+            if (Settings.Unprotect(_settings.HostIdentityEnc) == id) return;
+            _settings.HostIdentityEnc = Settings.Protect(id);
+            _identity = null; // made again from the settings the next time it hosts
+            SaveSettings();
+        }
+
+        /// <summary>The relay to host through, from the settings, or null when Host through a relay is off or not filled in.</summary>
+        private Relay.Target? RelayTargetHere()
+        {
+            if (!_settings.RelayHosting || _settings.RelayAddress.Trim().Length == 0 || _settings.RelayName.Trim().Length == 0) return null;
+            return Relay.Parse(_settings.RelayName.Trim() + "@" + _settings.RelayAddress.Trim(), _settings.RelayPort, out _);
         }
 
         /// <summary>If Windows Firewall would keep other PCs out, open the port (asking first unless already administrator).</summary>
@@ -2309,7 +2487,7 @@ namespace TailRemote
                 // available" from a background PC sounded as if it came from the one in front.
                 void Told(string msg) => Later(() => Speak(_parked.Find(x => x.Client == made) is Parked bg ? bg.Name + ", in the background: " + msg : msg));
                 var c = await System.Threading.Tasks.Task.Run(() =>
-                    Client.Connect(address, port, pw, player, Told, locked, answerMs));
+                    Client.Connect(address, port, pw, player, Told, locked, answerMs, _settings.Trust));
                 made = c;
                 if (attempt != _attempt || HostMode || _client != null)
                 {
@@ -2319,6 +2497,16 @@ namespace TailRemote
                 }
                 c.Disconnected += why => Later(() => { if (c == _client) Disconnect(why, byUser: false); else BackgroundDropped(c, why); });
                 c.ClipboardReceived += text => Later(() => ClipboardArrived(text));
+                c.UnaskedClipboardReceived += (text, path) => Later(() =>
+                {
+                    // Kept and offered, never put on the clipboard by itself: a hostile remote PC could otherwise swap what
+                    // you copy for something you would then paste into a command line.
+                    _sentText = text;
+                    _takeSent.Enabled = true;
+                    Tone(Sounds.Tone.ClipboardReceived);
+                    Speak("The remote PC sent some text. Your clipboard was left as it was. To use the text, choose Put the text the remote PC sent on this clipboard, in the Clipboard menu." +
+                        (path != null ? " It is also saved in " + System.IO.Path.GetDirectoryName(path) + "." : ""));
+                });
                 c.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 c.TransferProgress += t => Later(() => ShowTransfer(t));
                 c.HealthAlert += text => Later(() => HealthSaid(c, text));
@@ -2326,9 +2514,18 @@ namespace TailRemote
                 if (c.WakeInfo is string knownNow) RememberWake(address, port, knownNow); // it can come before the line above
                 // The remote NVDA's words go straight to this PC's NVDA from the network thread (never waiting on the
                 // window); the connection only raises them while it is the one heard.
-                c.NvdaSpoke += lines => Speech.Remote(lines, c.TakeKeyPressed());
-                c.NvdaBraille += Speech.Braille;
+                // Everything the remote NVDA did (its Kova Helper add-on): speech, cut-offs, braille, and its beeps and sounds,
+                // played here unless its sound comes too (both), so they are never heard twice. Straight from the network
+                // thread: the window is never waited on.
+                c.NvdaEventArrived += ev => NvdaEvent.Perform(ev, sounds: _remoteNvdaMode != 2); // the remote NVDA cuts itself off as keys arrive there: its Cancel comes too
                 c.NvdaNote += note => Later(() => { if (c == _client) Speak(note); });
+                bool missingSaid = false; // "coming through now" only after "missing" was said, never at every connect
+                c.NvdaHelperThere += there => Later(() =>
+                {
+                    if (c != _client) return;
+                    if (!there) { missingSaid = true; Speak("The remote PC doesn't have the Kova Helper NVDA add-on, so only its sound comes through. Install it with File, Install the Kova Helper on the remote PC."); }
+                    else if (missingSaid) { missingSaid = false; Speak("The remote PC's NVDA is coming through as text now."); }
+                });
                 c.MicNote += note => Later(() => { if (c == _client) Speak(note); });
                 c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoMic(c); SayIfNoNvda(c); } });
                 _client = c;
@@ -2359,6 +2556,24 @@ namespace TailRemote
                 // Connect pressed: the answer to it. Back by itself after a drop or a restart: news.
                 if (quiet) Speak(connected); else Say(connected);
             }
+            catch (HostChangedException changed) when (attempt == _attempt)
+            {
+                // Never tried again by itself, and never accepted without the person: a PC pretending to be this
+                // one would get the login's proof to guess the password from. Asked once, No by default.
+                if (_reconnecting) StopReconnecting("Stopped trying to reconnect.", news: quiet);
+                Tone(Sounds.Tone.Error);
+                var answer = MessageBox.Show(this, changed.Message + Environment.NewLine + Environment.NewLine +
+                    "If you know Kova was set up again on that PC, press Yes to trust it from now on and connect. If not, press No and check with whoever looks after that PC.",
+                    "Kova: that PC has a new identity", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (answer == DialogResult.Yes)
+                {
+                    // Exactly the identity that was shown is trusted, never whatever answers the next login.
+                    _settings.Trust.Remember(changed.Pc, changed.NewIdentity, null);
+                    SaveSettings();
+                    Later(() => Connect(quiet: false));
+                }
+                else Say("Not connected.");
+            }
             catch (Exception e) when (attempt == _attempt)
             {
                 // Keeps trying every second until Disconnect, except when trying again
@@ -2369,7 +2584,7 @@ namespace TailRemote
                 // uses up its budget for strangers: after 3 in a row it stops too. Any other error starts the count again.
                 // Not counted while the other PC restarts or updates: its Kova coming up can drop slow logins for a while.
                 _loginNotAwaited = e.Message != Client.LoginNotAwaited ? 0 : _expectUpdate != null || _expectRestart ? _loginNotAwaited : _loginNotAwaited + 1;
-                bool hopeless = e.Message.StartsWith("Wrong password") || _loginNotAwaited >= 3;
+                bool hopeless = e.Message.StartsWith("Wrong password") || e.Message == Client.TurnedAway || _loginNotAwaited >= 3;
                 if (hopeless) _loginNotAwaited = 0;
                 if (hopeless) { if (_reconnecting) StopReconnecting("Stopped trying: " + e.Message + DroppedNote(), news: quiet); else Say("Could not connect: " + e.Message + DroppedNote()); }
                 else if (!_reconnecting)
@@ -2648,7 +2863,9 @@ namespace TailRemote
             if (want && _host != null) StopHost(); // the service takes the port
             SaveSettings();
             Say("Windows asks for administrator permission.");
+            if (want) HostIdentityHere(); // the service hosts as this same PC: its identity goes with the settings
             bool ok = await ServiceHost.SetAsync(want, _settings);
+            if (want) TakeServiceIdentity();
             bool now = ServiceHost.IsInstalled();
             SetServiceBox(now);
             _startup.Checked = Startup.IsEnabled();
@@ -2667,7 +2884,9 @@ namespace TailRemote
             if (!CheckPassword() || !CheckPort(out _) || !CheckListenPassword()) return;
             SaveSettings();
             Say("Giving the service these settings. Windows asks for administrator permission.");
+            HostIdentityHere(); // the service hosts as this same PC
             bool ok = await ServiceHost.SetAsync(true, _settings);
+            TakeServiceIdentity();
             if (ok) await ServiceGotPort(_settings.Port);
             Say(ok
                 ? "The service is hosting with these settings on port " + _settings.Port + "."
@@ -2693,8 +2912,8 @@ namespace TailRemote
             string exe = ServiceHost.PlannedExe();
             string folder = System.IO.Path.GetDirectoryName(exe) ?? exe;
             return ServiceHost.SameFile(exe, Names.OwnExe)
-                ? "The service runs this copy of Kova, from " + folder + ", so leave it there. Updating this copy updates the service too. Any program that can change files in that folder could then act with full system access; if that worries you, put Kova in Program Files and turn this on from there."
-                : "Kova puts a copy of itself in " + folder + " for the service to run.";
+                ? "The service runs this copy of Kova, from " + folder + ", a folder only administrators can change, so leave it there. Updating this copy updates the service too."
+                : "Kova puts a copy of itself in " + folder + " for the service to run, where only administrators can change it, and keeps it up to date when you update this copy.";
         }
 
         private void SetServiceBox(bool on)
@@ -2760,7 +2979,7 @@ namespace TailRemote
             SaveSettings();
             Say("Windows asks for administrator permission.");
             var result = await Startup.ChangeAsync(want);
-            if (result == ChangeResult.Done) Say(want ? "Kova will start hosting when you sign in." : "Kova will no longer start with Windows.");
+            if (result == ChangeResult.Done) Say(want ? "Kova will start hosting when you sign in." + (ServiceHost.ProtectedFromUsers(Names.OwnExe) ? "" : " It will not run as administrator there, because this copy is in a folder other programs can change, so keys cannot reach administrator windows. To have it run as administrator, keep Kova in a folder only administrators can change, such as Program Files.") : "Kova will no longer start with Windows.");
             else
             {
                 Say(result == ChangeResult.Declined ? "That needs administrator permission, and it was not given." : "Windows did not accept the change.");

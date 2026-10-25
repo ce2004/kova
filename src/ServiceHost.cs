@@ -47,6 +47,12 @@ namespace TailRemote
             public bool WeSetSasPolicy { get; set; }
             /// <summary>Hosting at sign-in was on before the service replaced it: Remove turns it back on unless this is false.</summary>
             public bool? HadStartupTask { get; set; }
+            /// <summary>The host's lasting identity (HostIdentity, PKCS#8 as base64), sealed for this machine: the window's, handed over at install.</summary>
+            public string HostIdentityEnc { get; set; } = "";
+            public bool RelayHosting { get; set; }
+            public string RelayAddress { get; set; } = "";
+            public int RelayPort { get; set; } = 47200;
+            public string RelayName { get; set; } = "";
 
             // Null-safe: a "null" in the file (edited by hand, or damaged) used to stop hosting with a crash.
             public static string Seal(string? s) => string.IsNullOrEmpty(s) ? "" : Convert.ToBase64String(Native.Protect(System.Text.Encoding.UTF8.GetBytes(s), true, machine: true));
@@ -117,18 +123,72 @@ namespace TailRemote
         }
 
         /// <summary>
-        /// The copy the service will run if it is installed, or given settings, from this one. Since 4.2 that is this
-        /// very file, wherever it was run from (Documents, an apps folder): nothing is copied, so updating this copy
-        /// updates the service too. Two exceptions: a service installed in Program Files before keeps that copy, kept
-        /// up to date there as it always was, and a copy the service could not keep running from (CanRunInPlace) is
-        /// copied to Program Files as before.
+        /// The copy the service will run if it is installed, or given settings, from this one. 4.2 ran the very file
+        /// Kova was started from, wherever it was; 4.4 does that only when ordinary users cannot change that file or its
+        /// folders (ProtectedFromUsers), like a copy in Program Files or another folder only administrators can write.
+        /// The service runs as SYSTEM: a copy in Documents, Downloads or an apps folder of the user's own let any program
+        /// the user ran, with no administrator prompt, replace it (or put a DLL beside it) and so become SYSTEM. Such a
+        /// copy is copied into Program Files\Kova, which the service then keeps up to date by itself (it follows the
+        /// window's updates: TryUpdate). A service in Program Files keeps that copy.
         /// </summary>
         public static string PlannedExe()
         {
             string me = Self;
             if (SameFile(ServiceExe(), InstalledExe)) return InstalledExe;
-            return CanRunInPlace(me) ? me : InstalledExe;
+            return CanRunInPlace(me) && ProtectedFromUsers(me) ? me : InstalledExe;
         }
+
+        // Rights that let someone change what runs: write or append to the file, delete or rename it, change who may
+        // (permissions, owner). On the exe's folder, also add files (a DLL Windows would load from beside the exe) or
+        // delete what is in it; on folders above, delete or rename the folder below or change permissions.
+        // Generic write and all (0x40000000, 0x10000000) count too: an entry can hold them unmapped.
+        private const FileSystemRights Generic = (FileSystemRights)0x50000000;
+        private const FileSystemRights FileDanger = Generic | FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.Delete
+            | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership | FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes;
+        private const FileSystemRights FolderDanger = Generic | FileSystemRights.CreateFiles | FileSystemRights.CreateDirectories | FileSystemRights.Delete
+            | FileSystemRights.DeleteSubdirectoriesAndFiles | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+        private const FileSystemRights AboveDanger = Generic | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles
+            | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+
+        /// <summary>
+        /// Whether only SYSTEM, administrators and TrustedInstaller can change this exe, add files beside it, or rename
+        /// or re-permission the folders it is in (and they own them all). False when anything cannot be read.
+        /// </summary>
+        internal static bool ProtectedFromUsers(string exe)
+        {
+            try
+            {
+                exe = Path.GetFullPath(exe);
+                if (!Trusted(new FileInfo(exe).GetAccessControl(), FileDanger)) return false;
+                var dir = new DirectoryInfo(Path.GetDirectoryName(exe)!);
+                if (!Trusted(dir.GetAccessControl(), FolderDanger)) return false;
+                for (var up = dir.Parent; up != null; up = up.Parent)
+                    if (!Trusted(up.GetAccessControl(), AboveDanger, root: up.Parent == null)) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool Trusted(FileSystemSecurity sec, FileSystemRights danger, bool root = false)
+        {
+            // The drive's root is owned by SYSTEM or TrustedInstaller on Windows; anything else is checked as owner too.
+            if (sec.GetOwner(typeof(SecurityIdentifier)) is SecurityIdentifier owner && !TrustedSid(owner) && !root) return false;
+            foreach (FileSystemAccessRule rule in sec.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType != AccessControlType.Allow || rule.IdentityReference is not SecurityIdentifier sid || TrustedSid(sid)) continue;
+                // Rules only for what is made inside later (inherit only) say nothing about this one.
+                if ((rule.PropagationFlags & PropagationFlags.InheritOnly) != 0) continue;
+                // CREATOR OWNER on this very object means nothing (it applies to things made inside).
+                if (sid.IsWellKnown(WellKnownSidType.CreatorOwnerSid)) continue;
+                if ((rule.FileSystemRights & danger) != 0) return false;
+            }
+            return true;
+        }
+
+        private static readonly SecurityIdentifier TrustedInstallerSid = new("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+
+        private static bool TrustedSid(SecurityIdentifier sid) =>
+            sid.IsWellKnown(WellKnownSidType.LocalSystemSid) || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) || sid == TrustedInstallerSid;
 
         /// <summary>
         /// Whether the service can keep running this file where it is. Not on a network drive (it is not there for
@@ -183,6 +243,12 @@ namespace TailRemote
             public string MicDevice { get; set; } = "";
             public bool Logging { get; set; }
             public string User { get; set; } = "";
+            /// <summary>The window's lasting identity as a host (PKCS#8, base64): the service hosts as the same PC, so controlling PCs know it.</summary>
+            public string Identity { get; set; } = "";
+            public bool RelayHosting { get; set; }
+            public string RelayAddress { get; set; } = "";
+            public int RelayPort { get; set; } = 47200;
+            public string RelayName { get; set; } = "";
         }
 
         private const string HandoverPrefix = "Kova-setup-";
@@ -249,8 +315,11 @@ namespace TailRemote
                                 {
                                     Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword,
                                     CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging, User = me.Name,
+                                    Identity = Settings.Unprotect(s.HostIdentityEnc),
+                                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName,
                                 }));
                             try { _lastError = System.Text.Encoding.UTF8.GetString(ReadBlock(pipe)); } catch { }
+                            if (_lastError?.StartsWith('\u0001') == true) { ServiceIdentity = _lastError[1..]; _lastError = null; }
                             if (_lastError?.Length == 0) _lastError = null;
                         }
                         else
@@ -275,7 +344,7 @@ namespace TailRemote
             if (!name.StartsWith(HandoverPrefix, StringComparison.Ordinal) || name.Length > 64) return;
             try
             {
-                var c = new NamedPipeClientStream(".", name, PipeDirection.InOut);
+                var c = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.None, System.Security.Principal.TokenImpersonationLevel.Identification);
                 c.Connect(10_000);
                 // The window that asked made it, and nothing else.
                 if (!GetNamedPipeServerProcessId(c.SafePipeHandle, out uint by) || by != (uint)WindowPid) { c.Dispose(); return; }
@@ -290,7 +359,9 @@ namespace TailRemote
         internal static void Answer(int result)
         {
             if (_answerTo is not NamedPipeClientStream c) return;
-            try { WriteBlock(c, System.Text.Encoding.UTF8.GetBytes(result == 0 ? "" : _failWhy ?? "it did not work.")); } catch { }
+            // Done: the identity the service hosts as goes back with it (after \u0001), so the window hosts as the same PC.
+            string word = result == 0 ? (_identityBack != null ? "\u0001" + _identityBack : "") : _failWhy ?? "it did not work.";
+            try { WriteBlock(c, System.Text.Encoding.UTF8.GetBytes(word)); } catch { }
             try { c.Dispose(); } catch { }
         }
 
@@ -299,7 +370,12 @@ namespace TailRemote
         {
             if (_handoverWanted) return _handover;
             var s = Settings.Load();
-            return new Handover { Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging };
+            return new Handover
+            {
+                Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging,
+                Identity = Settings.Unprotect(s.HostIdentityEnc),
+                RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName,
+            };
         }
 
         /// <summary>
@@ -363,6 +439,10 @@ namespace TailRemote
                     WeSetSasPolicy = old?.WeSetSasPolicy ?? false,
                     // Asked before the task goes (below); a reinstall keeps what the first install found.
                     HadStartupTask = old != null ? old.HadStartupTask : Startup.IsEnabled(),
+                    // The window's identity, so the service is the same PC to the controlling PCs; one made by the
+                    // service itself (before any window handed one over) is kept only if the window has none.
+                    HostIdentityEnc = ChooseIdentity(old, s.Identity),
+                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress ?? "", RelayPort = s.RelayPort, RelayName = s.RelayName ?? "",
                 };
                 // Ctrl+Alt+Del from a service needs this policy (1 = services may send it).
                 using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"))
@@ -445,6 +525,43 @@ namespace TailRemote
                 return 0;
             }
             catch (Exception e) { return Fail(e.Message); }
+        }
+
+        /// <summary>The identity the service hosts as, from the elevated half's last install (PKCS#8, base64): the window takes it on. Null if none came back.</summary>
+        internal static string? ServiceIdentity;
+        private static string? _identityBack;
+
+        /// <summary>
+        /// One identity for this PC, whether the window or the service hosts: the service's own, if it already has one
+        /// (controlling PCs know it by it; it then goes back to the window), else the window's.
+        /// </summary>
+        private static string ChooseIdentity(Config? old, string? fromWindow)
+        {
+            string? kept = null;
+            try { if (old != null && HostIdentity.FromPkcs8(TryBase64(Config.Open(old.HostIdentityEnc))) is { } k) { k.Dispose(); kept = Config.Open(old.HostIdentityEnc); } } catch { }
+            if (kept == null && HostIdentity.FromPkcs8(TryBase64(fromWindow)) is { } w) { w.Dispose(); kept = fromWindow; }
+            _identityBack = kept;
+            return kept == null ? "" : Config.Seal(kept);
+        }
+
+        private static byte[]? TryBase64(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            try { return Convert.FromBase64String(s); } catch { return null; }
+        }
+
+        /// <summary>The service's identity as a host: from its settings, or made now and kept there (a service set up before 4.4).</summary>
+        internal static HostIdentity LoadOrMakeIdentity(Config cfg)
+        {
+            try { if (HostIdentity.FromPkcs8(TryBase64(Config.Open(cfg.HostIdentityEnc))) is { } kept) return kept; } catch { }
+            var made = HostIdentity.Create();
+            try
+            {
+                cfg.HostIdentityEnc = Config.Seal(Convert.ToBase64String(made.ExportPkcs8()));
+                WriteConfig(cfg);
+            }
+            catch (Exception e) { Log("Could not keep the service's identity: " + e.Message + " It is made again at the next start."); }
+            return made;
         }
 
         private static int Fail(string why)
@@ -609,6 +726,7 @@ namespace TailRemote
             new Thread(Agent.StartHosting) { IsBackground = true, Name = "Kova service hosting" }.Start();
             new Thread(UpdateLoop) { IsBackground = true, Name = "Kova service updates" }.Start();
             new Thread(UpdatePipe) { IsBackground = true, Name = "Kova update nudge" }.Start();
+            new Thread(MoveToProtected) { IsBackground = true, Name = "Kova service location", Priority = ThreadPriority.BelowNormal }.Start();
             Report(NativeService.SERVICE_RUNNING);
             if (!File.Exists(RollbackNote)) { try { File.Delete(ServiceSelf + ".old"); } catch { } } // left by the last self-update
             Log("Service started, version " + Updater.Current + ".");
@@ -732,7 +850,8 @@ namespace TailRemote
                 // Taken as one: the version and who to answer always belong together.
                 var request = Interlocked.Exchange(ref _request, null);
                 var reply = request?.Reply;
-                try { TryUpdate(request?.Want, reply); }
+                // One at a time with MoveToProtected: both put files where the service runs and restart it.
+                try { lock (SwapGate) TryUpdate(request?.Want, reply); }
                 catch (Exception e) { Log("Update failed: " + e.Message); reply?.Invoke("The remote PC could not update: " + e.Message); }
                 if (Restarting) { Wake.Set(); return; }
             }
@@ -870,6 +989,7 @@ namespace TailRemote
         /// </summary>
         public static void CountStart()
         {
+            CountRelocatedStart();
             try
             {
                 if (!File.Exists(RollbackNote)) return;
@@ -911,14 +1031,94 @@ namespace TailRemote
         /// Hosting really started (Agent.StartHosting). Only from now does the 2 minutes count: a new copy
         /// that ran but never managed to host used to count as good, and was never rolled back.
         /// </summary>
+        private static int _hostingNow, _relocatedWatch; // Agent.StartHosting got as far as hosting (MoveToProtected waits for it)
+
         public static void HostingStarted()
         {
+            Volatile.Write(ref _hostingNow, 1);
+            if (File.Exists(RelocatedNote) && Interlocked.Exchange(ref _relocatedWatch, 1) == 0)
+                new Thread(() =>
+                {
+                    Thread.Sleep(TimeSpan.FromMinutes(2));
+                    try { File.Delete(RelocatedNote); Log("The service runs well from " + InstallDir + "."); } catch { }
+                }) { IsBackground = true, Name = "Kova move check" }.Start();
             if (!File.Exists(RollbackNote) || Interlocked.Exchange(ref _hostingStarted, 1) == 1) return;
             new Thread(() =>
             {
                 Thread.Sleep(TimeSpan.FromMinutes(2));
                 try { File.Delete(RollbackNote); Log("Version " + Updater.Current + " is running well; the previous copy is no longer kept."); } catch { }
             }) { IsBackground = true, Name = "Kova update check" }.Start();
+        }
+
+        /// <summary>
+        /// A service set up by 4.2 or 4.3 may run a copy that ordinary users can change (Documents, an apps folder):
+        /// any program the user runs could swap it and become SYSTEM. Once this version has proven itself (hosting
+        /// for two minutes, no roll back pending), it copies itself into Program Files\Kova, points the service there
+        /// and restarts into it: controlling PCs reconnect by themselves within seconds. The copy it came from is the
+        /// user's own and is left alone. Tried once per start; a failure is logged and tried again at the next start.
+        /// </summary>
+        private static void MoveToProtected()
+        {
+            try
+            {
+                string self = ServiceSelf;
+                if (SameFile(self, InstalledExe) || ProtectedFromUsers(self)) return;
+                // Not while a new version is still on trial, and only after it has really hosted for a while.
+                for (int waited = 0; !Stop.WaitOne(10_000); waited += 10)
+                    if (waited >= 120 && Volatile.Read(ref _hostingNow) == 1 && !File.Exists(RollbackNote)) break;
+                lock (SwapGate)
+                {
+                    if (Stop.WaitOne(0) || Restarting) return;
+                    Log("This service runs " + self + ", which programs without administrator rights can change. Moving it to " + InstalledExe + ".");
+                    Directory.CreateDirectory(InstallDir);
+                    string fresh = InstalledExe + ".install";
+                    try
+                    {
+                        File.Copy(self, fresh, true);
+                        using (var f = new FileStream(fresh, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite)) f.Flush(flushToDisk: true);
+                        File.Move(fresh, InstalledExe, overwrite: true);
+                    }
+                    finally { try { File.Delete(fresh); } catch { } }
+                    // The way back, written first: if the new copy keeps failing to start, CountStart points the service
+                    // at the old one again (a PC reached only through Kova must never be lost to this move).
+                    File.WriteAllLines(RelocatedNote, new[] { self, "0" });
+                    if (!Register(InstalledExe)) { File.Delete(RelocatedNote); Log("Windows would not point the service at " + InstalledExe + "; it carries on from where it was."); return; }
+                    Log("The service now runs " + InstalledExe + " and restarts into it.");
+                    _restartingTo = Updater.Current.ToString();
+                    Restarting = true;
+                    Wake.Set();
+                }
+            }
+            catch (Exception e) { Log("Could not move the service to Program Files: " + e.Message + " Trying again at the next start."); }
+        }
+
+        private static readonly object SwapGate = new();
+
+        /// <summary>Where the service ran before MoveToProtected, and how many times the new copy has started; in the service's own folder in ProgramData (administrators only).</summary>
+        private static string RelocatedNote => Path.Combine(DataDir, "relocated.txt");
+
+        /// <summary>
+        /// Counted first thing at each start, like CountStart: a service just moved to Program Files that fails to start
+        /// three times before it hosts goes back to the copy it ran before. Hosting for two minutes ends the trial.
+        /// </summary>
+        private static void CountRelocatedStart()
+        {
+            try
+            {
+                if (!File.Exists(RelocatedNote) || !SameFile(ServiceSelf, InstalledExe)) return;
+                var note = File.ReadAllLines(RelocatedNote);
+                string old = note.Length > 0 ? note[0] : "";
+                int starts = (note.Length > 1 && int.TryParse(note[1], out int n) ? n : 0) + 1;
+                if (starts >= 4 && File.Exists(old) && Register(old))
+                {
+                    File.Delete(RelocatedNote);
+                    Log("The copy in " + InstallDir + " kept failing to start, so the service went back to " + old + ".");
+                    _rolledBack = true; // ServiceMain ends at once: Windows' recovery starts the old copy
+                    return;
+                }
+                File.WriteAllLines(RelocatedNote, new[] { old, starts.ToString() });
+            }
+            catch (Exception e) { Log("Move check failed: " + e.Message); }
         }
 
         /// <summary>A nudge from TailRemote after it updated itself: check now. At most once a minute.</summary>

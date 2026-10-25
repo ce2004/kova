@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Kova Relay: a small tray program that pairs Kova hosts and controlling PCs that both connect out to it.
+       Build: dotnet publish relay\KovaRelay.csproj -c Release -r win-x64 -p:BaseOutputPath=relay\obj\pubout\x64\ -o <dir>
+       (and win-arm64). It lives inside Kova's folder, so everything it builds stays under relay\obj. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>KovaRelay</AssemblyName>
+    <RootNamespace>KovaRelay</RootNamespace>
+    <Product>Kova Relay</Product>
+    <AssemblyTitle>Kova Relay</AssemblyTitle>
+    <Version>4.4.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+
+    <!-- One self-contained file, trimmed the same way Kova is (see kova.csproj for why each setting is there). -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
+    <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <!-- Without these two (and TrimRoots.xml), the trimmed window's UI Automation threw TypeLoadException: every
+         control showed to NVDA as an unnamed pane. -->
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>embedded</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="*.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <TrimmerRootAssembly Include="KovaRelay" />
+    <!-- WinForms reaches much of itself through COM (accessibility): trimmed, Kova's window crashed on opening. -->
+    <TrimmerRootAssembly Include="System.Windows.Forms" />
+    <TrimmerRootAssembly Include="System.Windows.Forms.Primitives" />
+    <TrimmerRootAssembly Include="System.Drawing.Common" />
+    <TrimmerRootAssembly Include="Accessibility" />
+    <TrimmerRootDescriptor Include="TrimRoots.xml" />
+  </ItemGroup>
+
+</Project>

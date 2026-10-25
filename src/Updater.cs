@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -63,7 +64,77 @@ namespace TailRemote
         }
 
         /// <summary>What GitHub's newest release says: its version, notes, and this PC's download (null if it has none).</summary>
-        internal sealed record Parsed(Version Version, string Notes, string? Url, string? Sha256);
+        internal sealed record Parsed(Version Version, string Notes, string? Url, string? Sha256, string? ManifestUrl = null, string? SignatureUrl = null);
+
+        // ---- Signed releases (4.4) ----
+        // GitHub's own fingerprint of a download comes from the same place as the download: it catches damage, not a
+        // stolen GitHub account or a tampered release, and an update ends up running as the service (SYSTEM). So every
+        // release also carries kova-release.json (each file's SHA-256 and the version) and its signature, made by the
+        // release build with a private key only it holds. Kova checks the signature against these public keys, built
+        // in, before it will install anything: the first is the one in use, the second a spare kept offline in case the
+        // first ever has to be replaced.
+        internal const string ManifestAsset = "kova-release.json", SignatureAsset = "kova-release.json.sig";
+        private static readonly string[] SigningKeys =
+        {
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEH9gfZpzO3z0w4ji4pqEX1H9pJ/Bm8raMQU+8XV6znnZuoDe8uc4qdlFB5D2gsqiJRYZm+MRoiwr0GwScojQdUg==",
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHzZm8nQwnNUp1KMHQpInlorB+ZvobhtcE36LVKFyV7Erl2L0fUg33mmMnsh28cRx68DciHcTuvWAebH4L5u0OA==",
+        };
+
+        /// <summary>
+        /// The SHA-256 the signed list gives this file, if the list is signed by one of Kova's keys and is for this version;
+        /// else null. testKey: tests only (with KOVA_UPDATE_FEED), another public key to accept.
+        /// </summary>
+        internal static string? SignedHash(byte[] manifest, byte[] signature, Version version, string asset, string? testKey = null)
+        {
+            bool signed = false;
+            foreach (string k in testKey != null ? new[] { testKey } : SigningKeys)
+            {
+                try
+                {
+                    using var ec = ECDsa.Create();
+                    ec.ImportSubjectPublicKeyInfo(Convert.FromBase64String(k), out _);
+                    if (ec.VerifyData(manifest, signature, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation)) { signed = true; break; }
+                }
+                catch (Exception e) when (e is CryptographicException or FormatException) { }
+            }
+            if (!signed) return null;
+            try
+            {
+                using var doc = JsonDocument.Parse(manifest);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("version", out var v) || v.ValueKind != JsonValueKind.String || NormalizeTag(v.GetString()) != version) return null;
+                if (!root.TryGetProperty("files", out var files) || files.ValueKind != JsonValueKind.Object) return null;
+                if (!files.TryGetProperty(asset, out var h) || h.ValueKind != JsonValueKind.String) return null;
+                string hash = h.GetString()!;
+                return hash.Length == 64 && hash.All(Uri.IsHexDigit) ? hash : null;
+            }
+            catch (JsonException) { return null; }
+        }
+
+        /// <summary>A small file of the release (the list or its signature): at most 64 KB, within the usual time limit.</summary>
+        private static async Task<byte[]> SmallAsync(string url)
+        {
+            if (TestFeed != null && Path.IsPathFullyQualified(url)) return await File.ReadAllBytesAsync(url);
+            using var h = Http();
+            using var limit = new System.Threading.CancellationTokenSource(ApiLimit);
+            try
+            {
+                using var resp = await h.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, limit.Token);
+                resp.EnsureSuccessStatusCode();
+                await using var s = await resp.Content.ReadAsStreamAsync(limit.Token);
+                var ms = new MemoryStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = await s.ReadAsync(buf, limit.Token)) > 0)
+                {
+                    ms.Write(buf, 0, n);
+                    if (ms.Length > 64 << 10) throw new InvalidOperationException("The release's list of files is far too big, so nothing was installed.");
+                }
+                return ms.ToArray();
+            }
+            catch (OperationCanceledException) when (limit.IsCancellationRequested) { throw new InvalidOperationException("GitHub did not answer. Check the internet connection and try again."); }
+            catch (HttpRequestException e) { throw new InvalidOperationException("Could not reach GitHub: " + e.Message, e); }
+        }
 
         /// <summary>
         /// Reads GitHub's answer about the newest release. Anything missing or odd is a plain sentence,
@@ -84,17 +155,24 @@ namespace TailRemote
                     NormalizeTag(tagEl.GetString()) is not Version version)
                     throw new InvalidOperationException("GitHub's answer about the newest Kova could not be understood. Try again later.");
                 string notes = root.TryGetProperty("body", out var b) && b.ValueKind == JsonValueKind.String ? b.GetString() ?? "" : "";
+                string? url = null, sha = null, manifestUrl = null, signatureUrl = null;
                 if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var a in assets.EnumerateArray())
                     {
-                        if (a.ValueKind != JsonValueKind.Object || !a.TryGetProperty("name", out var n) || n.ValueKind != JsonValueKind.String || n.GetString() != asset) continue;
+                        if (a.ValueKind != JsonValueKind.Object || !a.TryGetProperty("name", out var n) || n.ValueKind != JsonValueKind.String) continue;
                         if (!a.TryGetProperty("browser_download_url", out var u) || u.ValueKind != JsonValueKind.String) continue;
-                        string? sha = a.TryGetProperty("digest", out var d) && d.ValueKind == JsonValueKind.String && d.GetString() is string ds && ds.StartsWith("sha256:") ? ds[7..] : null;
-                        return new Parsed(version, notes, u.GetString(), sha);
+                        string name = n.GetString()!;
+                        if (name == ManifestAsset) manifestUrl = u.GetString();
+                        else if (name == SignatureAsset) signatureUrl = u.GetString();
+                        else if (name == asset && url == null)
+                        {
+                            url = u.GetString();
+                            sha = a.TryGetProperty("digest", out var d) && d.ValueKind == JsonValueKind.String && d.GetString() is string ds && ds.StartsWith("sha256:") ? ds[7..] : null;
+                        }
                     }
                 }
-                return new Parsed(version, notes, null, null);
+                return new Parsed(version, notes, url, sha, manifestUrl, signatureUrl);
             }
         }
 
@@ -109,7 +187,9 @@ namespace TailRemote
         /// Tests only: a file shaped like GitHub's answer about the newest release, whose download is a file on this
         /// PC (still checked against its SHA-256). Lets a test update a copy end to end without a real release.
         /// </summary>
-        private static readonly string? TestFeed = Environment.GetEnvironmentVariable("KOVA_UPDATE_FEED") is { Length: > 0 } f ? f : null;
+        // A test switch: never honoured by a copy running as administrator or SYSTEM (Names.TestSwitch), which would
+        // otherwise install whatever file a program without those rights pointed it at.
+        private static readonly string? TestFeed = Names.TestSwitch("KOVA_UPDATE_FEED") is { Length: > 0 } f ? f : null;
 
         private static async Task<string> ReleaseJsonAsync()
         {
@@ -147,7 +227,20 @@ namespace TailRemote
             var p = ParseRelease(await ReleaseJsonAsync(), AssetName);
             if (p.Version <= Current) return null;
             if (p.Url == null) throw new InvalidOperationException("Version " + p.Version + " has no " + AssetName + " yet. Try again later.");
-            return new Release(p.Version, p.Notes, p.Url, p.Sha256);
+            // Signed, or not installed at all (4.4): see SigningKeys.
+            if (p.ManifestUrl == null || p.SignatureUrl == null)
+                throw new InvalidOperationException("Version " + p.Version + " on GitHub is not signed by Kova's makers, so it was not installed. If it has only just come out, try again in a few minutes.");
+            byte[] manifest = await SmallAsync(p.ManifestUrl);
+            byte[] signature;
+            try { signature = Convert.FromBase64String(System.Text.Encoding.ASCII.GetString(await SmallAsync(p.SignatureUrl)).Trim()); }
+            catch (FormatException) { signature = Array.Empty<byte>(); }
+            string? testKey = TestFeed != null ? Names.TestSwitch("KOVA_UPDATE_TEST_KEY") : null;
+            string sha = SignedHash(manifest, signature, p.Version, AssetName, testKey)
+                ?? throw new InvalidOperationException("Version " + p.Version + " on GitHub does not carry a valid signature from Kova's makers, so it was not installed. This should never happen: tell Kova's makers.");
+            // GitHub's own fingerprint, when it gives one, must agree with the signed one.
+            if (p.Sha256 != null && !p.Sha256.Equals(sha, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The file for version " + p.Version + " on GitHub is not the one Kova's makers signed, so it was not installed. This should never happen: tell Kova's makers.");
+            return new Release(p.Version, p.Notes, p.Url, sha);
         }
 
         /// <summary>

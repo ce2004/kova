@@ -3,6 +3,11 @@ using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 
+// DLLs Kova names without a path come from System32 only (4.4): never from beside the exe, where a program
+// without administrator rights may have put one (a Downloads folder), and Kova sometimes runs as administrator
+// or as the service. Kova's own native library (NVDA's) is loaded by its full path after a fingerprint check.
+[assembly: System.Runtime.InteropServices.DefaultDllImportSearchPaths(System.Runtime.InteropServices.DllImportSearchPath.System32)]
+
 namespace TailRemote
 {
     internal static class Program
@@ -103,6 +108,13 @@ namespace TailRemote
             // or System Error box grabbed the keyboard until someone closed it. A crash now just ends
             // the process, and the service or Windows starts it again.
             SetErrorMode(0x0001 | 0x0002 | 0x8000); // SEM_FAILCRITICALERRORS, NOGPFAULTERRORBOX, NOOPENFILEERRORBOX
+            // And for anything Windows itself loads later by name (4.4, as above): System32 only, never the exe's folder.
+            try { SetDefaultDllDirectories(0x00000800); } catch { } // LOAD_LIBRARY_SEARCH_SYSTEM32
+            // A test copy's settings switch, in a copy running as administrator or SYSTEM, which must not honour it
+            // (Names.TestSwitch): it stops here, rather than quietly use (and save over) the real settings.
+            if (Environment.GetEnvironmentVariable("KOVA_SETTINGS_DIR") is { Length: > 0 } && Names.TestSwitch("KOVA_SETTINGS_DIR") == null
+                && !(args.Length >= 1 && args[0] is "--securitytest" or "--selftest" or "--chaostest" or "--testhost" or "--soaktest" or "--testcontrol"))
+                return 3;
             try { WerSetFlags(0x20); } catch { } // WER_FAULT_REPORTING_NO_UI
             Native.FullSpeed(); // never on power-saving cores: that makes the sound run dry
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
@@ -206,6 +218,23 @@ namespace TailRemote
                 return 0;
             }
             if (args.Length == 1 && args[0] == "--selftest") return SelfTest();
+            if (args.Length >= 1 && args[0] == "--securitytest")
+            {
+                // The security fixes (4.4), each part checked in-process: %TEMP%\kova-securitytest.txt says "ok" or what failed.
+                // --securitytest Files (or Media, Nvda, Lead) runs one part.
+                var lines = new System.Collections.Generic.List<string>();
+                bool all = true;
+                foreach (var (name, run) in new (string, Func<string?>)[] { ("Files", SecTestFiles.Run), ("Media", SecTestMedia.Run), ("Nvda", SecTestNvda.Run), ("NvdaHelper", SecTestNvdaHelper.Run), ("Lead", SecTestLead.Run) })
+                {
+                    if (args.Length > 1 && !name.Equals(args[1], StringComparison.OrdinalIgnoreCase)) continue;
+                    string? why;
+                    try { why = run(); } catch (Exception e) { why = "threw " + e; }
+                    lines.Add(name + ": " + (why ?? "ok"));
+                    all &= why == null;
+                }
+                File.WriteAllLines(Path.Combine(Path.GetTempPath(), "kova-securitytest.txt"), lines);
+                return all ? 0 : 1;
+            }
             if (args.Length == 1 && args[0] == "--speedtest")
             {
                 // The internet speed test from File, without the window: the result goes to the temp folder.
@@ -213,6 +242,9 @@ namespace TailRemote
                 return 0;
             }
             if (args.Length == 1 && args[0] == "--chaostest") return ChaosTest.Run();
+            // --relaytest RELAYPORT [HOSTPORT]: end to end through a Kova Relay running on this PC (RelayTest.cs).
+            if (args.Length >= 2 && args[0] == "--relaytest" && int.TryParse(args[1], out int relayTestPort))
+                return RelayTest.Run(relayTestPort, args.Length > 2 && int.TryParse(args[2], out int rtHost) ? rtHost : 47371);
             if (args.Length == 1 && args[0] == "--cliptest") return ClipTest();
             // --soaktest [minutes]: months of use in a few minutes; handles, threads and memory must stay put.
             if (args.Length >= 1 && args[0] == "--soaktest") return SoakTest.Run(args.Length > 1 && int.TryParse(args[1], out int soakMinutes) ? soakMinutes : 10);
@@ -225,8 +257,17 @@ namespace TailRemote
                 // What arrives is written down too, so a test can check a window's Send the clipboard end to end.
                 host.ClipboardReceived += t => { try { File.AppendAllText(said, "clipboard text: " + t + Environment.NewLine); } catch { } };
                 host.ClipboardFilesReceived += p => { try { File.AppendAllText(said, "clipboard files: " + string.Join(" | ", p) + Environment.NewLine); } catch { } };
-                // NVDA's viewers hidden and read here, as a hosting window does (only when run as administrator).
-                host.StartNvdaHere();
+                // The Kova Helper NVDA add-on, as a hosting window listens for it (its pipe has this run's KOVA_INSTANCE word in its name).
+                host.StartNvdaHelper();
+                if (Environment.GetEnvironmentVariable("KOVA_TEST_HELPER") == "1") host.TestHelperConnected = true; // tests: as if the Kova Helper were talking to it
+                host.NvdaEventSeen += ev => { try { File.AppendAllText(said, DateTime.Now.ToString("HH:mm:ss.fff ") + "NVDA: " + ev + Environment.NewLine); } catch { } };
+                // KOVA_TEST_RELAY=name@relay:port: also reachable through a Kova Relay (4.4), as Host through a relay does.
+                if (Environment.GetEnvironmentVariable("KOVA_TEST_RELAY") is { Length: > 0 } viaRelay)
+                {
+                    var target = Relay.Parse(viaRelay, 47200, out string? relayProblem);
+                    if (target != null) host.UseRelay(target);
+                    else try { File.AppendAllText(said, "relay: " + relayProblem + Environment.NewLine); } catch { }
+                }
                 // KOVA_MIC_TEST=1: the controlling PC's microphone is counted, not played (a test PC may have no second cable).
                 if (Environment.GetEnvironmentVariable("KOVA_MIC_TEST") == "1")
                 {
@@ -255,13 +296,20 @@ namespace TailRemote
                 void Note(string s) { try { File.AppendAllText(said, DateTime.Now.ToString("HH:mm:ss.fff ") + s + Environment.NewLine); } catch { } }
                 Speech.Init();
                 bool mic = Array.IndexOf(args, "mic") >= 0, nvda = Array.IndexOf(args, "nvda") >= 0;
-                int micOff = 0;
+                int micOff = 0, soundOffAt = 0, soundOnAt = 0;
+                string to = "127.0.0.1";
                 foreach (var a in args) if (a.StartsWith("micoff=") && int.TryParse(a[7..], out int mo)) micOff = mo;
+                // 4.4: to=ADDRESS (a relay address, name@relay:port, works too); soundoff=N / soundon=N turn the sound off and on
+                // at those seconds (text-only mode), and every 5 seconds the bytes received over UDP are noted, to measure both.
+                foreach (var a in args) if (a.StartsWith("to=")) to = a[3..];
+                foreach (var a in args) if (a.StartsWith("soundoff=") && int.TryParse(a[9..], out int so)) soundOffAt = so;
+                foreach (var a in args) if (a.StartsWith("soundon=") && int.TryParse(a[8..], out int sn)) soundOnAt = sn;
                 using var player = new Player(Player.NoDevice, Note);
-                using var c = Client.Connect("127.0.0.1", controlPort, args[2], player, s => Note("status: " + s));
+                using var c = Client.Connect(to, controlPort, args[2], player, s => Note("status: " + s));
                 Note("connected" + (c.ListenOnly ? ", listen only" : ""));
-                c.NvdaSpoke += lines => { Note("remote NVDA: " + string.Join(" / ", lines)); Speech.Remote(lines, c.TakeKeyPressed()); };
-                c.NvdaBraille += b => { Note("remote braille: " + b); Speech.Braille(b); };
+                // Everything the remote NVDA did, acted on as the window does (NvdaEvent.Perform), and logged.
+                c.NvdaEventArrived += ev => { Note(ev.Kind == NvdaEventKind.Speak ? "remote NVDA: " + ev.SpokenText : "remote NVDA " + ev); NvdaEvent.Perform(ev, sounds: true); };
+                c.NvdaHelperThere += there => Note(there ? "the remote PC has the Kova Helper" : "the remote PC has no Kova Helper");
                 c.NvdaNote += n => Note("NVDA note: " + n);
                 c.MicNote += n => Note("microphone note: " + n);
                 c.Disconnected += why => Note("disconnected: " + why);
@@ -272,10 +320,14 @@ namespace TailRemote
                 Note("host " + c.HostVersion + ": microphone " + (c.CanMic ? "taken" : "not taken") + ", NVDA text " + (c.CanNvda ? "offered" : "not offered") + ", sending microphone " + c.MicSending);
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 bool offDone = false;
+                long lastBytes = 0, lastBytesAt = 0;
                 while (sw.Elapsed.TotalSeconds < controlSecs)
                 {
                     System.Threading.Thread.Sleep(200);
                     if (micOff > 0 && !offDone && sw.Elapsed.TotalSeconds >= micOff) { offDone = true; c.SetMic(false, null); Note("microphone turned off"); }
+                    if (soundOffAt > 0 && sw.Elapsed.TotalSeconds >= soundOffAt) { soundOffAt = 0; c.SoundOff = true; Note("sound turned off"); }
+                    if (soundOnAt > 0 && sw.Elapsed.TotalSeconds >= soundOnAt) { soundOnAt = 0; c.SoundOff = false; Note("sound turned on"); }
+                    if (sw.ElapsedMilliseconds / 5000 != lastBytesAt) { lastBytesAt = sw.ElapsedMilliseconds / 5000; long b = c.UdpBytesReceived; Note("UDP bytes received in the last 5 seconds: " + (b - lastBytes)); lastBytes = b; }
                 }
                 Note("done, microphone was " + (c.MicSending ? "on" : "off") + " at the end");
                 return 0;
@@ -739,6 +791,7 @@ namespace TailRemote
 
         [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern uint SetErrorMode(uint mode);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool SetDefaultDllDirectories(uint flags);
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern int WerSetFlags(uint flags);
         [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool AllowSetForegroundWindow(int processId);
 
@@ -799,6 +852,7 @@ namespace TailRemote
         /// <summary>Host and client on this PC: handshake, wrong password, ping. No audio is played.</summary>
         private static int SelfTest()
         {
+            Host.TestLocked = false; // this VPS's console is usually locked: Get files is tested as if signed in (the lock refusal has its own test)
             string lossless = "";
             // Windows tools run from System32 by full path, never a same-named exe next to Kova.exe.
             {
@@ -911,7 +965,7 @@ namespace TailRemote
                 {
                     if (Directory.Exists(settingsDir)) Directory.Delete(settingsDir, true);
                     Directory.CreateDirectory(settingsDir);
-                    Environment.SetEnvironmentVariable("KOVA_SETTINGS_DIR", settingsDir);
+                    Settings.TestDir = settingsDir; // in-process, never the environment: honoured even when this test runs elevated (on CI it does)
                     File.WriteAllText(Settings.FilePath, "{\"PasswordEnc\":null,\"SavedPcs\":null}");
                     try
                     {
@@ -939,7 +993,7 @@ namespace TailRemote
                 }
                 finally
                 {
-                    Environment.SetEnvironmentVariable("KOVA_SETTINGS_DIR", before);
+                    Settings.TestDir = null;
                     try { Directory.Delete(settingsDir, true); } catch { }
                 }
             }
@@ -1036,6 +1090,7 @@ namespace TailRemote
             c.ClipboardReceived += t => toClient = t;
             for (int i = 0; i < 100 && host.ControllerFiles == null; i++) System.Threading.Thread.Sleep(20); // the first file lane
             c.SendClipboard("from client ✓");
+            c.Files!.ExpectClipboard(); // 4.4: a controller takes the host's clipboard only when it asked for it (Get the remote clipboard)
             host.SendClipboard("from host ✓");
             using var listener = Client.Connect("127.0.0.1", 47999, "listen", silent2, log.Enqueue);
             if (!listener.ListenOnly) return Fail("the listen password gave control");
@@ -1101,6 +1156,7 @@ namespace TailRemote
                 }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 toClient = null;
+                c.Files!.ExpectClipboard(); // 4.4: asked for, as Get the remote clipboard does
                 host.SendClipboard("during the flood");
                 while (toClient == null && sw.ElapsedMilliseconds < 3000) System.Threading.Thread.Sleep(10);
                 long clipMs = sw.ElapsedMilliseconds;
@@ -1243,6 +1299,7 @@ namespace TailRemote
             string bigText = string.Concat(Enumerable.Repeat("Kova clipboard, the long way round. ", 120_000)); // about 5 MB
             string? gotText = null;
             c.ClipboardReceived += t => gotText = t;
+            c.Files!.ExpectClipboard(); // 4.4: a controller takes the host's clipboard only when it asked for it (Get the remote clipboard)
             host.ControllerFiles.SendText(bigText);
             for (int i = 0; i < 200 && gotText == null; i++) System.Threading.Thread.Sleep(20);
             if (gotText != bigText) return Fail("big clipboard text: " + (gotText == null ? "nothing arrived" : gotText.Length + " characters"));

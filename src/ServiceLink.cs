@@ -243,6 +243,16 @@ namespace TailRemote
                 {
                     // Who the window runs as: files it sends are opened as that user, never as SYSTEM.
                     pipe.RunAsClient(() => user = WindowsIdentity.GetCurrent(TokenAccessLevels.Query | TokenAccessLevels.Impersonate | TokenAccessLevels.Duplicate));
+                    // Only the user signed in at the screen (4.4): another account started in the same session (runas)
+                    // would otherwise hear what arrives for that user's clipboard and choose where received files go.
+                    // (Asking Windows who that is needs the service's rights; where it cannot say, as in tests, the
+                    // session check above stands alone.)
+                    using (var console = NativeService.ConsoleUser())
+                        if (console?.User != null && user?.User != null && console.User != user.User)
+                        {
+                            ServiceHost.Log("Service link: refused a Kova window running as " + user.Name + ", not the user signed in at the screen.");
+                            return;
+                        }
                     lock (_windows) _windows.Add(window);
                     ServiceHost.Log("Service link: the Kova window of " + user?.Name + " is connected.");
                     new Thread(() =>
