@@ -104,5 +104,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $assets = @(Get-ChildItem dist | ForEach-Object { $_.FullName })
-          $draft = if (Test-Path dist/kova-release.json.sig) { @() } else { @('--draft') }
-          gh release create '${{ github.ref_name }}' @assets --title "Kova ${{ steps.ver.outputs.version }}" --notes-file notes.txt @draft
+          # Build the argument list as one array: an "if" expression unrolls a one-item array into a plain string.
+          $ghArgs = @('release', 'create', '${{ github.ref_name }}') + $assets + @('--title', "Kova ${{ steps.ver.outputs.version }}", '--notes-file', 'notes.txt')
+          if (-not (Test-Path dist/kova-release.json.sig)) { $ghArgs += '--draft' }
+          gh @ghArgs
