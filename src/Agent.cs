@@ -27,7 +27,7 @@ namespace TailRemote
         private static System.Threading.Timer? _folders;
 
         /// <summary>Relay only, and a relay is filled in: otherwise the service hosts directly, or nobody could ever reach it.</summary>
-        private static bool RelayOnlyUsable(ServiceHost.Config cfg) => Relay.OnlyUsable(cfg.RelayOnly, cfg.RelayHosting, cfg.RelayAddress, cfg.RelayName, cfg.RelayPort);
+        private static bool RelayOnlyUsable(ServiceHost.Config cfg) => Relay.OnlyUsable(cfg.RelayOnly, cfg.RelayHosting, cfg.RelayAddress, cfg.RelayPort);
 
         /// <summary>Starts hosting from the service. Retries until it can (the network may not be up yet at boot); never throws.</summary>
         public static void StartHosting()
@@ -91,9 +91,11 @@ namespace TailRemote
             _host.StartNvdaHelper();
             NvdaHelper.UpdateIfNeeded(null, ServiceHost.Log);
             // Also reachable through a Kova Relay, when the window set one up and handed it over.
-            if (cfg.RelayHosting && !string.IsNullOrWhiteSpace(cfg.RelayAddress) && !string.IsNullOrWhiteSpace(cfg.RelayName)
-                && Relay.Parse(cfg.RelayName.Trim() + "@" + cfg.RelayAddress.Trim(), cfg.RelayPort, out _) is Relay.Target relay)
-                _host.UseRelay(relay);
+            // 4.6: on the relay under the code made from the password (no names), as the window does.
+            if (cfg.RelayHosting && !string.IsNullOrWhiteSpace(cfg.RelayAddress) && password.Length > 0
+                && Relay.Parse(Relay.Channel(password) + "@" + cfg.RelayAddress.Trim(), cfg.RelayPort, out _) is Relay.Target relay)
+                _host.UseRelay(relay, listenPassword.Length == 0 ? null
+                    : Relay.Parse(Relay.Channel(listenPassword) + "@" + cfg.RelayAddress.Trim(), cfg.RelayPort, out _));
             // The screen is the agent's to see (the service is in session 0): pictures come from it.
             _host.VideoUpdate = agent.Video;
             _host.VideoForget = agent.ForgetVideo;

@@ -28,15 +28,27 @@ namespace TailRemote
         private readonly bool _ownIdentity;
 
         // ---- Hosting through a Kova Relay (Relay.cs) ----
-        private RelayHost? _relay;
+        private RelayHost? _relay, _listenRelay; // 4.6: the listen-only password has its own place on the relay
 
         /// <summary>Also reachable through this relay, under this name (null: not, or no longer).</summary>
         public void UseRelay(Relay.Target? target)
         {
+            UseRelay(target, null);
+        }
+
+        /// <summary>
+        /// Reachable through this relay (null: not, or no longer). listenTarget: the same relay under the code made from the
+        /// listen-only password (4.6), so listeners find this PC by that password; it says nothing of its own.
+        /// </summary>
+        public void UseRelay(Relay.Target? target, Relay.Target? listenTarget)
+        {
+            Interlocked.Exchange(ref _listenRelay, null)?.Dispose();
             var old = Interlocked.Exchange(ref _relay, null);
             old?.Dispose();
             if (target == null || _stop) return;
             _relay = new RelayHost(target, this, Identity, (b, n, ep) => { try { _udp.Send(b, n, Dual(ep)); } catch { } }, msg => { _status(msg); RelayStatus?.Invoke(msg); });
+            if (listenTarget != null && listenTarget.Name != target.Name)
+                _listenRelay = new RelayHost(listenTarget, this, Identity, (b, n, ep) => { try { _udp.Send(b, n, Dual(ep)); } catch { } }, msg => DiagLog.Write("host: listen-only relay: " + msg));
         }
 
         /// <summary>What happens with the relay, in a sentence (registered, refused, lost and trying again), each said once: the window speaks it.</summary>
@@ -417,6 +429,7 @@ namespace TailRemote
             // Stopping the capture waits for its thread (up to 2 seconds): never on the caller's (window's) thread.
             if (c != null) ThreadPool.QueueUserWorkItem(_ => c.Dispose());
             _relay?.Dispose();
+            _listenRelay?.Dispose();
             if (_ownIdentity) Identity.Dispose();
         }
 
@@ -1807,7 +1820,11 @@ namespace TailRemote
                         try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Native.SystemTool("shutdown.exe"), "/r /t 0") { CreateNoWindow = true, UseShellExecute = false }); }
                         catch (Exception e) { Broadcast("The remote PC could not restart: " + e.Message); }
                         break;
-                    case Protocol.ClipboardRequest when IsController(s) && !ScreenLocked():
+                    case Protocol.ClipboardRequest when IsController(s) && ScreenLocked():
+                        // Said, not silently dropped: the controlling PC heard nothing at all and took it for broken.
+                        ThreadPool.QueueUserWorkItem(_ => { try { Protocol.SendMessage(s.Link, s.Stream, "The remote PC is locked, so its clipboard cannot be read. Sign in there first, then try again."); } catch { } });
+                        break;
+                    case Protocol.ClipboardRequest when IsController(s):
                         // Not while this PC is locked (4.4): the Kova password must not be a way round the Windows one.
                         // Only a controller may pull the clipboard; a listener never reaches here.
                         // Coalesce a flood of rapid pulls (a mashed or held Ctrl+Shift+B, or an old

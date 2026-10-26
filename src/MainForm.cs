@@ -12,13 +12,13 @@ namespace TailRemote
 
         // The window is blank: everything is in the menu bar (Alt), File, Clipboard and Settings.
         private readonly MenuChoice _mode = new("&Mode");
-        private readonly MenuText _address = new("&Address", "The other PC's Tailscale name, IP address or internet address. For a PC that hosts through a Kova Relay, its name on the relay, then @, then the relay's address, like office-pc@relay.example.com:");
+        private readonly MenuText _address = new("&Address", "The address of the PC, or of the Kova Relay it hosts through:");
         private readonly MenuText _port = new("&Port", "The port (the same on both PCs; 47120 unless you changed it):");
         private readonly MenuText _password = new("Pass&word", "The password (at least 6 characters, the same on both PCs):", secret: true);
         private readonly MenuChoice _device = new("&Output device");
-        private readonly MenuChoice _quality = new("Sound &quality");
+        private readonly MenuChoice _quality = new("Audio &quality");
         private readonly MenuStatus _streaming = new("Not connected");
-        private readonly MenuChoice _captureFrom = new("C&apture sound from (what other PCs hear)");
+        private readonly MenuChoice _captureFrom = new("C&apture audio from");
         private bool _fillingCapture;
         private readonly MenuChoice _saved = new("Sa&ved PCs");
         private readonly MenuItem _savePc = new("Save t&his PC");
@@ -30,25 +30,25 @@ namespace TailRemote
         private const int ReachDirect = 0, ReachRelayOnly = 1, ReachBoth = 2;
         // 4.5: the step-by-step ways in, first in the File menu, and a check that the relay is up.
         private readonly MenuItem _connectWizard = new("&Connect to a PC...") { ShortcutKeys = Keys.Control | Keys.N, WhyNot = "Busy connecting." };
-        private readonly MenuItem _hostWizard = new("Host this PC, so other PCs can control it...") { ShortcutKeys = Keys.Control | Keys.H };
-        private readonly MenuItem _checkRelay = new("Check the relay is &up") { WhyNot = "Already checking the relay." };
+        private readonly MenuItem _hostWizard = new("&Host this PC...") { ShortcutKeys = Keys.Control | Keys.H };
+        private readonly MenuItem _checkRelay = new("Check the &relay") { WhyNot = "Already checking the relay." };
         private readonly MenuText _relayAddress = new("Relay addr&ess", "The Kova Relay's address, with its port after a colon if it is not 47200, like relay.example.com or relay.example.com:47200:");
         private readonly MenuText _relayName = new("Relay &name", "The name of this PC on the relay, like office-pc: 1 to 40 letters, digits, dashes, dots or underscores. Controlling PCs connect to it as name@relay:");
 
         private readonly MenuItem _sendClipboard = new("Send the clip&board") { ShortcutKeys = Keys.Control | Keys.B };
         private readonly MenuItem _sendFiles = new("Send f&iles") { ShortcutKeys = Keys.Control | Keys.I };
-        private readonly MenuItem _sendFolder = new("Send a folder and everything in i&t") { ShortcutKeys = Keys.Control | Keys.T };
+        private readonly MenuItem _sendFolder = new("Send a folder and its con&tents") { ShortcutKeys = Keys.Control | Keys.T };
         // Files: first in the Clipboard menu. While files move, it opens a line per file.
         private readonly MenuStatus _transferStatus = new("");
         private readonly MenuItem _transferStop = new("&Stop the file transfer") { Enabled = false, WhyNot = "Nothing is being sent or received." };
         // Where Send files and Send a folder from the other PC are saved: the menu item says where.
-        private readonly MenuItem _pickReceiveFolder = new("Pic&k where received files go");
-        private readonly MenuItem _logging = Menus.Check("Enable lo&gging (writes Kova-log.txt next to Kova)");
-        private readonly MenuItem _sounds = new("Sounds for connecting, clipboard and fi&les...");
-        private readonly MenuItem _speedUp = Menus.Check("Catch up b&y fast-forwarding the sound, same pitch (otherwise it skips ahead)");
-        private readonly MenuItem _startup = Menus.CheckAsking("Start &hosting when Windows starts (asks for administrator)...");
+        private readonly MenuItem _pickReceiveFolder = new("Pic&k the folder for received files...");
+        private readonly MenuItem _logging = Menus.Check("Diagnostic lo&gging");
+        private readonly MenuItem _sounds = new("Notification so&unds...");
+        private readonly MenuItem _speedUp = Menus.Check("Catch up b&y speeding up audio instead of skipping");
+        private readonly MenuItem _startup = Menus.CheckAsking("Start &hosting when Windows starts...");
         // (WhyNot for _startup is set in the constructor: CheckAsking makes it.)
-        private readonly MenuItem _service = Menus.CheckAsking("Run as a Windows servi&ce: works at the lock screen, sign-in and UAC prompts; Control Alt End sends Control Alt Delete...");
+        private readonly MenuItem _service = Menus.CheckAsking("Run as a Windows servi&ce (works at the lock screen, sign-in and administrator prompts)...");
         private bool _settingService; // set while the checkbox is changed by code, not by the user
         private readonly MenuItem _go = new() { WhyNot = "Still connecting." };
         private readonly MenuItem _toggle = new("Control &remote PC") { ShortcutKeyDisplayString = "Ctrl+Shift+Enter" };
@@ -69,10 +69,10 @@ namespace TailRemote
         private bool _micOn;
         private readonly MenuChoice _micDevice = new("Microphone to &use");
         // Host: where the controlling PC's microphone plays. Kova's own pick first: a virtual cable that is not what it sends.
-        private readonly MenuChoice _micOutput = new("Microphone from the controlling PC plays &into");
+        private readonly MenuChoice _micOutput = new("Play the controlling PC's microphone &into");
         private readonly System.Collections.Generic.List<(string Id, string Name)> _micDevices = new(), _micOutputs = new();
         // The remote NVDA: heard through the remote PC's sound, said here as text (and brailled) with no remote sound, or both.
-        private readonly MenuChoice _remoteNvda = new("Remote NVDA spea&king");
+        private readonly MenuChoice _remoteNvda = new("Remote NVDA spee&ch");
         // The Kova Helper NVDA add-on (4.4): on this PC (what it says follows where it stands: install, update or remove),
         // and on the remote PC from here.
         private readonly MenuItem _helperHere = new(NvdaHelper.MenuText(new NvdaHelperState(null, null, NvdaHelper.CarriedVersion, false, false, null))) { WhyNot = "Already working on the Kova Helper." };
@@ -83,14 +83,14 @@ namespace TailRemote
         private readonly MenuItem _takeSent = new("&Put the text the remote PC sent on this clipboard") { Enabled = false, WhyNot = "The remote PC has not sent any text that is waiting." };
         private string? _sentText;
         // Whether text and files the other PC sends without being asked are taken at all.
-        private readonly MenuItem _acceptUnasked = Menus.Check("Accept text and files the remote PC sends without bein&g asked");
-        private readonly MenuItem _announceQuality = Menus.Check("A&nnounce when the sound quality changes");
-        private readonly MenuItem _muteLocal = Menus.Check("&Mute Kova when not in focus (the remote PC's sound and NVDA speech; it stays connected)");
-        private readonly MenuItem _rideOut = Menus.Check("Ride out &Wi-Fi scans: when the sound keeps stalling, hold enough to cover it (a little more delay until it stops)");
+        private readonly MenuItem _acceptUnasked = Menus.Check("Accept text and files sent by the remote PC without askin&g");
+        private readonly MenuItem _announceQuality = Menus.Check("A&nnounce audio quality changes");
+        private readonly MenuItem _muteLocal = Menus.Check("&Mute Kova when it is not the active window");
+        private readonly MenuItem _rideOut = Menus.Check("Compensate for &Wi-Fi interruptions (adds a little delay when needed)");
         private readonly MenuItem _switchTo = new("Switch &to PC");
         // Wake-on-LAN for saved PCs: sent from here and from every PC connected to, then it connects.
         private readonly MenuItem _wake = new("Wa&ke a saved PC and connect");
-        private readonly MenuItem _announceHealth = Menus.Check("Announce the remote PC's heal&th: on battery, battery low, drive nearly full, processor busy, memory nearly gone");
+        private readonly MenuItem _announceHealth = Menus.Check("Announce remote PC heal&th alerts (battery, disk space, processor and memory)");
         private readonly MenuItem _speedHere = new("Meas&ure this PC's internet speed...") { WhyNot = "A speed test is already running on this PC." };
         private readonly MenuItem _speedRemote = new("Measure the r&emote PC's internet speed...");
         private readonly MenuItem _backup = new("&Back up settings to a file...");
@@ -223,11 +223,9 @@ namespace TailRemote
             var file = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _connectWizard, _hostWizard, _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
-                _speedHere, _speedRemote, new ToolStripSeparator(),
-                _mode.Menu, _saved.Menu, _address.Item, _port.Item, _password.Item, _listenPassword.Item, _copyAddress,
-                _reach.Menu, _relayAddress.Item, _relayName.Item, _checkRelay,
-                _savePc, _forgetPc, new ToolStripSeparator(),
+                _connectWizard, _hostWizard, _go, _switchTo, _wake, new ToolStripSeparator(),
+                _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
+                _speedHere, _speedRemote, _copyAddress, _checkRelay, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
             var clip = new MenuItem("&Clipboard");
@@ -417,6 +415,13 @@ namespace TailRemote
             _tray.Click += (_, e) => { if (e is not MouseEventArgs m || m.Button == MouseButtons.Left) RestoreFromTray(); };
             _retryTimer.Tick += (_, _) => { if (_client == null && !_connecting) Connect(quiet: true); };
             _settingsTimer.Tick += (_, _) => SettingsTimerTick();
+            // The relay codes take a moment to make (600,000 rounds): made now in the background, so hosting through a
+            // relay at start never pauses the window.
+            if (_settings.RelayHosting)
+            {
+                string pw = _settings.Password, listen = _settings.ListenPassword;
+                System.Threading.Tasks.Task.Run(() => { try { if (pw.Length > 0) Relay.Channel(pw); if (listen.Length > 0) Relay.Channel(listen); } catch { } });
+            }
             UpdateMode();
         }
 
@@ -446,23 +451,28 @@ namespace TailRemote
             }
             catch { }
             var parts = lan.Select(l => l.Ip + " (" + l.Network + ")").ToList();
-            if (tailscale != null) parts.Add("Tailscale " + tailscale);
-            parts.Add("name " + Environment.MachineName);
+            if (tailscale != null) parts.Add(tailscale);
+            parts.Add("computer name " + Environment.MachineName);
             _bestAddress = lan.Count > 0 ? lan[0].Ip : tailscale;
-            string text = "Copy this PC's IP a&ddress: " + string.Join(", ", parts).Replace("&", "&&");
-            if (HostMode && RelayOnlyNow && RelayTargetHere() is Relay.Target only)
-                text = "Copy how other PCs reach this PC: " + only.ToString().Replace("&", "&&");
+            _myAddresses = string.Join(", ", parts);
+            string text = "Copy this PC's a&ddress: " + _myAddresses.Replace("&", "&&");
+            if (HostMode && RelayOnlyNow) text = "Copy the relay a&ddress: " + RelayShown.Replace("&", "&&");
             if (_copyAddress.Text != text) _copyAddress.Text = text;
             _copyAddress.Enabled = _bestAddress != null || (HostMode && RelayOnlyNow);
         }
 
+        private string _myAddresses = "";
+
+        /// <summary>The relay this PC hosts through, as people type it: "relay.example.com" or "relay.example.com:47300".</summary>
+        private string RelayShown => _settings.RelayAddress + (_settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + _settings.RelayPort);
+
         private void CopyAddress()
         {
-            if (HostMode && RelayOnlyNow && RelayTargetHere() is Relay.Target only)
+            if (HostMode && RelayOnlyNow)
             {
-                string how = only.ToString();
+                string how = RelayShown;
                 ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(how)));
-                Say("Copied " + how + ". Other PCs type that as the address, or choose Connect to a PC, Through a Kova Relay.");
+                Say("Copied " + how + ". Other computers enter this relay address and this PC's password in Connect to a PC.");
                 return;
             }
             FillMyAddress();
@@ -513,7 +523,9 @@ namespace TailRemote
             _mode.Menu.Enabled = !busy;
             // Alt C and Alt S are the Clipboard and Settings menus, so the button uses other letters.
             if (HostMode) _go.Text = _service.Checked ? "Appl&y settings to the service" : _host == null ? "Start &hosting" : "Stop &hosting";
-            else _go.Text = _client == null && !_reconnecting ? "Co&nnect" : "Disco&nnect";
+            else _go.Text = _client == null && !_reconnecting ? "Co&nnect" : "&Disconnect";
+            // 4.6: connecting and hosting start from the wizards; this item only ends them.
+            _go.Available = HostMode ? _host != null && !_service.Checked : _client != null || _reconnecting || _connecting;
             bool canUse = _client != null && !_client.ListenOnly;
             string why = _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
             foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere })
@@ -781,7 +793,7 @@ namespace TailRemote
         {
             string folder = _settings.ReceiveFolder;
             FileChannel.DownloadsOverride = folder.Length > 0 ? folder : null;
-            _pickReceiveFolder.Text = "Pic&k where received files go (now " + FileChannel.Downloads.Replace("&", "&&") + ")...";
+            _pickReceiveFolder.Text = "Received files fol&der: " + FileChannel.Downloads.Replace("&", "&&") + "...";
             if (_serviceLink != null) _serviceLink.ReceiveFolder = folder;
         }
 
@@ -1158,7 +1170,8 @@ namespace TailRemote
         }
 
         private string NameFor(string address, int port) =>
-            _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port))?.ToString() ?? (port == Protocol.DefaultPort ? address : address + ", port " + port);
+            _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port))?.ToString()
+            ?? (Relay.IsByPassword(address) ? "the PC on the relay " + Relay.Shown(address) : port == Protocol.DefaultPort ? address : address + ", port " + port);
 
         private Parked? FindParked(string address, int port) => _parked.Find(p => SamePc(p.Address, p.Port, address, port));
 
@@ -2172,7 +2185,7 @@ namespace TailRemote
             var relayTarget = RelayTargetHere();
             if (_settings.RelayOnly && relayTarget == null)
             {
-                Say("This PC is set to be reached only through a relay, but no relay is filled in. Choose Host this PC in the File menu to set it up.");
+                Say("This PC is set to host through a Kova Relay, but no relay is set. Choose Host this PC in the File menu to set one.");
                 return;
             }
             bool relayOnly = RelayOnlyNow;
@@ -2182,7 +2195,7 @@ namespace TailRemote
                 _host = new Host(port, _password.Text, listen, msg => Later(() => Log(msg)),
                     _settings.CaptureDevice.Length == 0 ? null : _settings.CaptureDevice, HostIdentityHere(), relayOnly);
                 _host.RelayStatus += msg => Later(() => Speak(msg)); // news about the relay: registered, a name taken, the relay gone
-                if (relayTarget != null) _host.UseRelay(relayTarget);
+                if (relayTarget != null) _host.UseRelay(relayTarget, ListenRelayTarget());
                 _host.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 _host.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 var hosting = _host;
@@ -2191,8 +2204,8 @@ namespace TailRemote
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
                 _host.MicDevice = _settings.MicOutput;
                 _host.StartNvdaHelper(); // the Kova Helper NVDA add-on, if installed here, hands NVDA's speech to controlling PCs
-                Say((relayOnly ? "Hosting through the relay " + relayTarget!.RelayHost + " only, as " + relayTarget.Name + ". Nothing is opened to the internet. Connecting to the relay."
-                    : "Hosting on port " + port + ". Waiting for a connection.") + (listen.Length > 0 ? " Listening with the listen-only password is on." : ""));
+                Say((relayOnly ? "Hosting through the Kova Relay at " + relayTarget!.RelayHost + ". No ports are opened on this PC."
+                    : "Hosting on port " + port + ". Waiting for a connection.") + (listen.Length > 0 ? " The listen-only password is on." : ""));
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
                 if (Wasapi.OutputDevices().Count == 0)
@@ -2328,16 +2341,15 @@ namespace TailRemote
             UpdateMode();
             bool wants = _settings.RelayHosting;
             if (wants && _settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
-            if (wants && _settings.RelayName.Length == 0) { Later(() => _relayName.Ask(this, "Choose this PC's name on the relay.")); return; }
             var target = RelayTargetHere();
             // Into or out of relay only: the port is taken differently, so hosting here starts again.
             if (_host != null && _host.RelayOnly != (_settings.RelayOnly && target != null)) { StopHost(); StartHost(); return; }
-            if (_host != null) _host.UseRelay(target);
+            if (_host != null) _host.UseRelay(target, ListenRelayTarget());
             if (target == null) { if (ticked) Say("This PC is reached directly, not through a relay."); return; }
             string how = _settings.RelayOnly ? "only through the relay" : "through the relay too";
-            Say(_service.Checked ? "Press Apply settings to the service to host " + how + " as " + target.Name + "."
-                : _host != null ? "Connecting to the relay as " + target.Name + "."
-                : "This PC will be reachable " + how + " as " + target.Name + " while it hosts. Controlling PCs connect to " + target + ".");
+            Say(_service.Checked ? "Press Apply settings to the service to host " + how + "."
+                : _host != null ? "Connecting to the relay."
+                : "This PC will be reachable " + how + " while it hosts.");
         }
 
         /// <summary>The service kept the identity it already had: this window takes it on, so hosting here later is the same PC to controlling PCs.</summary>
@@ -2351,18 +2363,18 @@ namespace TailRemote
         }
 
         /// <summary>Hosting through the relay only, with a relay that can be used.</summary>
-        private bool RelayOnlyNow => Relay.OnlyUsable(_settings.RelayOnly, _settings.RelayHosting, _settings.RelayAddress, _settings.RelayName, _settings.RelayPort);
+        private bool RelayOnlyNow => Relay.OnlyUsable(_settings.RelayOnly, _settings.RelayHosting, _settings.RelayAddress, _settings.RelayPort);
 
         /// <summary>Relay only chosen but no usable relay: said, and false (the service would otherwise be reachable from nowhere).</summary>
         private bool RelayOnlyFilledIn()
         {
             if (!_settings.RelayOnly || RelayOnlyNow) return true;
-            Say("This PC is set to be reached only through a relay, but no relay is filled in. Choose Host this PC in the File menu to set it up.");
+            Say("This PC is set to host through a Kova Relay, but no relay is set. Choose Host this PC in the File menu to set one.");
             return false;
         }
 
         /// <summary>Where the service or this window hosts, in words: a port, or the relay alone.</summary>
-        private string HostedWhere() => RelayOnlyNow ? "through the relay " + _settings.RelayAddress + " only, as " + _settings.RelayName : "on port " + _settings.Port;
+        private string HostedWhere() => RelayOnlyNow ? "through the relay " + RelayShown : "on port " + _settings.Port;
 
         private static int ReachOf(Settings s) => !s.RelayHosting ? ReachDirect : s.RelayOnly ? ReachRelayOnly : ReachBoth;
 
@@ -2375,10 +2387,10 @@ namespace TailRemote
             if (HostMode)
             {
                 if (_settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
-                relay = _settings.RelayAddress + (_settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + _settings.RelayPort);
-                name = _settings.RelayName;
+                relay = RelayShown;
+                name = _password.Text.Length > 0 ? Relay.Channel(_password.Text) : "";
             }
-            else if (Relay.Parse(_address.Text.Trim(), KovaRelayWire.Wire.DefaultPort, out string? problem) is Relay.Target t)
+            else if (Relay.Parse(Relay.WithChannel(_address.Text.Trim(), _password.Text), KovaRelayWire.Wire.DefaultPort, out string? problem) is Relay.Target t)
             {
                 relay = t.RelayHost.Contains(':') ? "[" + t.RelayHost + "]:" + t.RelayPort : t.RelayHost + ":" + t.RelayPort;
                 name = t.Name;
@@ -2393,7 +2405,7 @@ namespace TailRemote
                 var found = await System.Threading.Tasks.Task.Run(() => Relay.Check(relay, name.Length > 0 ? name : null));
                 string said = found.Said;
                 if (HostMode && found.Up && _host != null)
-                    said += _host.RelayRegistered ? " This PC is registered on it." : " This PC is not registered on it yet; it keeps trying.";
+                    said += _host.RelayRegistered ? " This PC is connected to it." : " This PC is not connected to it yet, and keeps trying.";
                 Say(said);
             }
             finally { _checkingRelay = false; _checkRelay.Enabled = true; }
@@ -2409,9 +2421,7 @@ namespace TailRemote
                 if (MessageBox.Show(this, "This PC is hosting. Stop hosting and connect to another PC?", "Connect to a PC", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 StopHost();
             }
-            int.TryParse(_port.Text.Trim(), out int port);
-            if (port is < 1 or > 65535) port = Protocol.DefaultPort;
-            var answer = ConnectWizard.Run(this, _settings, _address.Text.Trim(), port, _password.Text);
+            var answer = ConnectWizard.Run(this, _settings, () => { SaveNow(); FillSaved(); });
             if (answer == null) return;
             if (_reconnecting) StopReconnecting("Stopped reconnecting.", news: false);
             else if (_client != null) Disconnect("Disconnected.", byUser: true);
@@ -2420,8 +2430,15 @@ namespace TailRemote
             _port.Text = answer.Port.ToString();
             _password.Text = answer.Password;
             SaveSettings();
+            if (answer.Save)
+            {
+                var pc = _settings.SavedPcs.Find(x => string.Equals(x.Address, answer.Address, StringComparison.OrdinalIgnoreCase) && x.Port == answer.Port);
+                if (pc == null) { pc = new SavedPc { Address = answer.Address, Port = answer.Port }; _settings.SavedPcs.Add(pc); }
+                pc.PasswordEnc = Settings.Protect(answer.Password);
+                if (answer.Name.Length > 0) pc.Name = answer.Name;
+                SaveNow();
+            }
             FillSaved();
-            if (answer.Save) SavePc();
             UpdateMode();
             Connect(quiet: false);
         }
@@ -2439,7 +2456,8 @@ namespace TailRemote
             }
             int.TryParse(_port.Text.Trim(), out int port);
             if (port is < 1 or > 65535) port = Protocol.DefaultPort;
-            var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked);
+            FillMyAddress();
+            var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked, _myAddresses);
             if (a == null) return;
             _loadingSettings = true; // filled in all at once: nothing below acts on half of it
             try
@@ -2448,15 +2466,11 @@ namespace TailRemote
                 _port.Text = a.Port.ToString();
                 _password.Text = a.Password;
                 _listenPassword.Text = a.ListenPassword;
-                if (a.Relay)
-                {
-                    _relayAddress.Text = a.RelayAddress + (a.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + a.RelayPort);
-                    _relayName.Text = a.RelayName;
-                }
+                if (a.Relay) _relayAddress.Text = a.RelayAddress + (a.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + a.RelayPort);
                 _reach.SelectedIndex = !a.Relay ? ReachDirect : a.Direct ? ReachBoth : ReachRelayOnly;
             }
             finally { _loadingSettings = false; }
-            if (a.Relay) { _settings.RelayAddress = a.RelayAddress; _settings.RelayPort = a.RelayPort; _settings.RelayName = a.RelayName; }
+            if (a.Relay) { _settings.RelayAddress = a.RelayAddress; _settings.RelayPort = a.RelayPort; _settings.RelayName = ""; }
             _settings.RelayHosting = a.Relay;
             _settings.RelayOnly = a.Relay && !a.Direct;
             SaveSettings();
@@ -2469,11 +2483,16 @@ namespace TailRemote
             }
         }
 
+        /// <summary>The same relay under the listen-only password's code, or null when there is no listen-only password.</summary>
+        private Relay.Target? ListenRelayTarget() =>
+            RelayTargetHere() == null || _listenPassword.Text.Length == 0 ? null
+            : Relay.Parse(Relay.Channel(_listenPassword.Text) + "@" + _settings.RelayAddress.Trim(), _settings.RelayPort, out _);
+
         /// <summary>The relay to host through, from the settings, or null when Host through a relay is off or not filled in.</summary>
         private Relay.Target? RelayTargetHere()
         {
-            if (!_settings.RelayHosting || _settings.RelayAddress.Trim().Length == 0 || _settings.RelayName.Trim().Length == 0) return null;
-            return Relay.Parse(_settings.RelayName.Trim() + "@" + _settings.RelayAddress.Trim(), _settings.RelayPort, out _);
+            if (!_settings.RelayHosting || _settings.RelayAddress.Trim().Length == 0 || _password.Text.Length == 0) return null;
+            return Relay.Parse(Relay.Channel(_password.Text) + "@" + _settings.RelayAddress.Trim(), _settings.RelayPort, out _);
         }
 
         /// <summary>If Windows Firewall would keep other PCs out, open the port (asking first unless already administrator).</summary>
@@ -2623,7 +2642,7 @@ namespace TailRemote
             (_frontAddress, _frontPort, _frontPassword) = (address, port, pw);
             _connecting = true;
             int attempt = ++_attempt;
-            if (!quiet) { _go.Enabled = false; Say("Connecting to " + address + "."); }
+            if (!quiet) { _go.Enabled = false; Say("Connecting to " + NameFor(address, port) + "."); }
             UpdateButtons();
             string device = _outDevices[Math.Max(0, _device.SelectedIndex)].Id;
             try

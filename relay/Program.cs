@@ -53,11 +53,11 @@ namespace KovaRelay
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // The host list and log of a relay in the tray: this user's LocalAppData\KovaRelay. Nothing beside the exe.
+            // The log of a relay in the tray: this user's LocalAppData\KovaRelay. Nothing beside the exe.
             string own = RelayService.TrayFolder(name);
             try { Directory.CreateDirectory(own); } catch (Exception) { }
-            bool hostsMoved = MoveOldFiles(folder, own);
-            var files = new RelayFiles(own, RelayService.DataDir(name), folder);
+            RemoveOldFiles(folder, own);
+            var files = new RelayFiles(RelayService.DataDir(name), folder);
             using var log = new RelayLog(own);
             string lastWindowError = "";
             long lastWindowErrorAt = 0;
@@ -68,14 +68,14 @@ namespace KovaRelay
                 long now = Environment.TickCount64;
                 if (what == lastWindowError && now - lastWindowErrorAt < 60_000) return;
                 lastWindowError = what; lastWindowErrorAt = now;
-                log.Write("Something unexpected went wrong in the window: " + what.Replace(Environment.NewLine, " | "));
+                log.Write("An unexpected error occurred in the relay window: " + what.Replace(Environment.NewLine, " | "));
             };
             AppDomain.CurrentDomain.UnhandledException += (_, e) => { log.Write("The relay stopped because of an unexpected error: " + e.ExceptionObject); log.Flush(); };
 
             using var app = new TrayApp(files, log);
             // Test switch: KOVA_RELAY_LOOPBACK=1 listens on 127.0.0.1 only (no firewall prompt, nothing reachable from outside).
             app.Server.LoopbackOnly = Environment.GetEnvironmentVariable("KOVA_RELAY_LOOPBACK") == "1";
-            app.Begin(hostsMoved);
+            app.Begin();
             ThreadPool.RegisterWaitForSingleObject(openEvent, (_, _) => app.OpenWindowFromAnyThread(), null, -1, false);
             Application.Run(app);
             return 0;
@@ -85,27 +85,17 @@ namespace KovaRelay
         private static extern bool AllowSetForegroundWindow(int processId);
 
         /// <summary>
-        /// 4.4.0 kept hosts.txt and its log beside the exe: the host list is copied into this user's folder (if it has
-        /// none yet), and what can be deleted without administrator rights goes. True when nothing of the host list is
-        /// left to lose, so the elevated move may delete what is still there.
+        /// Older versions kept a host name list (hosts.txt) beside the exe or in this user's folder, and 4.4.0 kept its log
+        /// beside the exe. The relay no longer uses a host list: whatever can be deleted without administrator rights
+        /// goes, quietly. Nothing here can fail the start.
         /// </summary>
-        private static bool MoveOldFiles(string exeFolder, string own)
+        private static void RemoveOldFiles(string exeFolder, string own)
         {
-            if (string.Equals(Path.GetFullPath(exeFolder).TrimEnd('\\'), Path.GetFullPath(own).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return false;
-            bool moved = true;
-            try
-            {
-                string from = Path.Combine(exeFolder, "hosts.txt"), to = Path.Combine(own, "hosts.txt");
-                if (File.Exists(from))
-                {
-                    if (!File.Exists(to)) File.Copy(from, to);
-                    try { File.Delete(from); } catch (Exception) { }
-                }
-            }
-            catch (Exception) { moved = false; }
-            foreach (string f in new[] { "relay-log.txt", "relay-log.old.txt" })
+            try { File.Delete(Path.Combine(own, "hosts.txt")); } catch (Exception) { }
+            try { File.Delete(Path.Combine(own, "hosts.txt.tmp")); } catch (Exception) { }
+            if (string.Equals(Path.GetFullPath(exeFolder).TrimEnd('\\'), Path.GetFullPath(own).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return;
+            foreach (string f in new[] { "hosts.txt", "relay-log.txt", "relay-log.old.txt" })
                 try { File.Delete(Path.Combine(exeFolder, f)); } catch (Exception) { }
-            return moved;
         }
 
         /// <summary>Whether 4.4.0 left anything beside the exe that only an administrator can move or delete.</summary>
@@ -148,7 +138,7 @@ namespace KovaRelay
         {
             Files = files;
             Log = log;
-            Server = new RelayServer(files, log);
+            Server = new RelayServer(log);
             AppIcon = LoadIcon();
             // A WinForms control first, so this thread has the WinForms synchronization context.
             _form = new OptionsForm(this);
@@ -175,11 +165,11 @@ namespace KovaRelay
         /// <summary>A word for the status box about moving 4.4.0's files (null once there is nothing to say).</summary>
         public string? MoveNote { get; private set; }
 
-        public void Begin(bool hostsMoved)
+        public void Begin()
         {
             if (ServiceMode)
             {
-                Log.Write($"Kova Relay {Program.Version} opened its tray icon; the relay itself runs as the service {ServiceName}.");
+                Log.Write($"Kova Relay {Program.Version} opened its tray icon. The relay itself runs as the Windows service {ServiceName}.");
                 UpdateTip();
                 _tipTimer.Start();
             }
@@ -191,62 +181,57 @@ namespace KovaRelay
                 UpdateTip();
                 _tipTimer.Start();
                 if (why is not null)
-                    _tray.Notify($"Kova Relay could not start. {why} Open the relay from its tray icon to choose another port.", warning: true);
-                else if (Files.Problem is not null)
-                    _tray.Notify("Kova Relay is running, but it cannot save its host list, so new host names last only until it closes.", warning: true);
+                    _tray.Notify($"Kova Relay could not start. {why} Open the relay window from its tray icon to choose another port.", warning: true);
             }
-            if (Program.OldFilesLeft(Files)) _ = MoveOldSettingsAsync(hostsMoved);
+            if (Program.OldFilesLeft(Files)) _ = MoveOldSettingsAsync();
         }
 
         /// <summary>
         /// 4.4.0's port.txt (and relay-settings.txt) is moved into settings.json once and deleted, by an elevated copy:
-        /// only administrators may write the relay's settings. Turned down, the relay keeps using what they say and
-        /// asks again the next time it starts.
+        /// only administrators may write the relay's settings. If permission is not given, the relay keeps using what
+        /// they say and asks again the next time it starts.
         /// </summary>
-        private async System.Threading.Tasks.Task MoveOldSettingsAsync(bool hostsMoved)
+        private async System.Threading.Tasks.Task MoveOldSettingsAsync()
         {
             RelaySettings before = Files.LoadSettings();
-            var r = await System.Threading.Tasks.Task.Run(() => RelayService.RunElevated($"--settings-migrate {ServiceName}" + (hostsMoved ? " --hosts-moved" : "")));
+            var r = await System.Threading.Tasks.Task.Run(() => RelayService.RunElevated($"--settings-migrate {ServiceName}"));
             if (r == RelayService.Result.Ok)
             {
                 MoveNote = null;
-                Log.Write($"Moved the port ({before.Port}) and settings from 4.4.0's files into {Files.SettingsFile}, and deleted those files.");
-                _tray.Notify($"Kova Relay moved its port, {before.Port}, from port.txt into its own settings. Change it in the relay's window from now on.");
+                Log.Write($"Moved the port ({before.Port}) from 4.4.0's files into {Files.SettingsFile}, and deleted those files.");
+                _tray.Notify($"Kova Relay moved its port setting, {before.Port}, from port.txt into its settings file. Change the port in the relay window from now on.");
             }
             else
             {
-                MoveNote = $"Kova Relay still uses port {before.Port} from port.txt, the file older versions kept beside the relay. Moving it into the relay's settings needs administrator permission, which was not given. It asks again the next time it starts.";
+                MoveNote = $"Kova Relay still uses port {before.Port} from port.txt, the file older versions kept beside the relay. Moving it into the relay's settings file needs administrator permission, which was not given. The relay asks again the next time it starts.";
                 Log.Write("Could not move 4.4.0's port.txt into settings.json: " + RelayService.Say(r, ""));
             }
         }
 
         /// <summary>What the window and tooltip show: the relay in this process, or the service.</summary>
-        public sealed record View(RelaySnapshot Snap, bool AllowNew, string Text, bool Service);
+        public sealed record View(RelaySnapshot Snap, string Text, bool Service);
 
         public View Current(string? note)
         {
             if (!ServiceMode)
             {
                 RelaySnapshot s = Server.Snapshot();
-                return new View(s, Server.AllowNewNames, OptionsForm.StatusText(s, Files.Problem, MoveNote is null ? note : note is null ? MoveNote : MoveNote + " " + note), false);
+                return new View(s, OptionsForm.StatusText(s, MoveNote is null ? note : note is null ? MoveNote : MoveNote + " " + note), false);
             }
             int state = RelayService.State(ServiceName);
-            var status = RelayService.ReadStatus(ServiceName);
-            string where = $"Its settings, host list and log are kept in {RelayService.DataDir(ServiceName)}.";
+            RelaySnapshot? status = RelayService.ReadStatus(ServiceName);
+            string where = $"Its settings and log are kept in {RelayService.DataDir(ServiceName)}.";
             var parts = new System.Collections.Generic.List<string>();
             RelaySnapshot snap;
-            bool allow = true;
-            if (state == RelayService.Running && status is { } st)
+            if (state == RelayService.Running && status is not null)
             {
-                snap = st.Snap;
-                allow = st.AllowNew;
+                snap = status;
                 if (snap.Running)
                 {
-                    parts.Add($"Running as a Windows service on port {snap.Port}.");
+                    parts.Add($"The relay is running as a Windows service on port {snap.Port}.");
                     parts.Add(OptionsForm.CountsText(snap));
                 }
-                else parts.Add("The relay service is running, but it is not relaying. " + (snap.Problem ?? ""));
-                if (st.FilesProblem is not null) parts.Add(st.FilesProblem);
+                else parts.Add("The relay service is running, but it is not accepting connections. " + (snap.Problem ?? ""));
             }
             else
             {
@@ -261,7 +246,7 @@ namespace KovaRelay
             parts.Add(where);
             if (MoveNote is not null) parts.Add(MoveNote);
             if (note is not null) parts.Add(note);
-            return new View(snap, allow, string.Join(" ", parts), true);
+            return new View(snap, string.Join(" ", parts), true);
         }
 
         public void UpdateTip()
@@ -269,7 +254,7 @@ namespace KovaRelay
             View v = Current(null);
             RelaySnapshot s = v.Snap;
             string state = !s.Running ? "stopped"
-                : $"port {s.Port}, " + (s.Hosts switch { 0 => "no hosts", 1 => "1 host", _ => $"{s.Hosts} hosts" });
+                : $"port {s.Port}, " + (s.Hosts switch { 0 => "no hosts connected", 1 => "1 host connected", _ => $"{s.Hosts} hosts connected" });
             if (v.Service) state = (s.Running ? "service, " : "service ") + state;
             // Windows 11 already puts the program's name in front of a tray tooltip (measured: UIA and NVDA read
             // "Kova Relay Kova Relay, port 47200" otherwise); Windows 10 shows the tip as it is.

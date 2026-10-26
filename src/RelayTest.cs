@@ -132,8 +132,8 @@ namespace TailRemote
                 var fakeSaid = new ConcurrentQueue<string>();
                 fake = new Host(hostPort + 1, "another-password", null, s => fakeSaid.Enqueue(s));
                 fake.UseRelay(Relay.Parse(address, relayPort, out _));
-                for (int i = 0; i < 100 && !fakeSaid.Any(s => s.Contains("already uses the name")); i++) Thread.Sleep(100);
-                Check(!fake.RelayRegistered && fakeSaid.Any(s => s.Contains("already uses the name")), "another host claiming the name " + Name + " was refused");
+                for (int i = 0; i < 100 && !fakeSaid.Any(s => s.Contains("already hosting")); i++) Thread.Sleep(100);
+                Check(!fake.RelayRegistered && fakeSaid.Any(s => s.Contains("already hosting")), "another host claiming the name " + Name + " was refused");
                 fake.Dispose(); fake = null;
                 // ...and the real host is still the one reached.
                 using (var again = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
@@ -152,6 +152,25 @@ namespace TailRemote
                 for (int i = 0; i < 30; i++) if (Relay.Check("127.0.0.1:" + relayPort, null).Up) pings++;
                 using (var stillIn = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
                     Check(pings == 30 && !stillIn.ListenOnly, "30 relay checks in a row are all answered and never get this PC blocked (" + pings + ")");
+
+                // 4.6: by password, as NVDA Remote: the host is on the relay under the code made from its password, and a
+                // controlling PC that types only the relay's address and that password reaches it; another password does not.
+                using (var byPw = new Host(hostPort + 3, "second-pc-password", "second-pc-listen", _ => { }))
+                {
+                    byPw.UseRelay(Relay.Parse(Relay.Channel("second-pc-password") + "@127.0.0.1:" + relayPort, relayPort, out _),
+                        Relay.Parse(Relay.Channel("second-pc-listen") + "@127.0.0.1:" + relayPort, relayPort, out _));
+                    for (int i = 0; i < 100 && !byPw.RelayRegistered; i++) Thread.Sleep(100);
+                    Check(byPw.RelayRegistered, "a host registered on the relay by its password, with no name");
+                    using (var pwClient = Client.Connect("@127.0.0.1:" + relayPort, Protocol.DefaultPort, "second-pc-password", new Player(Player.NoDevice, _ => { }), _ => { }))
+                        Check(!pwClient.ListenOnly, "a controlling PC reached it with only the relay's address and the password");
+                    try { Client.Connect("@127.0.0.1:" + relayPort, Protocol.DefaultPort, "a-password-nobody-uses", new Player(Player.NoDevice, _ => { }), _ => { }).Dispose(); Check(false, "a password no PC hosts with reached nothing"); }
+                    catch (InvalidOperationException e) { Check(e.Message.StartsWith("No PC is hosting on this relay with that password"), "a password no PC hosts with reached nothing (" + e.Message + ")"); }
+                    Thread.Sleep(1500); // the listen-only registration is a second line to the relay
+                    using (var listener = Client.Connect("@127.0.0.1:" + relayPort, Protocol.DefaultPort, "second-pc-listen", new Player(Player.NoDevice, _ => { }), _ => { }))
+                        Check(listener.ListenOnly, "the listen-only password reaches the same PC through the relay, listening only");
+                    var seen = Relay.Check("127.0.0.1:" + relayPort, Relay.Channel("second-pc-password"));
+                    Check(seen.HostHere == true && !seen.Said.Contains(Relay.Channel("second-pc-password")), "the relay check finds the PC by password and never says the code (" + seen.Said + ")");
+                }
 
                 // 4.5: a host reachable only through the relay: in through the relay, never directly.
                 string onlyName = "relayonly-" + Guid.NewGuid().ToString("N")[..6];

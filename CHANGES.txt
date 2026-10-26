@@ -1,3 +1,15 @@
+4.6.0
+New feature: Kova Relay works like NVDA Remote. There are no names to choose: the password itself pairs the two PCs. Each PC you host gets its own password, and the password you type decides which PC you reach. The password never goes to the relay; the relay only sees a code made from it.
+New feature: Connect to a PC no longer asks how to connect. Enter the address of the PC or of a Kova Relay and the password, and Kova finds the way by itself.
+New feature: saved PCs can have a name, such as Office PC. In Connect to a PC, Edit PC changes a saved PC's name, address and password, and Delete PC removes it.
+Changed: connecting and hosting now start only from Connect to a PC and Host this PC. The File menu no longer has Mode, Saved PCs, Address, Port, Password, Listen-only password, the relay settings, Save this PC or Forget. While you are connected or hosting, the File menu has Disconnect or Stop hosting.
+Changed: Kova Relay no longer has Allow new host names or a list of host names. Its window lists the hosts connected now, by address. A PC can use a password on the relay as long as no other PC is already hosting there with the same password.
+Changed: new wording throughout the menus, the step-by-step windows, messages and the guide.
+Important: hosting through a relay now needs Kova 4.6 on both PCs and Kova Relay 4.6. After you update a PC that hosted through a relay with a name, connect to it with Connect to a PC: enter just the relay address and that PC's password.
+New feature: the relay limits how many times one address can ask for a PC that is not there, so it cannot be used to guess passwords.
+New feature: the listen-only password works through a relay too.
+Bug fixed: Get the remote PC's clipboard and Get files did nothing on most PCs, because Kova wrongly believed the remote PC's screen was locked. They work again, and if the remote PC really is locked, Kova now says so instead of staying silent.
+
 4.5.1
 Changed: text the remote PC sends with Send the clipboard goes straight onto your clipboard again, replacing what was there, as it did before 4.4. It is no longer saved as a file, and Put the text the remote PC sent on this clipboard is gone from the Clipboard menu.
 
@@ -286,7 +298,7 @@ Changed: the screen is only taken while you watch it. It is off unless you open 
 Changed: Kova 2.3 and 3.0 still connect to each other. Only seeing the screen needs both PCs on 3.0.
 
 2.3.0
-Changed: TailRemote is now called Kova. It works on any network, not just Tailscale, and video is on the way. The download is Kova-x64.exe or Kova-arm64.exe, files you receive go to Downloads, Kova, and the project lives at github.com/ce2004/kova.
+Changed: TailRemote is now called Kova. It works on any network, and video is on the way. The download is Kova-x64.exe or Kova-arm64.exe, files you receive go to Downloads, Kova, and the project lives at github.com/ce2004/kova.
 Changed: be careful updating to Kova, and have another way to control each PC before you start, such as Remote Desktop or someone sitting at it. TailRemote cannot update itself to Kova: download Kova from github.com/ce2004/kova on every PC. Kova starts with fresh settings, so set your password again and add your saved PCs again. On a PC that runs TailRemote as a Windows service, turn off Run as a Windows service in TailRemote first, then open Kova, set the same password and turn it on there. Doing that cuts off the TailRemote connection to that PC, so do it with your other way in. Every PC must be on Kova: older versions cannot connect to it and say the other PC has a different version.
 New feature: File, Update the remote PC now updates the other PC to the newest version on GitHub, even before this PC has it, so next time you can update a remote PC from here first.
 Changed: when Kova runs as a Windows service, Get files, sending files into a folder you choose, and browsing the remote PC's folders now have only the signed-in user's rights, never full control of the PC. When nobody is signed in there, Kova says so.
@@ -470,7 +482,7 @@ Bug fixed: with the service hosting, files from Send files went into a hidden sy
 Bug fixed: This PC's IP address shared its Alt S shortcut with Start hosting. It is now Alt R.
 
 1.8.15
-New feature: when hosting, This PC's IP address (Alt S) shows, right before the password, the addresses the other PC can connect to: the home network one, the Tailscale one and the PC's name. Copy IP address (Alt Y) puts the home network address on the clipboard, or the Tailscale one if there is no home network.
+New feature: when hosting, This PC's IP address (Alt S) shows, right before the password, the addresses the other PC can connect to: the home network one, any VPN address and the PC's name. Copy IP address (Alt Y) puts the home network address on the clipboard, or the VPN one if there is no home network.
 
 1.8.14
 Bug fixed: connecting by a LAN address could give keys but no sound, if the remote PC answered from another of its addresses on that network. Sound is now accepted from any of the remote PC's addresses (every packet is still encrypted and checked).
@@ -485,7 +497,7 @@ Changed: each file now travels on its own connection and thread, up to 16 at onc
 1.8.12
 Bug fixed: if the connection damaged, dropped or held up data (as Clumsy does), Send the clipboard and Send files could get stuck for good, or silently do nothing until you reconnected. Now a transfer survives it: whatever did not arrive is sent again, a connection that dies or stalls for 10 seconds is reopened at once, and the transfer carries on from where it was, even if the main connection drops and reconnects. Only a whole minute with nothing getting through gives up, and both PCs then say so.
 Changed: the sending PC only says a transfer worked once the other PC has confirmed every piece arrived, so the two PCs always agree.
-Changed: much faster. Files go over up to 16 connections at once, each with its own threads, so several files, or parts of one big file, travel side by side and every processor core helps. On a home network or a direct Tailscale link, TailRemote notices and starts fast, then doubles its speed until the sound would suffer. On a slow line it uses fewer connections and smaller pieces, so nothing piles up and the sound stays live.
+Changed: much faster. Files go over up to 16 connections at once, each with its own threads, so several files, or parts of one big file, travel side by side and every processor core helps. On a home network or a direct VPN link, TailRemote notices and starts fast, then doubles its speed until the sound would suffer. On a slow line it uses fewer connections and smaller pieces, so nothing piles up and the sound stays live.
 Changed: clipboard text now goes the same safe way as files, so it is never lost when the connection hiccups.
 Changed: transfers are no longer spoken. The Files line shows them, and the sounds tell you when they start and end, so lots of them cannot flood your screen reader.
 Bug fixed: sending lots of files at once, or two files with the same name from different folders, could fail. The second one now arrives as name (2).
@@ -498,7 +510,7 @@ Bug fixed: each event's sound played on a different instrument every time. Defau
 Changed: nothing is shared by itself any more. Both PCs have two buttons. Send the clipboard (Alt B) sends what is on your clipboard (text, or files and folders you copied) to the other PC's clipboard, ready to paste with Control V. Send files (Alt I) sends files you choose to Downloads, TailRemote on the other PC, never over anything already there. The Share clipboard box is gone.
 Bug fixed: the wrong sound could play for an event. Clipboard text played a file sound, and stopping or replacing a transfer on purpose played the error sound. Now the clipboard has its own sounds, files have theirs, and the error sound is only for real failures.
 Bug fixed: the PC that sent a file could say it failed while the other PC still said it was receiving. A short pause in the connection no longer stops a transfer, a connection that really breaks is noticed by both PCs at once, and the Files line goes back to idle by itself.
-Changed: files go much faster. The speed only backs off when the sound actually suffers, not whenever the ping wobbles, which over Tailscale and Wi-Fi it always does.
+Changed: files go much faster. The speed only backs off when the sound actually suffers, not whenever the ping wobbles, which over a VPN and Wi-Fi it always does.
 
 1.8.9
 Changed: file progress is now the Files line, right after Streaming as you Tab through the window, followed by the progress bar and Stop the file transfer. It shows what is being sent or received, how much is done, the speed and the time left. The separate File transfer tab, which only Control Tab could reach, is gone.
@@ -641,11 +653,11 @@ New feature: Saved PCs. Save an address, port and password, and pick it from the
 New feature: sound uses about half the data, with no change at all to how it sounds.
 
 1.3.0
-New feature: everything TailRemote sends is encrypted, so you can connect with or without Tailscale, for example straight to a cloud PC's address.
+New feature: everything TailRemote sends is encrypted, so you can connect over any network, for example straight to a cloud PC's address.
 New feature: Port editor opens and closes TailRemote's ports in Windows Firewall. It remembers every port TailRemote has used, so you can still close an old one after changing the port.
 New feature: starting to host offers to open the port if Windows Firewall would keep other PCs out.
 Changed: passwords need at least 5 characters, both for hosting and for connecting.
-Changed: the Only accept Tailscale connections checkbox is gone. Anyone who knows the password can connect.
+Changed: the Only accept VPN connections checkbox is gone. Anyone who knows the password can connect.
 Changed: Start hosting when Windows starts no longer adds its own firewall rule, and removes the one older versions added. Use Port editor instead.
 
 1.2.0
@@ -660,17 +672,17 @@ Bug fixed: pressing Stop reconnecting could still connect a moment later.
 Bug fixed: TailRemote could crash when closing while hosting.
 Bug fixed: messages from the host, such as audio problems, are now spoken, not only written in the log.
 Bug fixed: turning on Start hosting when Windows starts made the window stop responding while it worked.
-Changed: the port is a plain edit box. A port that is not a number, or one other programs rely on (Remote Desktop, VNC, NVDA Remote, Tailscale), is refused with the reason. If another program is already using the port, hosting says so instead of starting.
+Changed: the port is a plain edit box. A port that is not a number, or one other programs rely on (Remote Desktop, VNC, NVDA Remote, VPN programs), is refused with the reason. If another program is already using the port, hosting says so instead of starting.
 Bug fixed: setting up the audio device also left VB-Cable's second output, CABLE In 16 Ch, switched on. It is turned off now, so only TailRemote is left. If you already set it up, press Set up audio device again to tidy it.
 Bug fixed: setting up the audio device left its download in the Temp folder. It is deleted now.
 
 1.1.0
 New feature: Set up audio device, in Host mode, gives a PC with no sound card an output called TailRemote and makes it the default, so you can hear it. A progress window downloads VB-Cable, a free virtual audio device, checks it is genuine and opens its installer: press Install Driver and the rest happens by itself.
 New feature: hosting on a PC with no sound output starts the audio device setup by itself.
-New feature: if connecting fails, TailRemote says why: Tailscale is not signed in on this PC, the name was not found, the other PC is not hosting, or it is not answering.
+New feature: if connecting fails, TailRemote says why: the network is not available, the name was not found, the other PC is not hosting, or it is not answering.
 
 1.0.0
-First release: control another Windows PC over Tailscale with your whole keyboard, and hear everything it plays in 16-bit 44.1 kHz.
+First release: control another Windows PC over a private network with your whole keyboard, and hear everything it plays in 16-bit 44.1 kHz.
 Control Shift Enter switches between the remote PC and this one.
 The audio buffer sets itself: it measures your connection and keeps the delay as low as it can without breaking up.
 A lost audio packet fades out smoothly instead of clicking.

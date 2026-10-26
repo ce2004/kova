@@ -40,9 +40,9 @@ namespace KovaRelay
             try
             {
                 Directory.CreateDirectory(dir);
-                var files = new RelayFiles(dir, dir, null);
+                var files = new RelayFiles(dir, null);
                 log = new RelayLog(dir);
-                server = new RelayServer(files, log) { LoopbackOnly = true };
+                server = new RelayServer(log) { LoopbackOnly = true };
                 StartOnFreePort(server, files);
                 done.Add($"listening on 127.0.0.1:{_port}");
                 RunAll(server, files, done);
@@ -53,7 +53,10 @@ namespace KovaRelay
                 log.Flush();
                 string logText = File.ReadAllText(log.Path);
                 Check(logText.Contains("connected from") && logText.Contains("Blocked 127.0.0.250"), "the log is missing expected lines");
-                done.Add("no unexpected errors, nothing thrown");
+                Check(logText.Contains("another PC is already hosting with the same password"), "the log does not say a second PC tried to host with the same password");
+                Check(!logText.Contains("office-pc", StringComparison.OrdinalIgnoreCase), "the log shows a host name");
+                Check(!File.Exists(Path.Combine(dir, "hosts.txt")), "the relay wrote a hosts.txt");
+                done.Add("no unexpected errors, nothing thrown, no host names in the log, no hosts.txt");
                 File.WriteAllText(outFile, "ok, " + string.Join("; ", done) + Environment.NewLine);
                 return 0;
             }
@@ -73,22 +76,26 @@ namespace KovaRelay
             }
         }
 
-        /// <summary>settings.json round trip, the default with nothing saved, and 4.4.0's files read until settings.json exists.</summary>
+        /// <summary>settings.json round trip, the default with nothing saved, 4.4.0's port.txt read until settings.json
+        /// exists, and an older settings.json that still has AllowNewHostNames loads fine.</summary>
         private static void CheckSettings(RelayFiles files)
         {
-            string old = Path.Combine(files.HostsFolder, "old");
+            string old = Path.Combine(files.SettingsFolder, "old");
             Directory.CreateDirectory(old);
-            var legacy = new RelayFiles(files.HostsFolder, Path.Combine(files.HostsFolder, "settings"), old);
-            Check(legacy.LoadSettings() == new RelaySettings(47200, true), "with nothing saved, the relay did not use port 47200");
+            var legacy = new RelayFiles(Path.Combine(files.SettingsFolder, "settings"), old);
+            Check(legacy.LoadSettings() == new RelaySettings(47200), "with nothing saved, the relay did not use port 47200");
             File.WriteAllText(Path.Combine(old, "port.txt"), "47321\r\n");
             File.WriteAllText(Path.Combine(old, "relay-settings.txt"), "allow-new-host-names=no\r\n");
             Check(legacy.HasOldSettings, "4.4.0's port.txt was not noticed");
-            Check(legacy.LoadSettings() == new RelaySettings(47321, false), "4.4.0's port.txt and relay-settings.txt were not read");
+            Check(legacy.LoadSettings() == new RelaySettings(47321), "4.4.0's port.txt was not read");
             Directory.CreateDirectory(legacy.SettingsFolder);
-            Check(legacy.SaveSettings(new RelaySettings(47555, true)), "settings.json could not be written");
-            Check(legacy.LoadSettings() == new RelaySettings(47555, true), "settings.json did not win over 4.4.0's files");
-            File.WriteAllText(legacy.SettingsFile, "{ \"Port\": 99999, \"AllowNewHostNames\": false }");
-            Check(legacy.LoadSettings() == new RelaySettings(47200, false), "a bad port in settings.json was not replaced by 47200");
+            Check(legacy.SaveSettings(new RelaySettings(47555)), "settings.json could not be written");
+            Check(legacy.LoadSettings() == new RelaySettings(47555), "settings.json did not win over 4.4.0's files");
+            Check(!File.ReadAllText(legacy.SettingsFile).Contains("AllowNewHostNames"), "settings.json still has AllowNewHostNames");
+            File.WriteAllText(legacy.SettingsFile, "{ \"Port\": 47600, \"AllowNewHostNames\": false }");
+            Check(legacy.LoadSettings() == new RelaySettings(47600), "an older settings.json with AllowNewHostNames did not load");
+            File.WriteAllText(legacy.SettingsFile, "{ \"Port\": 99999, \"AllowNewHostNames\": true }");
+            Check(legacy.LoadSettings() == new RelaySettings(47200), "a bad port in settings.json was not replaced by 47200");
             File.WriteAllText(legacy.SettingsFile, "not json");
             Check(legacy.LoadSettings().Port == 47321, "a broken settings.json did not fall back");
         }
@@ -164,24 +171,33 @@ namespace KovaRelay
             WaitFor(() => server.Snapshot().ControllingPcs == 0, 3000, "the pair did not go away when one side closed");
             done.Add("closing one side closed the pair");
 
-            // 4. Another key claiming the same name is refused.
+            // 4. Another key claiming the same name while its host is connected is refused, and the first host keeps it.
             var squatter = new FakeHost("OFFICE-pc", keyB);
             (t, b) = squatter.Register();
-            Check(IsRefused(t, b, Wire.Reason.NameTaken), $"a second key for the same name got {Describe(t, b)}");
+            Check(IsRefused(t, b, Wire.Reason.NameTaken), $"a second key for a name in use got {Describe(t, b)}");
             squatter.Dispose();
-            done.Add("another key for a taken name was refused NameTaken");
+            Check(!host.LineClosed.Wait(300), "the first host was disconnected when another key asked for its name");
+            done.Add("another key for a name in use was refused NameTaken, and the first host stayed connected");
 
-            // 5. The right key registering again replaces the old line.
+            // 5. The same key registering again replaces the old line.
             var host2 = new FakeHost("office-pc", keyA);
             (t, b) = host2.Register();
-            Check(t == Wire.Ok, $"re-registering with the right key got {Describe(t, b)}");
+            Check(t == Wire.Ok, $"re-registering with the same key got {Describe(t, b)}");
             host2.StartReading();
             Check(host.LineClosed.Wait(3000), "the old host line was not closed when the host registered again");
             host.Dispose();
             var (c2, h2, _) = Pair(host2, "office-pc", "127.0.0.1");
             Exchange(c2, h2, 64 << 10);
             c2.Dispose(); h2.Dispose();
-            done.Add("re-registering replaced the old line, and the new one pairs");
+            WaitFor(() => server.Snapshot().Hosts == 1, 3000, "the relay did not count exactly one host after it re-registered");
+            {
+                var rows = server.Snapshot().Rows;
+                Check(rows.Count == 1 && rows[0].Address == "127.0.0.1", "the list of connected hosts is wrong");
+                string line = OptionsForm.RowText(rows[0]);
+                Check(line.StartsWith("Host connected from 127.0.0.1 since ", StringComparison.Ordinal) && !line.Contains("office", StringComparison.OrdinalIgnoreCase),
+                    $"a host line in the window reads \"{line}\"");
+            }
+            done.Add("re-registering with the same key replaced the old line, and the new one pairs; the window lists it by address only");
 
             // 6. A bad signature, and a key that is not P-256.
             var forger = new FakeHost("forged", keyA);
@@ -229,19 +245,9 @@ namespace KovaRelay
             }
             done.Add("unknown name refused NoSuchHost");
 
-            // 9. New names off.
-            server.AllowNewNames = false;
-            using (ECDsa keyC = ECDsa.Create(ECCurve.NamedCurves.nistP256))
-            {
-                var newcomer = new FakeHost("brand-new", keyC);
-                (t, b) = newcomer.Register();
-                Check(IsRefused(t, b, Wire.Reason.NewNamesOff), $"a new name with new names off got {Describe(t, b)}");
-                newcomer.Dispose();
-            }
-            server.AllowNewNames = true;
+            // 9. Settings.
             CheckSettings(files);
-            done.Add("settings.json saved and read back; 4.4.0's port.txt and relay-settings.txt read until moved");
-            done.Add("new name refused NewNamesOff while new names were off");
+            done.Add("settings.json saved and read back; an older one with AllowNewHostNames loads; 4.4.0's port.txt read until moved");
 
             // 10. A frame with length 65535 is refused at once, without the relay waiting for its body.
             {
@@ -330,24 +336,26 @@ namespace KovaRelay
             }
             done.Add("one waiting connection too many from an address got Busy");
 
-            // 15. Forgetting a name drops that host and frees the name for another key.
-            Check(server.Forget("Office-PC"), "forgetting the name failed");
-            Check(host2.LineClosed.Wait(3000), "the forgotten host was not disconnected");
+            // 15. Once the host holding a name disconnects, a host with a different key can take it, and pairs.
             host2.Dispose();
+            WaitFor(() => server.Snapshot().Hosts == 0, 5000, "the relay still counts a host after it disconnected");
             var newOwner = new FakeHost("office-pc", keyB);
             (t, b) = newOwner.Register();
-            Check(t == Wire.Ok, $"another key taking a forgotten name got {Describe(t, b)}");
-            newOwner.Dispose();
-            done.Add("forgetting a name disconnected its host and freed the name");
+            Check(t == Wire.Ok, $"another key taking a name nobody holds now got {Describe(t, b)}");
+            newOwner.StartReading();
+            var (c4, h4, _) = Pair(newOwner, "Office-PC", "127.0.0.1");
+            Exchange(c4, h4, 64 << 10);
+            c4.Dispose(); h4.Dispose();
+            done.Add("after the first host disconnected, a host with a different key took the name and paired");
 
-            // 16. hosts.txt holds the names with key hashes.
-            server.Dispose();   // saves hosts.txt now
-            string hosts = File.ReadAllText(files.HostsFile);
-            string hashB = Convert.ToHexString(SHA256.HashData(keyB.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
-            Check(hosts.Contains("office-pc," + hashB) && hosts.Contains("sleepy,"), "hosts.txt does not hold the pinned names");
-            var reloaded = files.LoadPins(1000);
-            Check(reloaded.ContainsKey("office-pc") && reloaded["office-pc"].KeyHash == hashB, "hosts.txt did not load back");
-            done.Add("hosts.txt saved and loaded back");
+            // 16. ...and now the first key is the one refused, while the new holder is connected.
+            var former = new FakeHost("office-pc", keyA);
+            (t, b) = former.Register();
+            Check(IsRefused(t, b, Wire.Reason.NameTaken), $"the former key asking for a name in use got {Describe(t, b)}");
+            former.Dispose();
+            Check(!newOwner.LineClosed.Wait(300), "the new holder was disconnected when the former key asked for the name");
+            newOwner.Dispose();
+            done.Add("the former key was refused NameTaken while the new holder was connected");
         }
 
         // ------------------------------------------------------------------ helpers

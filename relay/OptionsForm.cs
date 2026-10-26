@@ -13,9 +13,12 @@ using TailRemote;
 namespace KovaRelay
 {
     /// <summary>
-    /// The relay's one window. Tab goes: status, port, Use this port, Port editor, Stop/Start, Allow new host names,
-    /// hosts list, Forget this host name, Start with Windows, Run as a Windows service, Open the log, Exit the relay. Escape or the close button only hide
-    /// it; the relay keeps running in the tray.
+    /// The relay's one window. Tab goes: status, port, Use this port, Port editor, Stop/Start, the read-only list of
+    /// hosts connected now, Start with Windows, Run as a Windows service, Open the log, Exit the relay. Escape or the
+    /// close button only hide it; the relay keeps running in the tray.
+    ///
+    /// The list shows where each host connected from and since when, never its name: Kova derives the name from the
+    /// hosted PC's password, so it means nothing to a person.
     /// </summary>
     internal sealed class OptionsForm : Form
     {
@@ -28,15 +31,12 @@ namespace KovaRelay
         private readonly Button _usePort = new();
         private readonly Button _portEditor = new();
         private readonly Button _startStop = new();
-        private readonly SpokenCheckBox _allowNew = new();
         private readonly ListBox _hosts = new();
-        private readonly Button _forget = new();
         private readonly SpokenCheckBox _startWithWindows = new();
         private readonly SpokenCheckBox _asService = new();
         private readonly Button _openLog = new();
         private readonly Button _exit = new();
         private readonly System.Windows.Forms.Timer _timer = new() { Interval = 2000 };
-        private List<HostRow> _rows = new();
         private bool _settingChecks;
         private string? _note;          // the last thing a button did, shown at the end of the status
         public bool ReallyClose;
@@ -101,28 +101,13 @@ namespace KovaRelay
             Controls.Add(_startStop);
             y += 36;
 
-            _allowNew.Text = "&Allow new host names";
-            _allowNew.AutoSize = true;
-            _allowNew.Location = new Point(x, y);
-            _allowNew.TabIndex = tab++;
-            _allowNew.CheckedChanged += (_, _) => AllowNewChanged();
-            Controls.Add(_allowNew);
-            y += 30;
-
-            L("&Hosts", y); y += 20;
+            L("&Hosts connected now", y); y += 20;
             _hosts.SetBounds(x, y, w, 120);
-            _hosts.AccessibleName = "Hosts";
+            _hosts.AccessibleName = "Hosts connected now";
             _hosts.IntegralHeight = false;
             _hosts.TabIndex = tab++;
             Controls.Add(_hosts);
-            y += 128;
-
-            _forget.Text = "&Forget this host name";
-            _forget.SetBounds(x, y, 180, 27);
-            _forget.TabIndex = tab++;
-            _forget.Click += (_, _) => Forget();
-            Controls.Add(_forget);
-            y += 38;
+            y += 132;
 
             _startWithWindows.Text = "Start with &Windows";
             _startWithWindows.AutoSize = true;
@@ -200,7 +185,6 @@ namespace KovaRelay
             try
             {
                 TrayApp.View v = _app.Current(null);
-                _allowNew.Checked = v.AllowNew;
                 _startWithWindows.Checked = ReadStartWithWindows();
                 _asService.Checked = v.Service;
             }
@@ -224,34 +208,33 @@ namespace KovaRelay
             string ex = view.Service ? "E&xit the tray icon (the service keeps running)" : "E&xit the relay";
             if (_exit.Text != ex) _exit.Text = ex;
 
-            var rows = snap.Rows.ToList();
-            string[] items = rows.Count == 0 ? new[] { "No hosts have registered yet." } : rows.Select(RowText).ToArray();
+            // Rebuilt only when a line changed, so NVDA does not repeat the list every 2 seconds. The selection stays on
+            // the same line text if it is still there, otherwise at the same position.
+            string[] items = snap.Rows.Count == 0 ? new[] { "No hosts are connected." } : snap.Rows.Select(RowText).ToArray();
             string[] now = _hosts.Items.Cast<string>().ToArray();
             if (force || !items.SequenceEqual(now))
             {
-                string? selectedName = _hosts.SelectedIndex >= 0 && _hosts.SelectedIndex < _rows.Count ? _rows[_hosts.SelectedIndex].Name : null;
+                string? selected = _hosts.SelectedItem as string;
                 int keepIndex = Math.Max(0, _hosts.SelectedIndex);
                 _hosts.BeginUpdate();
                 _hosts.Items.Clear();
                 _hosts.Items.AddRange(items);
-                int sel = selectedName is null ? -1 : rows.FindIndex(r => string.Equals(r.Name, selectedName, StringComparison.OrdinalIgnoreCase));
+                int sel = selected is null ? -1 : Array.IndexOf(items, selected);
                 _hosts.SelectedIndex = sel >= 0 ? sel : Math.Min(keepIndex, items.Length - 1);
                 _hosts.EndUpdate();
             }
-            _rows = rows;
         }
 
-        internal static string StatusText(RelaySnapshot s, string? filesProblem, string? note)
+        internal static string StatusText(RelaySnapshot s, string? note)
         {
             var parts = new List<string>();
             if (s.Running)
             {
-                parts.Add($"Running on port {s.Port}.");
+                parts.Add($"The relay is running on port {s.Port}.");
                 parts.Add(CountsText(s));
             }
             else if (s.Problem is not null) parts.Add("The relay is not running. " + s.Problem);
             else parts.Add("The relay is stopped. Press Start the relay to start it again.");
-            if (filesProblem is not null) parts.Add(filesProblem);
             if (note is not null) parts.Add(note);
             return string.Join(" ", parts);
         }
@@ -260,25 +243,26 @@ namespace KovaRelay
             (s.Hosts switch { 0 => "No hosts are connected.", 1 => "1 host is connected.", _ => $"{s.Hosts} hosts are connected." }) + " " +
             (s.ControllingPcs switch
             {
-                0 => "No controlling PCs are connected now.",
-                1 => "1 controlling PC is connected now.",
-                _ => $"{s.ControllingPcs} controlling PCs are connected now.",
+                0 => "No controlling PCs are connected.",
+                1 => "1 controlling PC is connected.",
+                _ => $"{s.ControllingPcs} controlling PCs are connected.",
             });
 
+        /// <summary>"Host connected from 203.0.113.5 since 14:02", with the date when it is not today, and its controlling PCs.</summary>
         internal static string RowText(HostRow r)
         {
-            if (r.Connected)
-                return r.ControllingPcs switch
-                {
-                    0 => $"{r.Name}, connected",
-                    1 => $"{r.Name}, connected, 1 controlling PC",
-                    _ => $"{r.Name}, connected, {r.ControllingPcs} controlling PCs",
-                };
-            return $"{r.Name}, not connected, last seen {SpokenDate(r.LastSeenUtc)}";
+            DateTime local = r.SinceUtc.ToLocalTime();
+            string since = local.Date == DateTime.Now.Date
+                ? local.ToString("HH:mm", CultureInfo.InvariantCulture)
+                : local.ToString("d MMMM yyyy 'at' HH:mm", CultureInfo.InvariantCulture);
+            string text = $"Host connected from {r.Address} since {since}";
+            return r.ControllingPcs switch
+            {
+                0 => text,
+                1 => text + ", 1 controlling PC",
+                _ => text + $", {r.ControllingPcs} controlling PCs",
+            };
         }
-
-        internal static string SpokenDate(DateTime utc) =>
-            utc.ToLocalTime().ToString("d MMMM yyyy, h:mm tt", CultureInfo.InvariantCulture);
 
         // ------------------------------------------------------------ actions
 
@@ -321,7 +305,7 @@ namespace KovaRelay
                 if (why is not null)
                 {
                     if (wasRunning) server.Start(was);
-                    _note = wasRunning ? $"Still using port {was}." : null;
+                    _note = wasRunning ? $"The relay is still using port {was}." : null;
                     RefreshState(force: true);
                     MessageBox.Show(this, why, "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     _port.Focus(); _port.SelectAll();
@@ -339,7 +323,7 @@ namespace KovaRelay
             {
                 RelayService.Result.Ok => here ? $"The relay now uses port {port}." : $"The relay service now uses port {port}.",
                 RelayService.Result.WouldNotStart => $"Port {port} is saved, but the service did not start on it. Another program may be using that port.",
-                RelayService.Result.Cancelled => $"The port was not changed, because the administrator prompt was turned down. The relay still uses port {old}.",
+                RelayService.Result.Cancelled => $"The port was not changed, because administrator permission was not given. The relay still uses port {old}.",
                 _ => RelayService.Say(result, ""),
             };
             _port.Text = (result == RelayService.Result.Ok ? port : old).ToString(CultureInfo.InvariantCulture);
@@ -458,46 +442,6 @@ namespace KovaRelay
             RefreshState(force: true);
         }
 
-        private void AllowNewChanged()
-        {
-            if (_settingChecks) return;
-            // Saved in settings.json, which only administrators may change: Windows asks.
-            bool want = _allowNew.Checked;
-            bool service = _app.ServiceMode;
-            Elevated($"--settings-allow {_app.ServiceName} {(want ? "yes" : "no")}", r =>
-            {
-                if (r != RelayService.Result.Ok) return RelayService.Say(r, "");
-                if (!service) _app.Server.SetAllowNewNamesFromFile(want);
-                return want ? "The relay allows new host names." : "The relay no longer takes new host names.";
-            }, quietSuccess: true);
-        }
-
-        private void Forget()
-        {
-            int i = _hosts.SelectedIndex;
-            if (i < 0 || i >= _rows.Count)
-            {
-                MessageBox.Show(this, "There is no host name to forget. Choose one in the Hosts list first.", "Kova Relay", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                _hosts.Focus();
-                return;
-            }
-            HostRow row = _rows[i];
-            string question = row.Connected
-                ? $"Forget the host name {row.Name}? That host is connected now and will be disconnected. Any host can then take the name."
-                : $"Forget the host name {row.Name}? Any host can then take the name.";
-            if (MessageBox.Show(this, question, "Kova Relay", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-                return;
-            if (_app.ServiceMode)
-            {
-                Elevated($"--service-forget {_app.ServiceName} {row.Name}", r => r == RelayService.Result.Ok
-                    ? $"The relay service is forgetting the host name {row.Name}." : RelayService.Say(r, ""), quietSuccess: true);
-                return;
-            }
-            _note = _app.Server.Forget(row.Name) ? $"Forgot the host name {row.Name}." : $"The host name {row.Name} was already gone.";
-            RefreshState(force: true);
-            _hosts.Focus();
-        }
-
         private static string ExeQuoted => "\"" + Environment.ProcessPath + "\"";
 
         internal static bool ReadStartWithWindows()
@@ -604,7 +548,7 @@ namespace KovaRelay
                     if (wasRunning) server.Start(port);
                     _note = RelayService.Say(r, exe);
                 }
-                else _note = $"The relay now runs as a Windows service. It starts when Windows starts, even before anyone signs in, and keeps running when you close this. Its host list, settings and log are kept in {RelayService.DataDir(name)}.";
+                else _note = $"The relay now runs as a Windows service. It starts when Windows starts, even before anyone signs in, and keeps running when you close this. Its settings and log are kept in {RelayService.DataDir(name)}.";
             }
             else
             {

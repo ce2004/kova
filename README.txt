@@ -1,139 +1,184 @@
 Kova
 
-Control another Windows PC with your keyboard, and hear everything it plays. Built for NVDA. Works over Tailscale or straight over the internet; everything is encrypted either way.
+Kova lets you control another Windows PC with your keyboard and hear everything it plays, with very little delay. It is designed for screen reader users and works fully with NVDA. Connections are encrypted from end to end, whether they go across a home network, a VPN, the internet, or a Kova Relay.
 
-Files
-- bin\arm64\Kova.exe for ARM64 PCs, bin\x64\Kova.exe for x64 PCs. Each is one self-contained file; no .NET install needed.
-- KovaRelay.exe (KovaRelay-x64.exe and KovaRelay-arm64.exe on the releases page): Kova Relay, only needed if you want PCs to reach each other through a relay. See Kova Relay below.
 
-The quick way
-- On the PC you want to control, run Kova and choose File, Host this PC (Control H). It asks how other PCs should reach it: through a Kova Relay only (nothing on the PC is opened to the internet), directly by its address, or both. Then the port or the relay, then the passwords. It checks the relay is up, tells you what the other PCs need to type, and starts hosting.
-- On your own PC, choose File, Connect to a PC (Control N). Pick a saved PC, or a new one: by its address, or through a Kova Relay with the relay's address and the PC's name on it. It checks the relay is up and whether that PC is connected to it, asks for the password, and connects. It can save the PC for next time.
-- Both windows go one question at a time: Tab moves around a page, Enter or Next goes on, Back goes back, and Escape cancels.
-- The rest of this section is the same thing done by hand in the menus.
+Downloads
 
-On the PC you want to control (the host)
-1. Either install Tailscale on both PCs and sign in to the same tailnet, or use the host's internet address, or use a Kova Relay (see Kova Relay below).
-2. Run Kova. In the File menu, choose Mode, Host, set Password, then choose Start hosting.
-3. A cloud PC usually has no sound card. Kova notices and sets up an audio device called Kova: approve the administrator prompt, then press Install Driver in VB-Cable's window. A progress bar shows the rest. You can also use Settings, Set up audio device at any time, and Settings, Remove audio device takes it off again.
-4. If Windows Firewall would keep other PCs out, Kova offers to open the port. When you change the port on a PC that hosts, Kova opens the new one and offers to close the old one. Settings, Port editor lists every port Kova has used or has a firewall rule for, marks the one in use, and opens, closes or removes the others. Its Clean up old firewall rules button removes the rules Windows piled up for copies of Kova that are gone or no longer used, and old TailRemote rules. The port in use always stays open.
-5. Turn on Settings, Start hosting when Windows starts. It asks for administrator once, then starts hosting at every sign-in as administrator, so keys also reach administrator windows and the port is opened by itself.
+- Kova-x64.exe is for PCs with Intel or AMD processors. Kova-arm64.exe is for PCs with ARM processors, such as Snapdragon laptops. Each is a single file; nothing else needs to be installed.
+- KovaRelay-x64.exe and KovaRelay-arm64.exe are Kova Relay, an optional program for reaching PCs that are behind a router or firewall. See Kova Relay below.
+- All downloads are on the releases page at github.com/ce2004/kova.
 
-On your PC
-1. Run Kova. In the File menu, choose Mode, Control another PC.
-2. In the File menu, set Address to the host's Tailscale name, 100 address or internet address, and the same Port and Password. Then choose Connect, the first item in the File menu.
-3. In the Kova window, press Control Shift Enter to control the remote PC. Every key goes there: Windows, Alt Tab, your NVDA key, everything. The mouse goes there too: moving it, clicking and the wheel all happen on the remote PC, and this PC's pointer stays where it was until you come back.
-4. Press Control Shift Enter again to come back to this PC.
 
-The menus
-- The window is blank: everything is in the menu bar. Alt, then Enter, is Connect (or Start hosting).
-- Press Alt, then Right Arrow to move between File, Clipboard and Settings, and Down Arrow through each menu. Escape goes back.
-- On a setting, Enter turns it on or off and says checked or unchecked. The menu stays open, so you can change several in a row. Choices such as Sound quality are submenus: their name says the current choice, and Enter on another one picks it.
-- Address, Port and the passwords are menu items that say what they are set to (passwords only say set or not set). Enter opens a small box to change them, with Show password for passwords. If something is missing or wrong when you connect, that box opens by itself and says what is wrong.
-- File: Connect to a PC (Control N), Host this PC (Control H), Connect or Disconnect (Start or Stop hosting), Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC, Install the Kova Helper on the remote PC, Streaming (Enter says it again), Mode, Saved PCs, Address, Port, Password, Listen-only password, Copy this PC's IP address (it shows the addresses), Host: how other PCs reach this PC, Relay address, Relay name, Check the relay is up, Save this PC, Forget the chosen saved PC and Exit.
-- Clipboard: Files (what is moving right now; Enter says it again, and while several files move it opens a line per file), Send the clipboard (Control B), Send files (Control I), Send a folder (Control T), Get the remote PC's clipboard, Stop the file transfer, Pick where received files go, and Accept text and files the remote PC sends without being asked.
-- About: Check for updates (Control U), View the changelog (Shift F1), Read the guide (F1), Keyboard shortcuts, About Kova, Licences and credits, Open the Kova website, Report a problem on GitHub, and Open the log file. The changelog, guide and the rest open as a list: the arrows go a line at a time, Control Down and Control Up jump between versions or sections, and Control C copies a line.
-- Settings: Sound quality, Mute Kova when not in focus, Output device, Capture sound from, Remote NVDA speaking, Microphone to use, Microphone from the controlling PC plays into (Host mode), Catch up by fast-forwarding, Sounds, Start hosting when Windows starts, Run as a Windows service, Port editor, Set up audio device, Remove audio device, Install the Kova Helper NVDA add-on and Enable logging.
+Getting started
+
+Kova has two step-by-step windows, both in the File menu. Each asks one question at a time. Tab moves between the controls on a page, Enter continues, Back returns to the previous page, and Escape cancels.
+
+To set up the PC you want to control:
+1. Run Kova on that PC and choose File, Host this PC (Control H).
+2. Choose how other computers will connect:
+   - Through a Kova Relay. Recommended when the PC is behind a router or firewall. No ports are opened on the PC.
+   - Directly, using the PC's network address. Kova opens a port in Windows Firewall.
+   - Both.
+3. Enter the port or the relay address, then the password. A listen-only password is optional.
+4. Kova checks that the relay can be reached, shows what other computers need to enter, and starts hosting.
+
+To connect from your own PC:
+1. Choose File, Connect to a PC (Control N).
+2. Choose a saved PC, or A new PC.
+3. For a new PC, enter its address and password. The address can be the PC's name or IP address, or the address of the Kova Relay it hosts through. Kova works out which it is by itself. You can save the PC and give it a name.
+4. Choose Connect.
+
+Once connected:
+- Control Shift Enter, in the Kova window, sends every key to the remote PC, including the Windows key, Alt Tab and your NVDA key. The mouse goes to the remote PC too. Press Control Shift Enter again to return to your own PC.
+- File, Disconnect ends the connection. On the host, File, Stop hosting ends hosting.
+
+
+Saved PCs
+
+- In Connect to a PC, the first page lists your saved PCs. Edit PC changes a PC's name, address and password. Delete PC removes it.
+- Control 1 to Control 9 bring saved PC 1 to 9 to the front. The PC you were using stays connected in the background, silently, and its file transfers continue. File, Switch to PC lists the PCs in front, in the background and not connected, and can disconnect the ones in the background.
+- File, Wake a saved PC and connect wakes a PC that is asleep or turned off, using Wake-on-LAN, and connects as soon as it answers. Kova learns how to wake a PC the first time you connect to it. The wake signal only reaches the PC's own network, so it is also sent through every PC you are connected to. The PC's network adapter must allow Wake-on-LAN.
+
+
+Menus
+
+The Kova window is intentionally empty: everything is in the menu bar. Press Alt, then use the arrow keys. On a setting, Enter turns it on or off, and the menu stays open so you can change several settings in a row. Settings with several choices, such as Audio quality, are submenus whose name includes the current choice.
+
+File
+- Connect to a PC, Host this PC, and Disconnect or Stop hosting while one is active.
+- Switch to PC and Wake a saved PC and connect.
+- Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC to this PC's version, Install the Kova Helper on the remote PC, and the streaming status.
+- Measure this PC's internet speed, Measure the remote PC's internet speed, Copy this PC's address, Check the relay, and Exit.
+
+Clipboard
+- The current file transfer, the history of transfers, Send the clipboard (Control B), Send files (Control I), Send a folder and its contents (Control T), Get files from the remote PC (Control G), Get the remote PC's clipboard (Control Shift B), Stop the file transfer, the received files folder, and Accept text and files sent by the remote PC without asking.
+
+Settings
+- Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Capture audio from, Remote NVDA speech, Microphone to use, Play the controlling PC's microphone into, Catch up by speeding up audio instead of skipping, and Notification sounds.
+- Start hosting when Windows starts, Run as a Windows service, Port editor, Set up audio device, Remove audio device, and Install the Kova Helper NVDA add-on.
+- Back up settings to a file, Restore settings from a backup, and Diagnostic logging.
+
+About
+- Check for updates (Control U), View the changelog (Shift F1), Read the guide (F1), Keyboard shortcuts, About Kova, Licences and credits, Open the Kova website, Report a problem on GitHub, and Open the log file. Long text opens as a list: the arrow keys move a line at a time, Control Up and Control Down move between sections, and Control C copies a line.
+
 
 Features
-- Control Shift Enter in the Kova window switches between the remote PC and this one.
-- Control Alt End sends Control Alt Delete to the remote PC, when it runs Kova as a service.
-- Send the clipboard (Control B) sends what is on this PC's clipboard to the other PC's clipboard: text, or files and folders you copied. Paste it there with Control V. Send files (Control I) sends files you choose to Downloads, Kova on the other PC, never over anything already there. Send a folder and everything in it (Control T) does the same for a whole folder. Each file moving has its own progress bar. Both PCs have the Clipboard menu; nothing is ever sent by itself.
-- Clipboard, Pick where received files go chooses the folder files from the other PC are saved in (Downloads, Kova at first). A transfer interrupted by a dropped connection or Disconnect carries on by itself when you connect again; whatever arrived is always kept.
-- When hosting, File, Copy this PC's IP address shows the addresses to connect to, and Enter copies the home network one (or Tailscale's).
-- Clipboard, Files shows what is being sent or received, how far along, the speed and the time left. Clipboard, Stop the file transfer ends it.
-- Settings, Sounds for connecting, clipboard and files: a sound for each event. Default always plays the event's own tune on the piano; Random sound plays anything; or choose one of the instruments (a real Steinway, harp, glockenspiel, marimba, xylophone, pizzicato strings, classic phone and more) or Android's notification sounds, and the key (Alt K). Kova.exe --licence writes where the sounds come from.
-- File, Show the remote screen (Control Shift S) is a checkbox. Checked, a window opens with the remote PC's screen. While things move it is smooth video, up to 60 frames a second (H.264, on the remote PC's graphics chip when it has one); once they stop, an exact picture, every pixel as on the remote screen. The title bar always says how many frames a second are coming (0 while nothing moves), so NVDA plus T reads it; while the screen is on, the main window's title says it too. NVDA plus R reads it with Windows' text recognition. It follows the connection by itself, like the sound, and is only taken while the window is open (paused while it is minimized). Escape goes back to the main window and leaves the screen on. Control Shift S, or unchecking it in the File menu, turns it off and closes the window. F5 gets a whole new picture. If the remote PC has more than one screen, the main one shows first; keys 1 to 9 pick a screen and Page Down and Page Up go to the next or previous one, and Kova says which one it is, its size and where it sits ("Screen 2 of 3, 1920 by 1080, right of the main screen."). When Kova runs as the service there, the welcome screen, the lock screen and administrator prompts show too.
-- File, Your microphone to the remote PC (Control Shift M in the Kova window) sends your microphone to the PC you control. It is off every time Kova starts, and Control Shift M turns it off again. Settings, Microphone to use picks which one. Only the PC in front hears it, never one waiting in the background, and never a PC you only listen to. Use headphones, or the remote PC hears its own sound back through your microphone.
-- On the remote PC your microphone comes out of a virtual cable, so programs there (TeamTalk, a call) can choose that cable's recording side as their microphone: with VB-Audio's Hi-Fi Cable that is Hi-Fi Cable Output. Kova never plays it into the device it sends you, so you never hear yourself. A PC with its own sound card can use the Kova device for this (programs pick CABLE Output). A cloud PC whose only sound device is the Kova one needs a second cable: install VB-Audio's Hi-Fi Cable (free, from vb-audio.com) there, and Kova finds it by itself. In Host mode, Settings, Microphone from the controlling PC plays into chooses another device. Kova says where your microphone went, or why it could not. Its quality follows the connection, like the sound.
-- Settings, Remote NVDA speaking: through the remote PC's sound (as before), here as text and braille from your own NVDA with no remote sound at all, or both. As text, your NVDA speaks in your own voice and settings, with the remote NVDA's change of pitch for capitals, and stops when the remote NVDA stops (when you type there, for example). The remote braille display's text shows on yours, and the remote NVDA's beeps and sounds play here. With text only, the remote PC sends no sound at all, which saves a lot of data. This needs the Kova Helper NVDA add-on on the remote PC (see below); without it Kova says so, and you hear the remote NVDA through its sound.
-- The Kova Helper NVDA add-on goes on the PC you control, never on yours. Install it there with Settings, Install the Kova Helper NVDA add-on, or from your PC with File, Install the Kova Helper on the remote PC. A box says what it does first. It hands that PC's NVDA speech, braille, beeps and sounds straight to Kova on that PC, which sends them to the PC controlling it. It only talks to Kova on the same PC, over a connection no other PC or user can open, and sends nothing over the internet by itself. NVDA restarts once to finish installing. Kova keeps it up to date, and the same menu item removes it (or remove it in NVDA's add-on store).
-- File, Update the remote PC updates Kova on the PC you control to this PC's version (it must be the newest on GitHub). It works for the Kova service too. The remote PC keeps going while it downloads, then you hear it is updating and when it is back.
-- Clipboard, Get files from the remote PC (Control G) lists the remote PC's usual folders and drives. Enter opens a folder or checks a file, Space checks files and folders, Backspace goes up, and checks stay as you move between folders. Nothing comes until Get the checked files and folders (Alt G), which brings them all at once to your received files folder. Each then says getting, then got, and Kova says when they have arrived.
-- Clipboard, History of transfers lists every send and receive that ended, with the time, until Clear the history.
-- Settings, Ride out Wi-Fi scans (on at first): when the sound keeps stalling, as when a Wi-Fi card scans for networks, it holds enough sound to play through the stalls, for a little more delay until they stop.
-- File, Remote PC info (Control Shift I) shows the remote PC's name, Windows version, who is signed in, how long it has been on, processor, memory, battery, free disk space, Kova version and who is connected, one line each.
-- Several PCs at once: Control 1 to 9 (or File, Switch to PC) brings saved PC 1 to 9 to the front, and the one you were on stays connected in the background. You only hear and control the one in front; the others are silent and use almost nothing, and their file transfers carry on. Switching back is instant. Switch to PC says which PCs are in front, in the background or not connected, and has Disconnect the PCs in the background. Disconnect only disconnects the one in front.
-- File, Wake a saved PC and connect: wakes a sleeping or switched-off PC with Wake-on-LAN, then connects as soon as it answers. Kova learns how to wake a saved PC the first time you connect to it while it is on. The signal only reaches the PC's own network, so it is also sent through every PC you are connected to: away from home, connect to any other PC at home first. The PC's network card has to allow Wake-on-LAN (in Device Manager, and on some PCs in the BIOS).
-- File, Measure this PC's internet speed, or Measure the remote PC's internet speed: about 20 seconds later a window shows download and upload speed, ping and jitter, the Cloudflare data centre it tested against, the internet address and how much data it used (at most about 1.5 gigabytes). The sound may break up while it runs.
-- Settings, Back up settings to a file saves every setting and saved PC, with their passwords, in one file locked with a password you choose. Settings, Restore settings from a backup puts them on this PC (disconnect first).
-- Settings, Announce the remote PC's health (on unless you turn it off): says when the remote PC goes onto its battery or is plugged in, when the battery is low or very low, when its Windows drive is nearly full, when its processor has been busy for a whole minute, and when it is nearly out of memory. Each is said once, and again only after it got better. Problems that are already there are said when you connect.
-- Settings, Announce when the sound quality changes: says when the sound is lowered because the connection struggles, and when it is back to full quality.
-- Settings, Mute Kova when not in focus: while you are in another program on this PC, you hear nothing from the remote PC, its NVDA speech and braille included, and it stays connected with no sound sent at all, so it uses almost no data. Going back to Kova brings it all straight back.
-- Text the remote PC sends (someone at that PC pressing Send the clipboard) goes straight onto your clipboard, replacing what was there. Files it sends that way go to your received files folder instead of your clipboard. Clipboard, Accept text and files the remote PC sends without being asked turns both off altogether. Get the remote PC's clipboard always puts it straight on yours.
-- File, Restart remote PC and reconnect restarts the remote PC and reconnects when it is back.
-- File, Saved PCs: choose one to fill in its address, port and password. File, Save this PC remembers the address, port and password; File, Forget the chosen saved PC removes one.
-- Listen-only password, in Host mode: anyone who connects with it hears the PC but cannot control it. Up to 100 at once. Each listener uses about 0.7 megabits per second of the host's upload while sound plays.
+
+Remote screen
+- File, Show the remote screen (Control Shift S) opens a window with the remote PC's screen. While the screen changes, it is shown as smooth video at up to 60 frames per second, using the remote PC's graphics hardware when available. When it stops changing, an exact picture is shown. NVDA plus R reads it with Windows text recognition.
+- The title bar shows the frame rate. Escape returns to the main window and leaves the screen on; Control Shift S turns it off. F5 requests a fresh picture. With several monitors, the keys 1 to 9 choose a monitor, and Page Up and Page Down move between them.
+- When the remote PC runs Kova as a service, the sign-in screen, the lock screen and administrator prompts are shown too.
+
+Microphone
+- File, Your microphone to the remote PC (Control Shift M) sends your microphone to the PC you control. It is off each time Kova starts. Settings, Microphone to use chooses the microphone.
+- On the remote PC, your microphone plays into a virtual audio cable, so programs there can use it as their microphone. Use headphones, or the remote PC will hear its own sound through your microphone.
+- A PC whose only sound device is the Kova audio device needs a second virtual cable for this, such as VB-Audio's free Hi-Fi Cable. Kova finds it automatically.
+
+Remote NVDA speech
+- Settings, Remote NVDA speech chooses how you hear the remote PC's NVDA: through the remote PC's audio, as text and braille spoken by your own NVDA, or both.
+- As text, your NVDA speaks in your own voice and settings, follows the remote NVDA's pitch changes for capitals, and stops when the remote NVDA stops. Braille, beeps and sounds come through too. With text only, no audio is sent at all, which uses much less data.
+- This requires the Kova Helper NVDA add-on on the remote PC. Install it there with Settings, Install the Kova Helper NVDA add-on, or from your PC with File, Install the Kova Helper on the remote PC. The add-on only communicates with Kova on the same PC and sends nothing over the internet by itself. NVDA restarts once to complete the installation, and Kova keeps the add-on up to date.
+
+Clipboard and files
+- Send the clipboard (Control B) sends your clipboard to the other PC: text replaces the other PC's clipboard, and copied files go to its received files folder. Get the remote PC's clipboard (Control Shift B) puts the remote clipboard on yours.
+- Send files (Control I) and Send a folder and its contents (Control T) send files to the other PC's received files folder, which is Downloads, Kova unless you choose another. Existing files are never overwritten.
+- Get files from the remote PC (Control G) lists the remote PC's folders and drives. Enter opens a folder, Space selects files and folders, and Backspace goes up. Choose Get the checked files and folders (Alt G) to copy them all at once.
+- Clipboard, Files shows what is being sent or received, the progress, speed and time remaining. Transfers interrupted by a dropped connection continue automatically when you reconnect, and whatever arrived is always kept.
+
+Remote PC tools
+- Remote PC info (Control Shift I) shows the remote PC's name, Windows version, signed-in user, uptime, processor, memory, battery, free disk space, Kova version and current connections.
+- Restart remote PC and reconnect restarts the remote PC and reconnects when it is back.
+- Update the remote PC to this PC's version updates Kova on the remote PC, including the Kova service.
+- The internet speed tests report download and upload speed, latency and jitter after about 20 seconds. The audio may break up while a test runs.
+- Announce remote PC health alerts reports when the remote PC switches to or from battery power, when its battery is low, when its system drive is nearly full, when its processor has been busy for a full minute, and when it is nearly out of memory.
+
+Listening only
+- A host can have a listen-only password. Anyone who connects with it hears the PC but cannot control it, send files or use the clipboard. Up to 100 listeners can connect at once, each using about 0.7 megabits per second of the host's upload while audio plays.
+
+Settings backup
+- Settings, Back up settings to a file saves every setting and saved PC, including passwords, in one file protected by a password you choose. Restore settings from a backup loads them on this PC.
+
 
 Running the host as a Windows service
-- In Host mode, turn on Settings, Run as a Windows service. It asks for administrator permission once.
-- The service starts with Windows, before anyone signs in, and has full system access. You can use the lock screen, sign in, answer administrator prompts and send Control Alt Delete with Control Alt End.
-- Anyone who knows the Kova password gets that access too, so use a long password.
-- While the service runs, Start hosting in the File menu becomes Apply settings to the service. Press it after changing the port or passwords.
-- The service runs with full system access, so it only runs a copy of Kova that only administrators can change. If you turn it on from a copy in Documents, Downloads or an apps folder of your own, Kova puts a copy of itself in Program Files, Kova for the service. If you keep Kova in a folder only administrators can change (Program Files, for example), the service runs that very copy. A service set up by Kova 4.2 or 4.3 in a folder of your own moves itself to Program Files, Kova a couple of minutes after it first runs 4.4, and goes back if the moved copy will not start.
-- It never updates by itself: when you update Kova on that PC with Check for updates, the service follows to the same version straight away, without asking.
-- Turn off Settings, Run as a Windows service to remove it completely.
 
-More settings
-- Enable logging: writes Kova-log.txt next to Kova (the service writes Kova-service-log.txt; if the folder cannot be written, both go to AppData, Local, Kova), with a line every second about the sound on that PC. Turn it on on both PCs and send both files when something sounds wrong. What you type is never logged.
-- Capture sound from (Host mode): which output's sound the other PCs hear. Windows default follows whatever the default output is.
-- Output device: where the remote PC's sound plays here.
+- In Settings, turn on Run as a Windows service. Windows asks for administrator permission once.
+- The service starts with Windows, before anyone signs in. You can use the sign-in screen, the lock screen and administrator prompts, and Control Alt End sends Control Alt Delete.
+- Anyone who knows the Kova password has this access too, so use a strong password.
+- Host this PC applies its settings to the service while the service is installed.
+- The service only runs a copy of Kova that only administrators can change. If you turn it on from a folder of your own, Kova installs a copy in Program Files, Kova for the service.
+- When you update Kova with Check for updates, the service updates to the same version straight away.
+- Turn off Run as a Windows service to remove it completely.
 
-How it keeps delay down
-- Sound is Opus at 48 kHz stereo, up to 510 kilobits per second, in 5 millisecond packets over UDP, never waited for or resent. Opus adds about 2.5 milliseconds.
-- Sound quality (Control mode): Variable follows the connection, lowering the bitrate until the sound fits, down to 6 kilobits per second, one step at most every three quarters of a second. Or lock it to one bitrate and it never changes. Above 16 kilobits per second it is tuned for music, from 16 down for speech. The lowest steps send longer packets (up to 60 milliseconds), so they fit even dial-up, at the cost of more delay.
-- File, Streaming says the bitrate, whether it is locked or variable, and the audio delay.
-- It always heads back to live: nothing old is ever played. The buffer covers how unevenly packets arrived over the last 3 seconds, never more than 40 milliseconds; a stall never raises it, and whatever piles up behind a stall is skipped the moment it lands.
-- Catch up by fast-forwarding (Control mode): instead of skipping, the sound plays at 1.5x, 2x or 4x at its own pitch until it has caught up.
-- Packets that arrive out of order are put back in order. A packet that never comes is filled in by Opus, smoothly.
-- The pitch never changes.
-- Keys go over TCP with no batching, so each key is sent the moment it is pressed.
-- The window title shows the ping and the total audio delay. Press NVDA T to hear it. Run tailscale ping with the host's name: if it says via DERP, the connection is relayed and slower; a direct connection is best.
 
 Kova Relay
-- For a host that other PCs cannot reach directly (behind a home router, or with no open port). Run KovaRelay.exe on any PC both can reach, for example a cloud PC. It uses port 47200 until you change it in its window. It keeps no files next to itself: its settings are in ProgramData\KovaRelay, and only an administrator can change them, so Windows asks for permission when you change the port.
-- Port editor, in its window, opens and closes the relay's ports in Windows Firewall (TCP and UDP), shows which port is in use, removes a port's rule, and cleans up old firewall rules the relay left. It never closes the port the relay uses now. When you change the port, the relay offers to open the new port and close the old one. Its rules are called Kova Relay port and a number, so it never touches Kova's own rules, and Kova never touches the relay's.
-- It has no window at first, only an icon in the notification area. Enter or a double click on it opens its window: Tab goes through the status, the port, Use this port and Port editor, Stop or Start the relay, Allow new host names, the list of host names with Forget this host name, Start with Windows, Run as a Windows service, Open the log and Exit the relay. Escape hides the window again.
-- On the host, File, Host this PC sets it all up. By hand, in Host mode: File, Host: how other PCs reach this PC, then Relay address (with :port after it if it is not 47200) and Relay name (like office-pc). From then on the host stays connected to the relay while it hosts, as the Kova service too.
-- Through a relay only: the host takes a free port that only the PC itself can use, and opens nothing in Windows Firewall, so no other PC can reach it directly. Every connection comes in through the relay, which the host connects out to. Both: it can be reached directly and through the relay.
-- On your PC, File, Connect to a PC, Through a Kova Relay. By hand, set Address to the name, @, and the relay's address, like office-pc@relay.example.com, or office-pc@relay.example.com:47300 for another port. The password is the host's, as always.
-- File, Check the relay is up says whether the relay answers, and whether the PC is connected to it: on the host, this PC; on your PC, the one in Address. The step-by-step windows check this by themselves. The check never counts against your PC on the relay.
-- What the relay can and cannot see: it sees which host names are connected, from which internet addresses, which addresses connect to them, when, and how much data goes each way. It never sees passwords, keys pressed, sound, the screen, files, the clipboard or NVDA's speech: all of that is encrypted between the two PCs, and the host's identity means a relay cannot pretend to be the host either.
-- The first host to use a name keeps it: the name is tied to that host's own key, so no other PC can take it over. Turn off Allow new host names once your hosts are registered, and the relay takes no new names. Forget this host name frees a name again.
-- It limits connections from any one address, cuts off anything that sends rubbish or stays silent, and holds a sensible amount of memory however busy it gets. Its log never holds passwords or anything from a session.
-- Run as a Windows service makes it start with Windows, before anyone signs in, with very limited rights. Kova Relay must then be in a folder only administrators can change, such as Program Files.
+
+Kova Relay connects PCs that cannot reach each other directly, for example a PC behind a home router. Run it on any PC both can reach, such as a cloud server. It works like NVDA Remote: there are no names to manage, and the password pairs the two PCs.
+
+How it works
+- A PC hosting through the relay connects out to it and stays connected. It opens no ports of its own.
+- When you connect, you enter the relay address and the password of the PC you want. The relay connects you to the PC hosting with that password.
+- Each PC you host needs its own password. The password you type decides which PC you reach, so one relay can serve any number of PCs.
+- The password never reaches the relay. Kova sends a code made from it, which takes deliberate effort to reverse. Even so, use a long password for any PC reachable through a relay.
+- If a PC is already hosting on the relay with a password, another PC cannot host with the same password until the first one disconnects.
+
+What the relay can and cannot see
+- It sees the addresses of the PCs that connect, when, and how much data passes.
+- It never sees passwords, keystrokes, audio, the screen, files, the clipboard or NVDA speech. All of that is encrypted between the two PCs, and each host's identity is verified by your PC, so a relay cannot impersonate a host.
+
+Running Kova Relay
+- It uses port 47200 unless you change it. Its settings are in ProgramData, KovaRelay, and only an administrator can change them, so Windows asks for permission when you change the port.
+- It runs in the notification area. Enter or a double click on its icon opens its window. Tab moves through the status, the port, Use this port, Port editor, Stop or Start the relay, the hosts connected now, Start with Windows, Run as a Windows service, Open the log and Exit. Escape hides the window.
+- Port editor opens and closes the relay's ports in Windows Firewall and removes old rules. It never closes the port in use.
+- Run as a Windows service starts the relay with Windows, before anyone signs in, with limited rights. The relay must then be in a folder only administrators can change, such as Program Files.
+- The relay limits the connections from any one address, closes connections that send invalid data or nothing at all, and keeps its memory use bounded. Its log never contains passwords or session content.
+
 
 Updates
-- About, Check for updates gets the newest version from github.com/ce2004/kova, checks that it is signed by Kova's makers and that the download is exactly what they signed, swaps it in and restarts. A host keeps hosting while it downloads, then restarts hosting; a connected PC reconnects.
-- To update the cloud PC, use File, Update the remote PC from your side, or control it and use Check for updates there. Your side says the remote PC is updating, not that the connection broke, and says when it is back on the new version. A restart, a shutdown or stopping hosting are said the same way.
-- If the connection drops for any reason, Kova keeps trying every second until it is back or you press Disconnect.
+
+- About, Check for updates downloads the newest version from github.com/ce2004/kova, verifies that it is signed by Kova's developers and that the download matches exactly, then replaces Kova and restarts it. A host keeps hosting and a connected PC reconnects.
+- To update a remote PC, use File, Update the remote PC to this PC's version. Kova tells you when the remote PC is updating and when it is back.
+- If a connection drops for any reason, Kova tries again every second until it reconnects or you choose Disconnect.
+
+
+Audio and latency
+
+- Audio is Opus at 48 kHz stereo, up to 510 kilobits per second, sent in 5 millisecond packets that are never delayed or resent.
+- Audio quality: Variable follows the connection, lowering the bitrate when needed, down to 6 kilobits per second. You can also lock it to one bitrate.
+- Kova always stays live: old audio is never played. The buffer adapts to how evenly packets arrive and never exceeds 40 milliseconds. After a stall, the delayed audio is skipped, or, with Catch up by speeding up audio instead of skipping, played faster at the same pitch until it has caught up.
+- Keystrokes are sent the moment they are pressed.
+- The window title shows the latency and the total audio delay. Press NVDA T to hear it.
+
 
 Security
-- Both PCs prove they know the password before anything is sent, and wrong passwords are slowed down. Each host has a lasting identity that signs the start of every login; your PC remembers it the first time and asks before logging in if it ever changes, so nothing pretending to be that PC learns anything to guess your password from.
-- After that, keys, audio and messages are encrypted with keys that are new for every connection, and anything changed on the way is thrown away.
-- An address that keeps guessing is turned away for a while, and PCs that have never connected get 30 wrong passwords a minute, 200 an hour and 1,000 a day in all. PCs that have connected before always get in.
-- Someone with only the listen-only password hears the sound and nothing else: no keys, mouse, files, clipboard, microphone or NVDA text.
-- While the remote PC is locked, Get files and Get the remote PC's clipboard wait until someone signs in there, and Get files only ever reads that PC's own drives.
-- Received files are marked as coming from the internet, and names that hide a file's real type are made safe.
-- Updates are signed by Kova's makers and checked before they are installed.
-- Use a long password if the port is open to the internet.
+
+- Both PCs prove they know the password before anything is sent, and wrong passwords are slowed down. Each host has a lasting identity that signs every connection. Your PC remembers it and asks before connecting if it ever changes.
+- After that, everything is encrypted with keys that are new for every connection, and anything altered in transit is rejected.
+- An address that keeps guessing is blocked for a while. PCs that have never connected before get 30 wrong passwords per minute, 200 per hour and 1,000 per day in total. PCs that have connected before are always let in.
+- A listen-only connection receives audio only: no keys, mouse, files, clipboard, microphone or NVDA text.
+- While the remote PC is locked, Get files and Get the remote PC's clipboard wait until someone signs in.
+- Received files are marked as coming from the internet, and file names that disguise a file's type are made safe.
+- Updates are signed and verified before they are installed.
+- Use a long password for any PC that can be reached from the internet or through a relay.
+
 
 Limits
-- Control Alt Delete and Windows L on your keyboard are kept by your own PC. Use Control Alt End for the remote PC.
-- Without the service, the remote PC's lock screen and administrator prompts cannot be used from Kova.
-- Remote NVDA as text needs the Kova Helper add-on on the remote PC. Nothing comes from the lock screen or sign-in screen: NVDA there is a separate copy. Remote braille shows as a braille message, so it goes away after NVDA's message timeout unless you set that to stay. Changes of pitch come through when your NVDA is 2024.1 or newer.
-- The microphone only goes to a PC you connected to with its control password, and the remote PC plays one PC's microphone at a time.
 
-Releasing
-- Add a section to CHANGES.txt: the version number on its own line, then one change per line.
-- Push a tag such as v1.0.1. GitHub builds both versions of Kova and Kova Relay, signs the list of files and publishes the release.
+- Control Alt Delete and Windows L on your own keyboard always act on your own PC. Use Control Alt End to send Control Alt Delete to the remote PC.
+- Without the Kova service, the remote PC's lock screen and administrator prompts cannot be used.
+- Remote NVDA text requires the Kova Helper add-on, and does not include the sign-in screen, where a separate copy of NVDA runs.
+- The microphone only goes to a PC you connected to with its full password, and a PC plays one controlling PC's microphone at a time.
+
 
 About the audio device
-- It is VB-Cable by VB-Audio, free donationware: www.vb-cable.com. Its licence does not allow other programs to install it silently, so you press its Install Driver button yourself. Kova downloads it from vb-audio.com, checks it is signed by VB-Audio, then names it Kova and makes it the default output.
-- If Windows needs a restart after installing it, restart and start hosting: Kova finishes the setup by itself.
 
-Building
-- build.bat builds this PC's own kind (arm64 or x64) quickly, in seconds, without trimming or compression, Kova Relay beside Kova. build.bat arm64 or build.bat x64 picks one. build.bat full builds both exactly as a release is built.
-- If Kova is running from bin, the new build replaces it, closes the old copy and restarts it, still hosting or connected.
-- Kova.exe --selftest runs a host and client on this PC and writes the result to tailremote-selftest.txt in the temp folder. Kova.exe --securitytest checks the security fixes (kova-securitytest.txt), KovaRelay.exe --selftest checks the relay (kova-relay-selftest.txt), and Kova.exe --relaytest PORT checks everything end to end through a relay already running on this PC on that port (kova-relaytest.txt).
-- Kova.exe --licence writes the NVDA controller client licence beside the exe.
+- A PC without a sound card, such as a cloud server, needs a virtual audio device. Settings, Set up audio device installs VB-Cable by VB-Audio (donationware, www.vb-cable.com), names it Kova and makes it the default output. Its licence requires that you press its Install Driver button yourself. Remove audio device removes it.
+- If Windows asks for a restart after installing it, restart and start hosting; Kova completes the setup.
+
+
+For developers
+
+- build.bat builds this PC's architecture quickly, with Kova Relay beside Kova. build.bat x64 or build.bat arm64 chooses one; build.bat full builds both exactly as a release is built. If Kova is running from the bin folder, the new build replaces it and restarts it.
+- Tests: Kova.exe --selftest, --securitytest and --chaostest; KovaRelay.exe --selftest; and Kova.exe --relaytest PORT against a Kova Relay running on this PC. Each writes its result to a file in the temp folder.
+- To release, add a section to CHANGES.txt (the version on its own line, then one change per line) and push a tag such as v4.6.0. GitHub builds, signs and publishes both programs.
+- Kova.exe --licence writes the NVDA controller client licence beside the program.

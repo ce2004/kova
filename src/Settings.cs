@@ -15,7 +15,11 @@ namespace TailRemote
         public string PasswordEnc { get; set; } = "";
         /// <summary>Its network cards (Wake.Describe), learnt while connected: how to wake it. Empty until then.</summary>
         public string Wake { get; set; } = "";
-        public override string ToString() => Port == Protocol.DefaultPort ? Address : Address + ", port " + Port;
+        /// <summary>The name the owner gave it (4.6, Edit PC); empty: it is shown by its address.</summary>
+        public string Name { get; set; } = "";
+        public override string ToString() => Name.Trim().Length > 0 ? Name.Trim()
+            : Relay.IsByPassword(Address) ? Relay.Shown(Address) + ", through the relay"
+            : Port == Protocol.DefaultPort ? Address : Address + ", port " + Port;
     }
 
     /// <summary>Saved in %APPDATA%\TailRemote\settings.json; the passwords are DPAPI-encrypted.</summary>
@@ -348,7 +352,7 @@ namespace TailRemote
             KnownHosts ??= new();
             HostIdentityEnc ??= ""; RelayAddress ??= ""; RelayName ??= "";
             SavedPcs.RemoveAll(pc => pc == null);
-            foreach (var pc in SavedPcs) { pc.Address ??= ""; pc.PasswordEnc ??= ""; }
+            foreach (var pc in SavedPcs) { pc.Address ??= ""; pc.PasswordEnc ??= ""; pc.Name ??= ""; }
             return this;
         }
 

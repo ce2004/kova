@@ -162,7 +162,11 @@ namespace TailRemote
         {
             if (session == 0xFFFFFFFF) return true;
             if (!WTSQuerySessionInformationW(IntPtr.Zero, session, WTSSessionInfoEx, out IntPtr buf, out uint n)) return false;
-            try { return n >= 16 && Marshal.ReadInt32(buf, 12) == 0; }
+            // WTSINFOEXW: Level (4 bytes), then the level-1 data, which holds 8-byte fields and so starts at offset 8:
+            // SessionId at 8, SessionState at 12, SessionFlags at 16 (0 locked, 1 unlocked, -1 unknown). Up to 4.6.0 this
+            // read offset 12, the session's state, which is 0 for every active session: every PC in use looked locked,
+            // so Get files and Get the remote PC's clipboard were always refused.
+            try { return n >= 20 && Marshal.ReadInt32(buf, 16) == 0; }
             finally { WTSFreeMemory(buf); }
         }
 

@@ -23,7 +23,7 @@ namespace KovaRelay
     ///     connections hold at most 600 x 32 KB = about 19 MB (they come from the shared array pool and go back).
     ///   - Connections still asking: a 36-byte hello and at most a 1027-byte frame each, 600 x ~1.1 KB = under 1 MB.
     ///   - Per-address table: at most 20,000 entries of about 200 bytes with their dictionary slot, about 4 MB.
-    ///   - Pinned names: at most 1,000 of about 300 bytes, under 1 MB. Pending pairings: bounded by connections.
+    ///   - Connected hosts and pending pairings: bounded by connections.
     ///   - UDP: one 64 KB receive buffer; packets are forwarded straight from it, never queued.
     ///   - Log: at most 2,000 queued lines, under 1 MB.
     /// So about 25 MB of the relay's own at the very worst, plus Windows' socket buffers (in the kernel, by default
@@ -42,8 +42,8 @@ namespace KovaRelay
         public const long BlockMs = 10 * 60_000;        // ...block the address for 10 minutes (closed at once, nothing read)
         public const int MaxAddressEntries = 20_000;    // per-address table cap; the longest unused go first
         public const long ForgetAddressAfterMs = 60 * 60_000; // an idle address entry is dropped after an hour
-        public const int MaxPinnedNames = 1000;
-        public const int NewNamesPerAddressPerHour = 5;
+        public const int MissesPerHour = 30;            // lookups for a host that is not there (wrong passwords, in effect), per address per hour
+        public const long MissWindowMs = 3_600_000;     // ...after which the address's lookups are turned away until the hour is up
         public const int HostAddressFactor = 8;         // an address with a registered host: 8 times the connections, no rate bucket (HostLines)
         public const int PendingPerHost = 64;           // pairings waiting for one host to dial back (two PCs connecting at once ask for about 40)
         public const int PendingPerClient = 40;         // pairings waiting, asked for from one address (one PC asks for about 20 at once)
@@ -60,24 +60,29 @@ namespace KovaRelay
     internal sealed record RelaySnapshot(bool Running, int Port, string? Problem, int Hosts, int ControllingPcs,
         int Connections, IReadOnlyList<HostRow> Rows);
 
-    internal sealed record HostRow(string Name, bool Connected, int ControllingPcs, DateTime LastSeenUtc);
+    /// <summary>
+    /// One host connected right now: the address its control line came from and when it registered. Never its name:
+    /// Kova derives the name from the hosted PC's password, so it means nothing to a person and is not shown.
+    /// </summary>
+    internal sealed record HostRow(string Address, DateTime SinceUtc, int ControllingPcs);
 
     /// <summary>
     /// The relay itself: one TCP listener and one UDP socket on the same port, following RelayWire.cs exactly.
+    /// There is no list of names: a name belongs to whichever host holds it right now (Kova derives it from the hosted
+    /// PC's password, like NVDA Remote's key). A host with a different public key is refused the name only while the
+    /// current holder is connected.
     /// All shared state is guarded by one lock (_gate); nothing slow (network, disk) happens while holding it.
     /// Every connection runs on async sockets (no thread per connection) inside its own try/catch, so one bad
     /// connection never affects another.
     /// </summary>
     internal sealed class RelayServer : IDisposable
     {
-        private readonly RelayFiles _files;
         private readonly RelayLog _log;
         private readonly object _gate = new();
 
         private readonly Dictionary<AddrKey, AddrState> _addrs = new();
         private readonly Dictionary<string, HostLine> _hosts = new(StringComparer.Ordinal);   // connected, by name key
         private readonly Dictionary<ulong, HostLine> _hostsByUdpKey = new();
-        private readonly Dictionary<string, Pin> _pins;                                       // by name key
         private readonly Dictionary<ulong, Pending> _pending = new();
         private readonly Dictionary<ulong, Pairing> _pairings = new();                        // spliced, live
         private readonly HashSet<Conn> _conns = new();
@@ -87,8 +92,6 @@ namespace KovaRelay
 
         private Socket? _listener, _udp;
         private CancellationTokenSource? _run;
-        private bool _pinsDirty;
-        private long _pinsSavedAt;
 
         public int Port { get; private set; }
         public bool Running { get; private set; }
@@ -98,27 +101,9 @@ namespace KovaRelay
         /// <summary>Exceptions the relay did not expect (not network or disk trouble). The self-test requires 0.</summary>
         public int UnexpectedErrors;
 
-        private volatile bool _allowNewNames;
-        public bool AllowNewNames
+        public RelayServer(RelayLog log)
         {
-            get => _allowNewNames;
-            set => _allowNewNames = value; // in memory: settings.json is written only by an elevated copy (RelayService)
-        }
-
-        /// <summary>An administrator changed settings.json (through an elevated copy): take it, and log it.</summary>
-        public void SetAllowNewNamesFromFile(bool allow)
-        {
-            if (_allowNewNames == allow) return;
-            _allowNewNames = allow;
-            _log.Write(allow ? "New host names are allowed." : "New host names are turned off.");
-        }
-
-        public RelayServer(RelayFiles files, RelayLog log)
-        {
-            _files = files;
             _log = log;
-            _pins = files.LoadPins(Limits.MaxPinnedNames);
-            _allowNewNames = files.LoadSettings().AllowNewNames;
             _ = Task.Run(HousekeepingLoop);
         }
 
@@ -210,7 +195,6 @@ namespace KovaRelay
         {
             _disposed = true;
             Stop();
-            SavePinsIfDirty(force: true);
         }
 
         // ---------------------------------------------------------------- status
@@ -229,33 +213,14 @@ namespace KovaRelay
                     if (!clientsByHost.TryGetValue(p.NameKey, out var set)) clientsByHost[p.NameKey] = set = new(StringComparer.Ordinal);
                     set.Add(p.ClientText);
                 }
-                var rows = new List<HostRow>(_pins.Count);
-                foreach (var kv in _pins.OrderBy(k => k.Key, StringComparer.Ordinal))
+                var rows = new List<HostRow>(_hosts.Count);
+                foreach (HostLine h in _hosts.Values.OrderBy(h => h.SinceUtc))
                 {
-                    bool on = _hosts.ContainsKey(kv.Key);
-                    int pcs = clientsByHost.TryGetValue(kv.Key, out var s) ? s.Count : 0;
-                    rows.Add(new HostRow(kv.Value.Name, on, pcs, kv.Value.LastSeen));
+                    int pcs = clientsByHost.TryGetValue(h.NameKey, out var s) ? s.Count : 0;
+                    rows.Add(new HostRow(h.Conn.Text, h.SinceUtc, pcs));
                 }
                 return new RelaySnapshot(Running, Port, Problem, _hosts.Count, allClients.Count, _total, rows);
             }
-        }
-
-        /// <summary>Removes a pinned name (and drops that host if connected) so another host can take it.</summary>
-        public bool Forget(string name)
-        {
-            string key = Wire.NameKey(name);
-            HostLine? line;
-            lock (_gate)
-            {
-                if (!_pins.Remove(key)) return false;
-                _pinsDirty = true;
-                _hosts.TryGetValue(key, out line);
-                if (line is not null) RemoveHostLocked(line);
-            }
-            line?.Close();
-            SavePinsIfDirty(force: true);
-            _log.Write($"Host name {name} was forgotten" + (line is not null ? ", and that host was disconnected." : "."));
-            return true;
         }
 
         // ---------------------------------------------------------------- TCP
@@ -410,59 +375,48 @@ namespace KovaRelay
                 }
             }
             catch (CryptographicException) { }
-            if (!goodKey) { await Refuse(c, Wire.Reason.BadRequest, $"sent a host key the relay does not take (name {name})", run, true).ConfigureAwait(false); return; }
-            if (!goodSig) { await Refuse(c, Wire.Reason.BadSignature, $"sent a host signature that did not check out (name {name})", run, true).ConfigureAwait(false); return; }
+            // The name is never written to the log: Kova derives it from the hosted PC's password.
+            if (!goodKey) { await Refuse(c, Wire.Reason.BadRequest, "it sent a host key the relay does not accept", run, true).ConfigureAwait(false); return; }
+            if (!goodSig) { await Refuse(c, Wire.Reason.BadSignature, "it sent a host signature that did not verify", run, true).ConfigureAwait(false); return; }
 
-            string keyHash = Convert.ToHexString(SHA256.HashData(spki)).ToLowerInvariant();
+            byte[] keyHash = SHA256.HashData(spki);
             string nameKey = Wire.NameKey(name);
             byte[] udpKeyBytes = new byte[Wire.IdBytes];
-            Wire.Reason? no = null;
-            string why = "";
+            bool taken = false;
             HostLine? old = null, line = null;
             lock (_gate)
             {
-                long now = Environment.TickCount64;
-                _pins.TryGetValue(nameKey, out Pin? pin);
-                if (pin is not null)
+                // Nobody holds the name now: this host takes it. The same key: the host reconnected, and its new line
+                // replaces the old one. A different key while the holder is connected: refused. Once the holder goes
+                // away, any host may take the name.
+                if (_hosts.TryGetValue(nameKey, out old) && !CryptographicOperations.FixedTimeEquals(old.KeyHash, keyHash))
                 {
-                    if (!CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(pin.KeyHash), Encoding.ASCII.GetBytes(keyHash)))
-                    { no = Wire.Reason.NameTaken; why = $"it tried to register the name {name}, which another host has"; }
+                    taken = true;
+                    old = null;
                 }
-                else if (!_allowNewNames) { no = Wire.Reason.NewNamesOff; why = $"it tried to register the new name {name} while new names are turned off"; }
-                else if (_pins.Count >= Limits.MaxPinnedNames) { no = Wire.Reason.TooManyNames; why = $"it tried to register the name {name}, but the relay holds as many names as it will"; }
                 else
                 {
-                    AddrState a = c.Addr;
-                    if (now - a.NewNamesSince > 3_600_000) { a.NewNamesSince = now; a.NewNames = 0; }
-                    if (a.NewNames >= Limits.NewNamesPerAddressPerHour) { no = Wire.Reason.Busy; why = $"it tried to register the name {name}, but that address registered too many new names this hour"; }
-                    else
-                    {
-                        a.NewNames++;
-                        pin = new Pin { Name = name, KeyHash = keyHash, FirstSeen = DateTime.UtcNow, LastSeen = DateTime.UtcNow };
-                        _pins[nameKey] = pin;
-                    }
-                }
-                if (no is null)
-                {
-                    pin!.LastSeen = DateTime.UtcNow;
-                    _pinsDirty = true;
                     ulong udpKey;
                     do { RandomNumberGenerator.Fill(udpKeyBytes); udpKey = BinaryPrimitives.ReadUInt64BigEndian(udpKeyBytes); }
                     while (udpKey == 0 || _hostsByUdpKey.ContainsKey(udpKey));
-                    if (_hosts.TryGetValue(nameKey, out old)) RemoveHostLocked(old);
-                    line = new HostLine(c, pin.Name, nameKey, udpKey);
+                    if (old is not null) RemoveHostLocked(old);
+                    line = new HostLine(c, nameKey, keyHash, udpKey);
                     _hosts[nameKey] = line;
                     _hostsByUdpKey[udpKey] = line;
                     c.Addr.HostLines++;
                     MarkPairedLocked(c);
                 }
             }
-            if (no is not null) { await Refuse(c, no.Value, why, run, countFailure: false).ConfigureAwait(false); return; }
+            if (taken || line is null)
+            {
+                await Refuse(c, Wire.Reason.NameTaken, "another PC is already hosting with the same password", run, countFailure: false).ConfigureAwait(false);
+                return;
+            }
 
             old?.Close(true);
             _log.Write(old is not null
-                ? $"Host {line!.Name} connected again from {c.Text}; its old connection was closed."
-                : $"Host {line!.Name} connected from {c.Text}.");
+                ? $"A host connected again from {c.Text}. Its previous connection from {old.Conn.Text} was closed."
+                : $"A host connected from {c.Text}.");
             try
             {
                 // The line's send lock starts held, so no Incoming can go out before this Ok.
@@ -480,11 +434,10 @@ namespace KovaRelay
                     if (wasCurrent) RemoveHostLocked(line);
                     dropped = _pending.Values.Where(p => p.Host == line).ToList();
                     foreach (Pending p in dropped) RemovePendingLocked(p);
-                    if (_pins.TryGetValue(nameKey, out Pin? pin)) { pin.LastSeen = DateTime.UtcNow; _pinsDirty = true; }
                 }
                 foreach (Pending p in dropped) p.Done.TrySetResult(null);
                 line.Close();
-                if (!line.Replaced) _log.Write($"Host {line.Name} went away ({c.Text}).");
+                if (!line.Replaced) _log.Write($"The host at {c.Text} disconnected.");
             }
         }
 
@@ -552,9 +505,10 @@ namespace KovaRelay
             string why = "";
             lock (_gate)
             {
-                if (!_hosts.TryGetValue(nameKey, out HostLine? host)) { no = Wire.Reason.NoSuchHost; why = $"asked for host {name}, which is not connected"; }
-                else if (host.Pending >= Limits.PendingPerHost) { no = Wire.Reason.Busy; why = $"asked for host {name}, which has too many connections waiting"; }
-                else if (c.Addr.PendingAsClient >= Limits.PendingPerClient) { no = Wire.Reason.Busy; why = $"asked for host {name} with too many requests waiting"; }
+                if (OutOfMissesLocked(c.Addr)) { no = Wire.Reason.Busy; why = "it asked for too many hosts that were not connected this hour"; }
+                else if (!_hosts.TryGetValue(nameKey, out HostLine? host)) { no = Wire.Reason.NoSuchHost; why = "it asked for a host that is not connected (no host is using that password)"; c.Addr.Misses++; }
+                else if (host.Pending >= Limits.PendingPerHost) { no = Wire.Reason.Busy; why = $"it asked for the host at {host.Conn.Text}, which has too many connections waiting"; }
+                else if (c.Addr.PendingAsClient >= Limits.PendingPerClient) { no = Wire.Reason.Busy; why = "it has too many connection requests waiting"; }
                 else
                 {
                     byte[] idBytes = new byte[Wire.IdBytes];
@@ -589,7 +543,7 @@ namespace KovaRelay
             }
             if (hostSide is null)
             {
-                await Refuse(c, Wire.Reason.HostDidNotAnswer, $"asked for host {name}, which did not answer in time", run, countFailure: false).ConfigureAwait(false);
+                await Refuse(c, Wire.Reason.HostDidNotAnswer, $"the host at {p.Host.Conn.Text} did not answer in time", run, countFailure: false).ConfigureAwait(false);
                 return false;
             }
             await Splice(c, hostSide, p, run).ConfigureAwait(false);
@@ -607,7 +561,18 @@ namespace KovaRelay
                 string? name = Wire.ReadName(body, out int used);
                 if (name is null || used != body.Length)
                 { await Refuse(c, Wire.Reason.BadRequest, "it sent a badly formed check", run, true).ConfigureAwait(false); return; }
-                lock (_gate) answer = _hosts.ContainsKey(Wire.NameKey(name)) ? Wire.PingAnswer.HostHere : Wire.PingAnswer.HostAbsent;
+                bool spent;
+                lock (_gate)
+                {
+                    spent = OutOfMissesLocked(c.Addr);
+                    if (!spent)
+                    {
+                        answer = _hosts.ContainsKey(Wire.NameKey(name)) ? Wire.PingAnswer.HostHere : Wire.PingAnswer.HostAbsent;
+                        if (answer == Wire.PingAnswer.HostAbsent) c.Addr.Misses++;
+                    }
+                }
+                // Out of lookups: no answer about any host at all, so the relay cannot be used to test passwords.
+                if (spent) { await Refuse(c, Wire.Reason.Busy, "it asked about too many hosts that were not connected this hour", run, false).ConfigureAwait(false); return; }
             }
             try
             {
@@ -616,6 +581,18 @@ namespace KovaRelay
                 c.S.Shutdown(SocketShutdown.Send);
             }
             catch (Exception) { }
+        }
+
+        /// <summary>
+        /// Every host's name is made from its password, so asking for a host that is not there is, in effect, a wrong
+        /// password. An address gets Limits.MissesPerHour of those an hour (connects and checks together), then no answers
+        /// about any host until the hour is up. Under _gate.
+        /// </summary>
+        private static bool OutOfMissesLocked(AddrState a)
+        {
+            long now = Environment.TickCount64;
+            if (now - a.MissSince > Limits.MissWindowMs) { a.MissSince = now; a.Misses = 0; }
+            return a.Misses >= Limits.MissesPerHour;
         }
 
         // ---------------------------------------------------------------- Accept
@@ -645,7 +622,7 @@ namespace KovaRelay
 
         private async Task Splice(Conn client, Conn host, Pending p, CancellationToken run)
         {
-            var pair = new Pairing(p.Id, p.Host.NameKey, p.Host.Name, client.Text);
+            var pair = new Pairing(p.Id, p.Host.NameKey, p.Host.Conn.Text, client.Text);
             bool first;
             lock (_gate)
             {
@@ -661,7 +638,7 @@ namespace KovaRelay
             pair.Cts = cts;
             try
             {
-                if (first) _log.Write($"A controlling PC at {client.Text} connected to host {pair.Name}.");
+                if (first) _log.Write($"A controlling PC at {client.Text} connected to the host at {pair.HostText}.");
                 using (var t = Timeout(run))
                 {
                     // The client's Ok goes first: nothing the host sends can reach the client before it.
@@ -691,7 +668,7 @@ namespace KovaRelay
                 }
                 Release(client);
                 Release(host);
-                if (last) _log.Write($"The controlling PC at {client.Text} left host {pair.Name}.");
+                if (last) _log.Write($"The controlling PC at {client.Text} disconnected from the host at {pair.HostText}.");
             }
         }
 
@@ -797,30 +774,13 @@ namespace KovaRelay
                     }
                     foreach (Pairing p in idle)
                     {
-                        _log.Write($"Closed an idle connection between {p.ClientText} and host {p.Name} after 15 minutes without traffic.");
+                        _log.Write($"Closed an idle connection between {p.ClientText} and the host at {p.HostText} after 15 minutes without traffic.");
                         try { p.Cts?.Cancel(); } catch (Exception) { }
                     }
                     foreach (string n in notes) _log.Write(n);
-                    SavePinsIfDirty(force: false);
                 }
                 catch (Exception e) { Unexpected("housekeeping", e); }
             }
-        }
-
-        private void SavePinsIfDirty(bool force)
-        {
-            List<Pin> pins;
-            lock (_gate)
-            {
-                long now = Environment.TickCount64;
-                // At most one write every 5 seconds, so a host reconnecting in a loop cannot keep the disk busy.
-                if (!_pinsDirty || (!force && now - _pinsSavedAt < 5000)) return;
-                _pinsDirty = false;
-                _pinsSavedAt = now;
-                pins = _pins.Values.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-                    .Select(p => new Pin { Name = p.Name, KeyHash = p.KeyHash, FirstSeen = p.FirstSeen, LastSeen = p.LastSeen }).ToList();
-            }
-            _files.SavePins(pins);
         }
 
         // ---------------------------------------------------------------- per-address bookkeeping (call holding _gate)
@@ -980,7 +940,7 @@ namespace KovaRelay
         private void Unexpected(string what, Exception e)
         {
             Interlocked.Increment(ref UnexpectedErrors);
-            _log.Write($"Something unexpected went wrong while {what}: {e.GetType().Name}: {e.Message}");
+            _log.Write($"An unexpected error occurred while {what}: {e.GetType().Name}: {e.Message}");
         }
 
         /// <summary>IPv4-mapped addresses as plain IPv4, IPv6 without a scope.</summary>
@@ -1020,13 +980,13 @@ namespace KovaRelay
             // controlling PC opens (about 20 each), so its address gets far more room: each dial-back still needs its
             // one-time token, and a wrong one counts as a failure as always.
             public int HostLines;
+            public int Misses;      // lookups for absent hosts in this window (Limits.MissesPerHour)
+            public long MissSince;
             public double Tokens = Limits.BucketSize;
             public long TokensAt;
             public int Fails;
             public long FailSince;
             public long BlockedUntil;
-            public int NewNames;
-            public long NewNamesSince = long.MinValue / 2;
             public long LastNoteAt = long.MinValue / 2;
             public int Unnoted;
             public string UnnotedWhy = "";
@@ -1060,7 +1020,9 @@ namespace KovaRelay
         private sealed class HostLine
         {
             public readonly Conn Conn;
-            public readonly string Name, NameKey;
+            public readonly string NameKey;
+            public readonly byte[] KeyHash;           // SHA-256 of the host's public key
+            public readonly DateTime SinceUtc = DateTime.UtcNow;
             public readonly ulong UdpKey;
             public readonly SemaphoreSlim SendLock = new(0, 1);   // starts held: the Ok goes first
             public readonly CancellationTokenSource Closed = new();
@@ -1069,7 +1031,7 @@ namespace KovaRelay
             public volatile bool Replaced;
             private int _closed;
 
-            public HostLine(Conn conn, string name, string nameKey, ulong udpKey) { Conn = conn; Name = name; NameKey = nameKey; UdpKey = udpKey; }
+            public HostLine(Conn conn, string nameKey, byte[] keyHash, ulong udpKey) { Conn = conn; NameKey = nameKey; KeyHash = keyHash; UdpKey = udpKey; }
 
             public async Task<bool> Send(byte type, byte[] body, CancellationToken run)
             {
@@ -1109,13 +1071,13 @@ namespace KovaRelay
         private sealed class Pairing
         {
             public readonly ulong Id;
-            public readonly string NameKey, Name, ClientText;
+            public readonly string NameKey, HostText, ClientText;
             public long LastActivity = Environment.TickCount64;
             public CancellationTokenSource? Cts;
             public IPEndPoint? ClientUdp;                // guarded by _gate
             public readonly Bucket ToHost = new(), ToClient = new();
 
-            public Pairing(ulong id, string nameKey, string name, string clientText) { Id = id; NameKey = nameKey; Name = name; ClientText = clientText; }
+            public Pairing(ulong id, string nameKey, string hostText, string clientText) { Id = id; NameKey = nameKey; HostText = hostText; ClientText = clientText; }
         }
 
         /// <summary>UDP bytes allowed per direction of a pair: about 2 MB a second, beyond that packets are dropped.</summary>

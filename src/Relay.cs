@@ -59,25 +59,84 @@ namespace TailRemote
         private static int Count(this string s, Func<char, bool> f) { int n = 0; foreach (char c in s) if (f(c)) n++; return n; }
 
         /// <summary>What Kova says for each of the relay's refusals (the relay sends a code, never words of its own).</summary>
-        public static string Explain(Wire.Reason r, string name) => r switch
+        public static string Explain(Wire.Reason r, string name)
         {
-            Wire.Reason.NoSuchHost => "No PC called " + name + " is connected to the relay right now. Check the name, and that Kova on that PC is hosting through this relay.",
-            Wire.Reason.HostDidNotAnswer => name + " is connected to the relay but did not answer in time. Try again.",
-            Wire.Reason.Busy => "The relay is busy, or has had too many connections from here. Try again in a minute.",
-            Wire.Reason.NameTaken => "Another PC already uses the name " + name + " on this relay. Choose another name in Host through a relay, or ask whoever runs the relay to forget the old one.",
-            Wire.Reason.NewNamesOff => "The relay is not taking new names. Ask whoever runs it to turn on Allow new host names, or use a name it already knows.",
-            Wire.Reason.TooManyNames => "The relay holds as many names as it will. Ask whoever runs it to forget some.",
-            Wire.Reason.BadSignature => "The relay could not check this PC's identity. Try again.",
-            _ => "The relay refused the connection.",
-        };
+            // A name made from the password is never shown: it means nothing to anyone.
+            string pc = IsChannel(name) ? "the PC" : name;
+            return r switch
+            {
+                Wire.Reason.NoSuchHost => pc == "the PC"
+                    ? "No PC is hosting on this relay with that password right now. Check the password, and that Kova on the other PC is hosting through this relay."
+                    : "No PC called " + name + " is connected to the relay right now.",
+                Wire.Reason.HostDidNotAnswer => "The relay found " + pc + ", but it did not answer in time. Try again.",
+                Wire.Reason.Busy => "The relay is busy, or has had too many connections from this PC. Try again in a minute.",
+                Wire.Reason.NameTaken => "Another PC is already hosting on this relay with the same password. Each PC needs its own password.",
+                Wire.Reason.NewNamesOff or Wire.Reason.TooManyNames => "The relay is not accepting new PCs. Update Kova Relay to the latest version.",
+                Wire.Reason.BadSignature => "The relay could not verify this PC's identity. Try again.",
+                _ => "The relay refused the connection.",
+            };
+        }
 
         /// <summary>
-        /// Relay only that can work: relay only, through a relay, and a relay address and name that read. Otherwise a host
+        /// Relay only that can work: relay only, through a relay, and a relay address that reads. Otherwise a host
         /// listens directly (and opens its port), or nobody could ever reach it.
         /// </summary>
-        public static bool OnlyUsable(bool relayOnly, bool relayHosting, string? address, string? name, int port) =>
-            relayOnly && relayHosting && !string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(name)
-            && Parse(name.Trim() + "@" + address.Trim(), port, out _) != null;
+        public static bool OnlyUsable(bool relayOnly, bool relayHosting, string? address, int port) =>
+            relayOnly && relayHosting && !string.IsNullOrWhiteSpace(address) && Parse("x@" + address.Trim(), port, out _) != null;
+
+        // ---- 4.6: the password is the meeting point on a relay (as NVDA Remote's key is) ----
+
+        private static readonly ConcurrentDictionary<string, string> Channels = new();
+
+        /// <summary>
+        /// What a host registers under on a relay, and what a controlling PC asks the relay for: made from the password
+        /// alone, so the PC reached is the one hosting with the password typed, and there are no names to choose. It is
+        /// 40 hex characters (a valid relay name), from PBKDF2-SHA256 with 600,000 rounds: the password itself never
+        /// reaches the relay, and guessing it back from this is slow. Kept per password for the session (every file
+        /// and screen connection asks for it again).
+        /// </summary>
+        public static string Channel(string password) => Channels.GetOrAdd(password, p =>
+        {
+            byte[] key = System.Security.Cryptography.Rfc2898DeriveBytes.Pbkdf2(
+                System.Text.Encoding.UTF8.GetBytes(p), "Kova relay channel 1"u8.ToArray(), 600_000, HashAlgorithmName.SHA256, 20);
+            return Convert.ToHexString(key).ToLowerInvariant();
+        });
+
+        /// <summary>Whether a relay name is one made from a password (Channel), so never shown to people.</summary>
+        public static bool IsChannel(string name)
+        {
+            if (name.Length != 40) return false;
+            foreach (char c in name) if (!char.IsAsciiHexDigitLower(c)) return false;
+            return true;
+        }
+
+        /// <summary>A relay address with no name in front ("@relay" or "@relay:port"): the PC is found by the password.</summary>
+        public static bool IsByPassword(string address) => address.TrimStart().StartsWith('@');
+
+        /// <summary>"@relay" (or "@relay#tag") made into "channel@relay" for this password; anything else is left as it is.</summary>
+        public static string WithChannel(string address, string password) =>
+            IsByPassword(address) ? Channel(password) + "@" + RelayPart(address) : address;
+
+        /// <summary>How a relay address reads to people: the relay alone ("relay.example.com"), never the code made from the password.</summary>
+        public static string Shown(string address) => IsByPassword(address) ? RelayPart(address) : address;
+
+        /// <summary>
+        /// A PC reached through a relay by its password, as saved and compared: "@relay#tag". The tag (8 hex characters
+        /// from a hash of the password's code) tells two PCs on the same relay apart, so saving, switching to and waking
+        /// one never touches another; it is too short to reveal anything about the password.
+        /// </summary>
+        public static string Tagged(string relayAt, string password)
+        {
+            byte[] h = SHA256.HashData(System.Text.Encoding.ASCII.GetBytes("Kova saved PC tag 1|" + Channel(password)));
+            return "@" + relayAt + "#" + Convert.ToHexString(h, 0, 4).ToLowerInvariant();
+        }
+
+        private static string RelayPart(string address)
+        {
+            string a = address.Trim()[1..];
+            int hash = a.IndexOf('#');
+            return hash < 0 ? a : a[..hash];
+        }
 
         public static IPEndPoint Resolve(Target t)
         {
@@ -137,14 +196,18 @@ namespace TailRemote
                     var (type, body) = Wire.ReadFrame(s);
                     if (type == Wire.Refused)
                         return body.Length >= 1 && (Wire.Reason)body[0] != Wire.Reason.BadRequest
-                            ? new(true, null, "The relay " + where + " is up, but turned this check away: " + Explain((Wire.Reason)body[0], t.Name))
-                            : new(true, null, "The relay " + where + " is up. It is an older Kova Relay, so it cannot say which PCs are connected; updating it lets it.");
-                    if (type != Wire.Ok || body.Length < 1) return new(true, null, "The relay " + where + " is up.");
+                            ? new(true, null, "The relay " + where + " is reachable, but declined the check: " + Explain((Wire.Reason)body[0], t.Name))
+                            : new(true, null, "The relay " + where + " is reachable. It runs an older version of Kova Relay, so it cannot report which PCs are connected.");
+                    if (type != Wire.Ok || body.Length < 1) return new(true, null, "The relay " + where + " is reachable.");
                     return (Wire.PingAnswer)body[0] switch
                     {
-                        Wire.PingAnswer.HostHere => new(true, true, "The relay " + where + " is up, and " + t.Name + " is connected to it."),
-                        Wire.PingAnswer.HostAbsent => new(true, false, "The relay " + where + " is up, but no PC called " + t.Name + " is connected to it right now."),
-                        _ => new(true, null, "The relay " + where + " is up."),
+                        Wire.PingAnswer.HostHere => new(true, true, IsChannel(t.Name)
+                            ? "The relay " + where + " is reachable, and a PC is hosting on it with this password."
+                            : "The relay " + where + " is reachable, and " + t.Name + " is connected to it."),
+                        Wire.PingAnswer.HostAbsent => new(true, false, IsChannel(t.Name)
+                            ? "The relay " + where + " is reachable, but no PC is hosting on it with this password right now."
+                            : "The relay " + where + " is reachable, but no PC called " + t.Name + " is connected to it right now."),
+                        _ => new(true, null, "The relay " + where + " is reachable."),
                     };
                 }
             }
@@ -154,7 +217,7 @@ namespace TailRemote
             }
             catch (Exception e) when (e is System.IO.IOException or SocketException or AggregateException or System.IO.InvalidDataException)
             {
-                return new(false, null, "The relay " + where + " did not answer properly. Check its address and port, and that Kova Relay is running there.");
+                return new(false, null, "The relay " + where + " did not respond correctly. Check its address and port, and that Kova Relay is running there.");
             }
         }
 
@@ -172,7 +235,7 @@ namespace TailRemote
                 s.ReadTimeout = Wire.PairWaitMs + timeoutMs;
                 (byte type, byte[] body) f;
                 try { f = Wire.ReadFrame(s); }
-                catch (Exception e) when (e is System.IO.IOException or System.IO.InvalidDataException) { throw new InvalidOperationException("The relay hung up before " + name + " answered. Try again."); }
+                catch (Exception e) when (e is System.IO.IOException or System.IO.InvalidDataException) { throw new InvalidOperationException("The relay closed the connection before " + (IsChannel(name) ? "the PC" : name) + " answered. Try again."); }
                 if (f.type == Wire.Refused && f.body.Length >= 1) throw new InvalidOperationException(Explain((Wire.Reason)f.body[0], name));
                 if (f.type != Wire.Ok || f.body.Length != Wire.IdBytes) throw new InvalidOperationException("The relay answered with something Kova does not understand. Update Kova Relay.");
                 id = f.body;
@@ -317,7 +380,8 @@ namespace TailRemote
                         AnnounceUdp();
                         Registered = true;
                         wait = 2000;
-                        Say("Reachable through the relay " + _target.RelayHost + " as " + _target.Name + ".");
+                        Say(Relay.IsChannel(_target.Name) ? "Connected to the Kova Relay at " + _target.RelayHost + ". Other computers can now connect through it."
+                            : "Reachable through the relay " + _target.RelayHost + " as " + _target.Name + ".");
                         Serve(tcp, s);
                     }
                 }
@@ -452,7 +516,8 @@ namespace TailRemote
             if (d.Length <= Wire.UdpHead || d[0] != Wire.Udp0 || d[1] != Wire.Udp1) return false;
             ulong id = BitConverter.ToUInt64(d, 2);
             var route = Relay.RouteOfId(id);
-            if (route == null || route.Value.Via != this) return false;
+            // Any pairing this process holds on this relay: the listen-only registration shares the relay's address (4.6).
+            if (route == null) return false;
             from = new IPEndPoint(route.Value.Stand, 1);
             d = d[Wire.UdpHead..];
             return true;

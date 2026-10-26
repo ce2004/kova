@@ -417,7 +417,7 @@ namespace TailRemote
                 5355 => "Windows network name lookups",
                 5900 => "VNC",
                 6837 => "NVDA Remote",
-                41641 => "Tailscale itself",
+                41641 => "a VPN program",
                 _ => null,
             };
             return owner == null ? null : "Port " + port + " belongs to " + owner + ". Choose another, such as " + DefaultPort + ".";

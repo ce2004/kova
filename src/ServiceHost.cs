@@ -463,7 +463,7 @@ namespace TailRemote
                 Startup.Apply(false);
                 // Through a relay only (4.5), nothing is opened: the service takes its port on this PC alone.
                 if (old != null && old.Port != s.Port) Firewall.Apply(false, old.Port);
-                if (!Relay.OnlyUsable(s.RelayOnly, s.RelayHosting, s.RelayAddress, s.RelayName, s.RelayPort)) Firewall.Apply(true, s.Port);
+                if (!Relay.OnlyUsable(s.RelayOnly, s.RelayHosting, s.RelayAddress, s.RelayPort)) Firewall.Apply(true, s.Port);
                 Firewall.Clean(new[] { s.Port }, thorough: false); // already administrator: rules for copies that are gone go too
 
                 if (RunHidden("sc.exe", "start " + Name) != 0) return Fail("The service was installed but would not start.");

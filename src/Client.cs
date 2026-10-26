@@ -159,6 +159,10 @@ namespace TailRemote
         /// </summary>
         public static Client Connect(string address, int port, string password, Player player, Action<string> status, int lockedStep = -1, int answerMs = 8000, IHostTrust? trust = null)
         {
+            // "@relay": the PC hosting on that relay with this password (4.6), as NVDA Remote finds its peer by key.
+            // Messages name the PC as typed: the code made from the password is never shown.
+            string shown = Relay.IsByPassword(address) ? "the PC on the relay " + Relay.Shown(address) : address.Trim();
+            address = Relay.WithChannel(address, password);
             // A relay address carries its own port, or the relay's usual one (never the Port setting, which is the host's).
             var route = Relay.Parse(address, KovaRelayWire.Wire.DefaultPort, out string? relayProblem);
             if (relayProblem != null) throw new InvalidOperationException(relayProblem);
@@ -184,17 +188,15 @@ namespace TailRemote
                 // Over 255 characters (or otherwise not a name at all): .NET's own wording was read out.
                 catch (ArgumentException) { throw new InvalidOperationException("That address is too long, or is not a PC name or address. Check it."); }
                 if (addrs.Length == 0)
-                    throw new InvalidOperationException(Protocol.LocalTailscaleUp()
-                        ? "Could not find " + address + ". Check the name or address."
-                        : "Could not find " + address + ". If it is a Tailscale name, open Tailscale on this PC and sign in.");
+                    throw new InvalidOperationException("Could not find " + address + ". Check the name or address, and that this PC is connected to the network it is on.");
                 bool done;
                 try { done = tcp.ConnectAsync(addrs, port).Wait(answerMs); }
                 catch (AggregateException e) when (e.InnerException is SocketException se && se.SocketErrorCode == SocketError.ConnectionRefused)
                 {
-                    throw new InvalidOperationException(address + " is on, but Kova is not hosting there. Start hosting on that PC.");
+                    throw new InvalidOperationException(address + " is reachable, but Kova is not hosting there. Start hosting on that PC.");
                 }
                 if (!done)
-                    throw new TimeoutException("No answer from " + address + ". It may be off or not hosting, or its port is not open: use Port editor on that PC.");
+                    throw new TimeoutException("No response from " + address + ". It may be turned off or not hosting, or its port may be closed. Use Port editor on that PC to check.");
             }
             catch (AggregateException e) { tcp.Dispose(); throw new InvalidOperationException(e.InnerException?.Message ?? e.Message); }
             catch { tcp.Dispose(); throw; }
@@ -227,7 +229,7 @@ namespace TailRemote
                 byte[] identity = hello[Protocol.HelloIdentityAt..Protocol.HelloSignatureAt];
                 var (knownIdentity, ticket) = trust?.Known(pc) ?? (null, null);
                 if (knownIdentity != null && !knownIdentity.AsSpan().SequenceEqual(identity))
-                    throw new HostChangedException(pc, address.Trim(), knownIdentity, identity);
+                    throw new HostChangedException(pc, shown, knownIdentity, identity);
                 byte[] hostNonce = hello[4..20];
                 byte[] passwordKey = Protocol.DeriveKey(password, hello.AsSpan(Protocol.HelloSaltAt, Protocol.SaltBytes));
                 byte[] myNonce = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
@@ -345,7 +347,7 @@ namespace TailRemote
                 if (files != null) Keep(filesTo!, files);
                 udp?.Dispose(); tcp.Dispose();
                 if (e.InnerException is SocketException { SocketErrorCode: SocketError.TimedOut })
-                    throw new InvalidOperationException("No answer from " + address.Trim() + " in time: the line may be very slow, or Kova there is busy.");
+                    throw new InvalidOperationException("No response from " + shown + " in time. The connection may be very slow, or Kova there may be busy.");
                 throw new InvalidOperationException("The host closed the connection.");
             }
             catch
@@ -388,7 +390,14 @@ namespace TailRemote
         }
 
         /// <summary>How a PC is remembered (its identity, its ticket, its file transfers): its address and port as typed.</summary>
-        internal static string TrustKey(string address, int port) => address.Trim().ToLowerInvariant() + ":" + port;
+        internal static string TrustKey(string address, int port)
+        {
+            string a = address.Trim().ToLowerInvariant();
+            int at = a.IndexOf('@');
+            if (at > 0 && Relay.IsChannel(a[..at]))
+                return "relay:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("Kova trust key 1|" + a))).ToLowerInvariant()[..32];
+            return a + ":" + port;
+        }
 
         /// <summary>Reads exactly buffer.Length bytes, all of them before the deadline.</summary>
         private static void ReadWithin(NetworkStream s, Span<byte> buffer, long deadline)
