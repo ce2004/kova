@@ -232,12 +232,15 @@ namespace TailRemote
             var r = relay.Result;
             if (r.Up && r.HostHere == true) return new(Relay.Tagged(relayAt, password), Protocol.DefaultPort, null, false);
             if (direct.Result) return new(t.RelayHost, directPort, null, false);
-            if (r.Up) return new(Relay.Tagged(relayAt, password), Protocol.DefaultPort, r.Said, true);
+            if (r.Up) return new(Relay.Tagged(relayAt, password), Protocol.DefaultPort, r.HostHere == false ? r.Said : null, r.HostHere == false);
             return new(t.RelayHost, directPort,
                 "Could not reach " + typed + ", either as a PC hosting Kova or as a Kova Relay. Check the address, and that the PC is turned on and hosting.", true);
         }
 
-        /// <summary>Whether something takes connections at that address and port (a PC hosting Kova, most likely).</summary>
+        /// <summary>
+        /// Whether Kova is hosting at that address and port: it must greet with Kova's own first bytes ("TRM"). 4.6.0 took
+        /// any answer as a PC, so a busy relay on that port was connected to as if it were the PC ("damaged first message").
+        /// </summary>
         private static bool Answers(string host, int port)
         {
             try
@@ -245,7 +248,13 @@ namespace TailRemote
                 using var tcp = new TcpClient(AddressFamily.InterNetworkV6);
                 tcp.Client.DualMode = true;
                 var addrs = System.Net.Dns.GetHostAddresses(host);
-                return addrs.Length > 0 && tcp.ConnectAsync(addrs, port).Wait(5000) && tcp.Connected;
+                if (addrs.Length == 0 || !tcp.ConnectAsync(addrs, port).Wait(5000) || !tcp.Connected) return false;
+                var s = tcp.GetStream();
+                s.ReadTimeout = 4000;
+                byte[] head = new byte[3];
+                int got = 0;
+                while (got < 3) { int n = s.Read(head, got, 3 - got); if (n <= 0) return false; got += n; }
+                return head[0] == (byte)'T' && head[1] == (byte)'R' && head[2] == (byte)'M';
             }
             catch { return false; }
         }

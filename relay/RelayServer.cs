@@ -42,7 +42,7 @@ namespace KovaRelay
         public const long BlockMs = 10 * 60_000;        // ...block the address for 10 minutes (closed at once, nothing read)
         public const int MaxAddressEntries = 20_000;    // per-address table cap; the longest unused go first
         public const long ForgetAddressAfterMs = 60 * 60_000; // an idle address entry is dropped after an hour
-        public const int MissesPerHour = 30;            // lookups for a host that is not there (wrong passwords, in effect), per address per hour
+        public const int MissesPerHour = 30;            // DIFFERENT absent hosts asked for (different wrong passwords, in effect), per address per hour
         public const long MissWindowMs = 3_600_000;     // ...after which the address's lookups are turned away until the hour is up
         public const int HostAddressFactor = 8;         // an address with a registered host: 8 times the connections, no rate bucket (HostLines)
         public const int PendingPerHost = 64;           // pairings waiting for one host to dial back (two PCs connecting at once ask for about 40)
@@ -505,8 +505,8 @@ namespace KovaRelay
             string why = "";
             lock (_gate)
             {
-                if (OutOfMissesLocked(c.Addr)) { no = Wire.Reason.Busy; why = "it asked for too many hosts that were not connected this hour"; }
-                else if (!_hosts.TryGetValue(nameKey, out HostLine? host)) { no = Wire.Reason.NoSuchHost; why = "it asked for a host that is not connected (no host is using that password)"; c.Addr.Misses++; }
+                if (!MayAskLocked(c.Addr, nameKey)) { no = Wire.Reason.Busy; why = "it asked for too many different hosts that were not connected this hour"; }
+                else if (!_hosts.TryGetValue(nameKey, out HostLine? host)) { no = Wire.Reason.NoSuchHost; why = "it asked for a host that is not connected (no host is using that password)"; MissLocked(c.Addr, nameKey); }
                 else if (host.Pending >= Limits.PendingPerHost) { no = Wire.Reason.Busy; why = $"it asked for the host at {host.Conn.Text}, which has too many connections waiting"; }
                 else if (c.Addr.PendingAsClient >= Limits.PendingPerClient) { no = Wire.Reason.Busy; why = "it has too many connection requests waiting"; }
                 else
@@ -564,11 +564,12 @@ namespace KovaRelay
                 bool spent;
                 lock (_gate)
                 {
-                    spent = OutOfMissesLocked(c.Addr);
+                    string key = Wire.NameKey(name);
+                    spent = !MayAskLocked(c.Addr, key);
                     if (!spent)
                     {
-                        answer = _hosts.ContainsKey(Wire.NameKey(name)) ? Wire.PingAnswer.HostHere : Wire.PingAnswer.HostAbsent;
-                        if (answer == Wire.PingAnswer.HostAbsent) c.Addr.Misses++;
+                        answer = _hosts.ContainsKey(key) ? Wire.PingAnswer.HostHere : Wire.PingAnswer.HostAbsent;
+                        if (answer == Wire.PingAnswer.HostAbsent) MissLocked(c.Addr, key);
                     }
                 }
                 // Out of lookups: no answer about any host at all, so the relay cannot be used to test passwords.
@@ -585,15 +586,20 @@ namespace KovaRelay
 
         /// <summary>
         /// Every host's name is made from its password, so asking for a host that is not there is, in effect, a wrong
-        /// password. An address gets Limits.MissesPerHour of those an hour (connects and checks together), then no answers
-        /// about any host until the hour is up. Under _gate.
+        /// password. An address may ask after Limits.MissesPerHour DIFFERENT absent hosts an hour (connects and checks
+        /// together); then it gets no answer about any host it has not already asked about, until the hour is up. Asking
+        /// again for the same one is never counted: a controlling PC reconnecting every second while its host restarts
+        /// asks for the same host each time (4.6.0 counted each try, and locked the owner out for an hour). Under _gate.
         /// </summary>
-        private static bool OutOfMissesLocked(AddrState a)
+        private static bool MayAskLocked(AddrState a, string nameKey)
         {
             long now = Environment.TickCount64;
-            if (now - a.MissSince > Limits.MissWindowMs) { a.MissSince = now; a.Misses = 0; }
-            return a.Misses >= Limits.MissesPerHour;
+            if (now - a.MissSince > Limits.MissWindowMs) { a.MissSince = now; a.MissNames?.Clear(); }
+            if (a.MissNames != null && a.MissNames.Contains(nameKey)) return true;
+            return (a.MissNames?.Count ?? 0) < Limits.MissesPerHour;
         }
+
+        private static void MissLocked(AddrState a, string nameKey) => (a.MissNames ??= new HashSet<string>(StringComparer.Ordinal)).Add(nameKey);
 
         // ---------------------------------------------------------------- Accept
 
@@ -980,7 +986,7 @@ namespace KovaRelay
             // controlling PC opens (about 20 each), so its address gets far more room: each dial-back still needs its
             // one-time token, and a wrong one counts as a failure as always.
             public int HostLines;
-            public int Misses;      // lookups for absent hosts in this window (Limits.MissesPerHour)
+            public HashSet<string>? MissNames; // the different absent hosts asked for in this window (Limits.MissesPerHour)
             public long MissSince;
             public double Tokens = Limits.BucketSize;
             public long TokensAt;

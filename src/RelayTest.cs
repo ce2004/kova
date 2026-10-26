@@ -153,6 +153,13 @@ namespace TailRemote
                 using (var stillIn = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
                     Check(pings == 30 && !stillIn.ListenOnly, "30 relay checks in a row are all answered and never get this PC blocked (" + pings + ")");
 
+                // 4.6.1: asking for the same absent PC over and over (reconnecting every second while its host restarts) never
+                // locks this PC out; 4.6.0 counted each try as a guess and refused everything for an hour after 30.
+                string restarting = Relay.Channel("a-pc-that-restarts");
+                int stillAnswered = 0;
+                for (int i = 0; i < 45; i++) if (Relay.Check("127.0.0.1:" + relayPort, restarting).HostHere == false) stillAnswered++;
+                Check(stillAnswered == 45, "45 checks for the same absent PC were all answered, never counted as guesses (" + stillAnswered + ")");
+
                 // 4.6: by password, as NVDA Remote: the host is on the relay under the code made from its password, and a
                 // controlling PC that types only the relay's address and that password reaches it; another password does not.
                 using (var byPw = new Host(hostPort + 3, "second-pc-password", "second-pc-listen", _ => { }))
@@ -238,6 +245,11 @@ namespace TailRemote
                 Check(stillOpen == 0, "300 junk connections (" + opened + " opened, " + refused + " refused at once) were all closed by the relay within its deadline (" + stillOpen + " still open)");
                 using (var after = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
                     Check(!after.ListenOnly, "after the flood, a real controlling PC still gets in through the relay");
+
+                // Last (it uses up this address's budget): many DIFFERENT absent PCs, in effect guessed passwords, are cut off.
+                int declined = 0;
+                for (int i = 0; i < 40; i++) { var g = Relay.Check("127.0.0.1:" + relayPort, Relay.Channel("guess-" + i)); if (g.Up && g.HostHere == null) declined++; }
+                Check(declined >= 10, "40 different absent PCs asked for: the relay stopped answering after its hourly limit (" + declined + " declined)");
             }
             catch (Exception e) { Check(false, "threw " + e); }
             finally

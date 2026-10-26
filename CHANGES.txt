@@ -1,3 +1,7 @@
+4.6.1
+Bug fixed: after a hosted PC restarted or reconnected to the relay, the PC controlling it could be locked out of the relay for an hour, and Connect to a PC then said the connection was damaged. Reconnecting never counts against you now.
+Bug fixed: Connect to a PC could mistake a Kova Relay for the PC itself when the relay was busy, and say the PC's first message was damaged. It now only connects directly when Kova itself answers.
+
 4.6.0
 New feature: Kova Relay works like NVDA Remote. There are no names to choose: the password itself pairs the two PCs. Each PC you host gets its own password, and the password you type decides which PC you reach. The password never goes to the relay; the relay only sees a code made from it.
 New feature: Connect to a PC no longer asks how to connect. Enter the address of the PC or of a Kova Relay and the password, and Kova finds the way by itself.
