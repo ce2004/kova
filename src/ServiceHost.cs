@@ -53,6 +53,7 @@ namespace TailRemote
             public string RelayAddress { get; set; } = "";
             public int RelayPort { get; set; } = 47200;
             public string RelayName { get; set; } = "";
+            public bool RelayOnly { get; set; }
 
             // Null-safe: a "null" in the file (edited by hand, or damaged) used to stop hosting with a crash.
             public static string Seal(string? s) => string.IsNullOrEmpty(s) ? "" : Convert.ToBase64String(Native.Protect(System.Text.Encoding.UTF8.GetBytes(s), true, machine: true));
@@ -249,6 +250,7 @@ namespace TailRemote
             public string RelayAddress { get; set; } = "";
             public int RelayPort { get; set; } = 47200;
             public string RelayName { get; set; } = "";
+            public bool RelayOnly { get; set; }
         }
 
         private const string HandoverPrefix = "Kova-setup-";
@@ -316,7 +318,7 @@ namespace TailRemote
                                     Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword,
                                     CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging, User = me.Name,
                                     Identity = Settings.Unprotect(s.HostIdentityEnc),
-                                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName,
+                                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName, RelayOnly = s.RelayOnly,
                                 }));
                             try { _lastError = System.Text.Encoding.UTF8.GetString(ReadBlock(pipe)); } catch { }
                             if (_lastError?.StartsWith('\u0001') == true) { ServiceIdentity = _lastError[1..]; _lastError = null; }
@@ -374,7 +376,7 @@ namespace TailRemote
             {
                 Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging,
                 Identity = Settings.Unprotect(s.HostIdentityEnc),
-                RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName,
+                RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName, RelayOnly = s.RelayOnly,
             };
         }
 
@@ -442,7 +444,7 @@ namespace TailRemote
                     // The window's identity, so the service is the same PC to the controlling PCs; one made by the
                     // service itself (before any window handed one over) is kept only if the window has none.
                     HostIdentityEnc = ChooseIdentity(old, s.Identity),
-                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress ?? "", RelayPort = s.RelayPort, RelayName = s.RelayName ?? "",
+                    RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress ?? "", RelayPort = s.RelayPort, RelayName = s.RelayName ?? "", RelayOnly = s.RelayOnly,
                 };
                 // Ctrl+Alt+Del from a service needs this policy (1 = services may send it).
                 using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"))
@@ -459,8 +461,9 @@ namespace TailRemote
                 // The service replaces the at-sign-in task, and opens its port (closing the one it
                 // used before, which Remove would otherwise never close).
                 Startup.Apply(false);
+                // Through a relay only (4.5), nothing is opened: the service takes its port on this PC alone.
                 if (old != null && old.Port != s.Port) Firewall.Apply(false, old.Port);
-                Firewall.Apply(true, s.Port);
+                if (!Relay.OnlyUsable(s.RelayOnly, s.RelayHosting, s.RelayAddress, s.RelayName, s.RelayPort)) Firewall.Apply(true, s.Port);
                 Firewall.Clean(new[] { s.Port }, thorough: false); // already administrator: rules for copies that are gone go too
 
                 if (RunHidden("sc.exe", "start " + Name) != 0) return Fail("The service was installed but would not start.");

@@ -26,6 +26,9 @@ namespace TailRemote
         private static volatile bool _stopping;
         private static System.Threading.Timer? _folders;
 
+        /// <summary>Relay only, and a relay is filled in: otherwise the service hosts directly, or nobody could ever reach it.</summary>
+        private static bool RelayOnlyUsable(ServiceHost.Config cfg) => Relay.OnlyUsable(cfg.RelayOnly, cfg.RelayHosting, cfg.RelayAddress, cfg.RelayName, cfg.RelayPort);
+
         /// <summary>Starts hosting from the service. Retries until it can (the network may not be up yet at boot); never throws.</summary>
         public static void StartHosting()
         {
@@ -67,7 +70,7 @@ namespace TailRemote
                 try
                 {
                     _host = new Host(cfg.Port, password, listenPassword, ServiceHost.Log,
-                        string.IsNullOrEmpty(cfg.CaptureDevice) ? null : cfg.CaptureDevice, identity)
+                        string.IsNullOrEmpty(cfg.CaptureDevice) ? null : cfg.CaptureDevice, identity, relayOnly: RelayOnlyUsable(cfg))
                     {
                         SecureAttention = SendSecureAttention,
                         FileUser = NativeService.ConsoleUser, // file tools with the signed-in user's rights, never SYSTEM's

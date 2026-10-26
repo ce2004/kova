@@ -1,3 +1,12 @@
+4.5.0
+New feature: File, Connect to a PC (Control N), the first thing in the File menu. It asks one thing at a time: a saved PC or a new one, then how you reach it (by its address, or through a Kova Relay), then where it is and its password, and connects. It can save the PC for next time too.
+New feature: File, Host this PC (Control H). It asks how other PCs should reach this PC, then the port or the relay, then the passwords, says what the other PCs need to type, and starts hosting. If the Kova service is on, it sets up the service the same way.
+New feature: a PC can now be hosted through a Kova Relay only. Nothing on that PC is opened to the internet and no port is opened in Windows Firewall: every connection comes in through the relay, so it works behind any home router. Choose it in Host this PC, or in File, Host: how other PCs reach this PC.
+New feature: Kova checks that the relay is up. Both step-by-step windows check it before going on and say what they found, including whether the PC you want is connected to it. If the relay is down, you can still carry on. File, Check the relay is up does the same at any time.
+New feature: Kova Relay answers these checks without counting them against your PC. An older Kova Relay still shows as up, but cannot say which PCs are connected until you update it.
+Changed: File, Host through a relay too is now File, Host: how other PCs reach this PC, with three choices: directly, through a relay only, or both. Your old setting carries over.
+Changed: Relay address and Relay name only show when this PC uses a relay.
+
 4.4.1
 New feature: Kova Relay has a Port editor, the same as Kova's. Find it next to the port in the relay's window. It lists the ports the relay uses and has used, says which are open in Windows Firewall and which one is in use, opens or closes a port, and cleans up old firewall rules the relay left behind. It never closes the port the relay is using.
 New feature: when you change Kova Relay's port, it offers to open the new port in Windows Firewall and close the old one, with one administrator prompt. If it runs as a Windows service, the service moves to the new port straight away.

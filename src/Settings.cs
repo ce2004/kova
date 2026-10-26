@@ -73,6 +73,8 @@ namespace TailRemote
         public string RelayAddress { get; set; } = "";
         public int RelayPort { get; set; } = 47200;
         public string RelayName { get; set; } = "";
+        /// <summary>Host (4.5): reachable only through the relay; nothing is opened to other PCs directly.</summary>
+        public bool RelayOnly { get; set; }
 
 
         /// <summary>Controlling: take text and files the remote PC sends without being asked (never onto the clipboard by itself either way).</summary>

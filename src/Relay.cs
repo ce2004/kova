@@ -71,6 +71,14 @@ namespace TailRemote
             _ => "The relay refused the connection.",
         };
 
+        /// <summary>
+        /// Relay only that can work: relay only, through a relay, and a relay address and name that read. Otherwise a host
+        /// listens directly (and opens its port), or nobody could ever reach it.
+        /// </summary>
+        public static bool OnlyUsable(bool relayOnly, bool relayHosting, string? address, string? name, int port) =>
+            relayOnly && relayHosting && !string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(name)
+            && Parse(name.Trim() + "@" + address.Trim(), port, out _) != null;
+
         public static IPEndPoint Resolve(Target t)
         {
             IPAddress[] addrs;
@@ -104,6 +112,50 @@ namespace TailRemote
                 return (tcp, s, hello[4..]);
             }
             catch { tcp.Dispose(); throw; }
+        }
+
+        /// <summary>What a relay check found: whether it is up, and (when a name was asked about) whether that PC is connected to it.</summary>
+        public sealed record CheckResult(bool Up, bool? HostHere, string Said);
+
+        /// <summary>
+        /// Is the relay up? relayAddress: "relay" or "relay:port". name: a host to ask about, or null. Never throws;
+        /// takes up to about 6 seconds when the relay does not answer. Uses the relay's Ping, which it never counts
+        /// against this PC (an older relay refuses it, which still shows it is up).
+        /// </summary>
+        public static CheckResult Check(string relayAddress, string? name)
+        {
+            string asName = string.IsNullOrWhiteSpace(name) ? "x" : name.Trim();
+            if (Parse(asName + "@" + relayAddress, Wire.DefaultPort, out string? problem) is not Target t)
+                return new(false, null, problem ?? "That is not a relay address.");
+            string where = t.RelayHost + (t.RelayPort == Wire.DefaultPort ? "" : ", port " + t.RelayPort);
+            try
+            {
+                var (tcp, s, _) = Open(Resolve(t), 6000);
+                using (tcp)
+                {
+                    Wire.WriteFrame(s, Wire.Ping, string.IsNullOrWhiteSpace(name) ? ReadOnlySpan<byte>.Empty : Wire.NameBody(t.Name));
+                    var (type, body) = Wire.ReadFrame(s);
+                    if (type == Wire.Refused)
+                        return body.Length >= 1 && (Wire.Reason)body[0] != Wire.Reason.BadRequest
+                            ? new(true, null, "The relay " + where + " is up, but turned this check away: " + Explain((Wire.Reason)body[0], t.Name))
+                            : new(true, null, "The relay " + where + " is up. It is an older Kova Relay, so it cannot say which PCs are connected; updating it lets it.");
+                    if (type != Wire.Ok || body.Length < 1) return new(true, null, "The relay " + where + " is up.");
+                    return (Wire.PingAnswer)body[0] switch
+                    {
+                        Wire.PingAnswer.HostHere => new(true, true, "The relay " + where + " is up, and " + t.Name + " is connected to it."),
+                        Wire.PingAnswer.HostAbsent => new(true, false, "The relay " + where + " is up, but no PC called " + t.Name + " is connected to it right now."),
+                        _ => new(true, null, "The relay " + where + " is up."),
+                    };
+                }
+            }
+            catch (Exception e) when (e is InvalidOperationException or TimeoutException)
+            {
+                return new(false, null, e.Message);
+            }
+            catch (Exception e) when (e is System.IO.IOException or SocketException or AggregateException or System.IO.InvalidDataException)
+            {
+                return new(false, null, "The relay " + where + " did not answer properly. Check its address and port, and that Kova Relay is running there.");
+            }
         }
 
         /// <summary>

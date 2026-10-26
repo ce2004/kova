@@ -35,6 +35,9 @@ namespace KovaRelayWire
     ///     and waits up to PairWaitMs for it to dial back. Ok body: the 8-byte pairing id (for UDP). From
     ///     then on the connection is the host's: the host speaks first, exactly as if connected directly.
     ///   Accept (the host dialling back, 'A'): body = pairing id (8), accept token (16). Ok, then raw.
+    ///   Ping (4.5, 'P'): "is the relay up", from Kova's wizards and Check the relay. Body empty, or a name
+    ///     (name length + name). Ok body: one PingAnswer byte. Never counted as a bad request. A relay older
+    ///     than 4.5 refuses it with BadRequest, which still shows it is up.
     ///
     /// UDP, to the relay's same port number:
     ///   [0x4B 0x52] [8-byte id] [payload]  (UdpHead bytes of header)
@@ -54,7 +57,10 @@ namespace KovaRelayWire
         public const int MaxBody = 1024;
         public const int MaxName = 40;
 
-        public const byte Register = (byte)'R', Connect = (byte)'C', Accept = (byte)'A';
+        public const byte Register = (byte)'R', Connect = (byte)'C', Accept = (byte)'A', Ping = (byte)'P';
+
+        /// <summary>The relay's answer to a Ping: whether the named host is connected to it now (NoName when none was asked about).</summary>
+        public enum PingAnswer : byte { HostAbsent = 0, HostHere = 1, NoName = 2 }
         public const byte Ok = (byte)'O', Refused = (byte)'X', Incoming = (byte)'I', KeepAlive = (byte)'K';
 
         public const int IdBytes = 8, TokenBytes = 16, UdpHead = 2 + IdBytes;

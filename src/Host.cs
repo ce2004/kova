@@ -42,6 +42,12 @@ namespace TailRemote
         /// <summary>What happens with the relay, in a sentence (registered, refused, lost and trying again), each said once: the window speaks it.</summary>
         public event Action<string>? RelayStatus;
 
+        /// <summary>Reachable only through the relay: the port is taken on this PC itself, never opened to others.</summary>
+        public bool RelayOnly { get; }
+
+        /// <summary>The TCP port this host listens on (relay only: the free one it was given).</summary>
+        public int ListeningPort => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
         /// <summary>Whether this host is registered on its relay right now.</summary>
         public bool RelayRegistered => _relay?.Registered == true;
 
@@ -158,8 +164,15 @@ namespace TailRemote
         private string? _captureDevice;
 
         /// <summary>captureDevice: the output whose sound is sent, or null for Windows' default.</summary>
-        public Host(int port, string password, string? listenPassword, Action<string> status, string? captureDevice = null, HostIdentity? identity = null)
+        /// <summary>
+        /// relayOnly (4.5): reachable only through a Kova Relay. Any free port is then taken, only on this PC itself
+        /// (loopback), so no other PC can connect to it directly and nothing needs opening in Windows Firewall;
+        /// every controlling PC comes in through the relay, which this host dials out to. The UDP socket still
+        /// listens everywhere: the relay's sound packets come back to it, as answers to what it sends out.
+        /// </summary>
+        public Host(int port, string password, string? listenPassword, Action<string> status, string? captureDevice = null, HostIdentity? identity = null, bool relayOnly = false)
         {
+            RelayOnly = relayOnly;
             // Lasting identity: the window and the service pass the one they keep; tests get a throwaway one.
             _ownIdentity = identity == null;
             Identity = identity ?? HostIdentity.Create();
@@ -175,7 +188,9 @@ namespace TailRemote
             VideoUpdate = screen.Update;
             VideoForget = screen.Forget;
 
-            _listener = new TcpListener(IPAddress.IPv6Any, port);
+            // Relay only: any free port, on this PC alone. No other PC ever uses it, so it can never clash with another program.
+            int bindPort = relayOnly ? 0 : port;
+            _listener = new TcpListener(relayOnly ? IPAddress.IPv6Loopback : IPAddress.IPv6Any, bindPort);
             _listener.Server.DualMode = true;
             _udp = new UdpClient(AddressFamily.InterNetworkV6);
             _udp.Client.DualMode = true;
@@ -185,7 +200,7 @@ namespace TailRemote
             try
             {
                 _listener.Start();
-                _udp.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+                _udp.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, bindPort));
             }
             catch (SocketException e)
             {

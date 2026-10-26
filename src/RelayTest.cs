@@ -139,6 +139,41 @@ namespace TailRemote
                 using (var again = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
                     Check(!again.ListenOnly, "the real host is still the one reached by that name");
 
+                // 4.5: Check the relay is up (the wizards and the File menu): up with the PC on it, up without it, and a relay that is not there.
+                var up = Relay.Check("127.0.0.1:" + relayPort, Name);
+                Check(up.Up && up.HostHere == true, "the relay check says the relay is up and " + Name + " is on it (" + up.Said + ")");
+                var absent = Relay.Check("127.0.0.1:" + relayPort, "nobody-by-this-name");
+                Check(absent.Up && absent.HostHere == false, "the relay check says a PC that is not there is not connected (" + absent.Said + ")");
+                var plain = Relay.Check("127.0.0.1:" + relayPort, null);
+                Check(plain.Up && plain.HostHere == null, "the relay check with no name says only that it is up (" + plain.Said + ")");
+                var down = Relay.Check("127.0.0.1:" + (relayPort + 57), null);
+                Check(!down.Up, "the relay check says a relay that is not running is not up (" + down.Said + ")");
+                int pings = 0;
+                for (int i = 0; i < 30; i++) if (Relay.Check("127.0.0.1:" + relayPort, null).Up) pings++;
+                using (var stillIn = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
+                    Check(pings == 30 && !stillIn.ListenOnly, "30 relay checks in a row are all answered and never get this PC blocked (" + pings + ")");
+
+                // 4.5: a host reachable only through the relay: in through the relay, never directly.
+                string onlyName = "relayonly-" + Guid.NewGuid().ToString("N")[..6];
+                using (var only = new Host(hostPort + 2, Password, null, _ => { }, null, null, relayOnly: true))
+                {
+                    only.UseRelay(Relay.Parse(onlyName + "@127.0.0.1:" + relayPort, relayPort, out _));
+                    for (int i = 0; i < 100 && !only.RelayRegistered; i++) Thread.Sleep(100);
+                    Check(only.RelayRegistered, "a relay-only host registered on the relay");
+                    using (var through = Client.Connect(onlyName + "@127.0.0.1:" + relayPort, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
+                        Check(!through.ListenOnly, "a controlling PC logged in to the relay-only host through the relay");
+                    int took = only.ListeningPort;
+                    bool Reaches(IPAddress at)
+                    {
+                        try { using var t = new TcpClient(at.AddressFamily); return t.ConnectAsync(at, took).Wait(2000) && t.Connected; }
+                        catch { return false; }
+                    }
+                    Check(took != hostPort + 2 && Reaches(IPAddress.IPv6Loopback), "the relay-only host took a free port of its own (" + took + "), open on this PC itself");
+                    var tries = new List<IPAddress> { IPAddress.Loopback };
+                    try { tries.AddRange(Dns.GetHostAddresses(Dns.GetHostName()).Where(x => !IPAddress.IsLoopback(x)).Take(3)); } catch { }
+                    foreach (var at in tries) Check(!Reaches(at), "the relay-only host cannot be reached directly at " + at + ", port " + took);
+                }
+
                 // A flood of junk connections (from other loopback addresses, so this test's own address stays clear).
                 int refused = 0, opened = 0;
                 var junk = new List<TcpClient>();

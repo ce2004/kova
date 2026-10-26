@@ -25,7 +25,13 @@ namespace TailRemote
         private readonly MenuItem _forgetPc = new("&Forget the chosen saved PC") { WhyNot = "Choose a saved PC first, in Saved PCs." };
         private readonly MenuText _listenPassword = new("&Listen-only password", "A second password that lets someone hear this PC but not control it. Leave it empty for none:", secret: true);
         // Host: also reachable through a Kova Relay (KovaRelay.exe), for when other PCs cannot reach this one directly.
-        private readonly MenuItem _relayHost = Menus.Check("Hos&t through a relay too, for PCs that cannot reach this one directly");
+        // 4.5: directly (the port opened), through a relay only (nothing opened: the port is taken on this PC alone), or both.
+        private readonly MenuChoice _reach = new("Hos&t: how other PCs reach this PC");
+        private const int ReachDirect = 0, ReachRelayOnly = 1, ReachBoth = 2;
+        // 4.5: the step-by-step ways in, first in the File menu, and a check that the relay is up.
+        private readonly MenuItem _connectWizard = new("&Connect to a PC...") { ShortcutKeys = Keys.Control | Keys.N, WhyNot = "Busy connecting." };
+        private readonly MenuItem _hostWizard = new("Host this PC, so other PCs can control it...") { ShortcutKeys = Keys.Control | Keys.H };
+        private readonly MenuItem _checkRelay = new("Check the relay is &up") { WhyNot = "Already checking the relay." };
         private readonly MenuText _relayAddress = new("Relay addr&ess", "The Kova Relay's address, with its port after a colon if it is not 47200, like relay.example.com or relay.example.com:47200:");
         private readonly MenuText _relayName = new("Relay &name", "The name of this PC on the relay, like office-pc: 1 to 40 letters, digits, dashes, dots or underscores. Controlling PCs connect to it as name@relay:");
 
@@ -217,10 +223,10 @@ namespace TailRemote
             var file = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
+                _connectWizard, _hostWizard, _go, _switchTo, _wake, _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 _mode.Menu, _saved.Menu, _address.Item, _port.Item, _password.Item, _listenPassword.Item, _copyAddress,
-                _relayHost, _relayAddress.Item, _relayName.Item,
+                _reach.Menu, _relayAddress.Item, _relayName.Item, _checkRelay,
                 _savePc, _forgetPc, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
@@ -250,7 +256,10 @@ namespace TailRemote
             _password.Text = _settings.Password;
             _listenPassword.Text = _settings.ListenPassword;
             _logging.Checked = _settings.Logging;
-            _relayHost.Checked = _settings.RelayHosting;
+            _reach.Add("Directly, by its address (Kova opens its port in Windows Firewall)");
+            _reach.Add("Through a Kova Relay only (nothing on this PC is opened to the internet)");
+            _reach.Add("Both: directly, and through a Kova Relay");
+            _reach.SelectedIndex = ReachOf(_settings);
             _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
             _relayName.Text = _settings.RelayName;
             _acceptUnasked.Checked = _settings.AcceptUnasked;
@@ -346,11 +355,14 @@ namespace TailRemote
                                      : "Logging is off.");
             };
             _go.Click += (_, _) => Menus.AfterMenu(() => Go());
-            _address.Changed += SaveSettings;
+            _address.Changed += () => { SaveSettings(); if (!HostMode) _checkRelay.Available = _address.Text.Contains('@'); };
             _port.Changed += PortChanged;
             // A host's identity or ticket learnt on a network thread: saved from the window's thread.
             _settings.TrustChanged = () => Later(SaveSettings);
-            _relayHost.CheckedChanged += (_, _) => Menus.AfterMenu(() => RelayChanged(ticked: true));
+            _reach.SelectedIndexChanged += (_, _) => { if (!_loadingSettings) Menus.AfterMenu(() => RelayChanged(ticked: true)); }; // not when filled in by code (a wizard, a restore)
+            _connectWizard.Click += (_, _) => Menus.AfterMenu(() => ConnectStepByStep());
+            _hostWizard.Click += (_, _) => Menus.AfterMenu(() => HostStepByStep());
+            _checkRelay.Click += (_, _) => Menus.AfterMenu(() => CheckRelay());
             _relayAddress.Changed += () => RelayChanged(ticked: false);
             _relayName.Changed += () => RelayChanged(ticked: false);
             _password.Changed += SaveSettings;
@@ -438,12 +450,21 @@ namespace TailRemote
             parts.Add("name " + Environment.MachineName);
             _bestAddress = lan.Count > 0 ? lan[0].Ip : tailscale;
             string text = "Copy this PC's IP a&ddress: " + string.Join(", ", parts).Replace("&", "&&");
+            if (HostMode && RelayOnlyNow && RelayTargetHere() is Relay.Target only)
+                text = "Copy how other PCs reach this PC: " + only.ToString().Replace("&", "&&");
             if (_copyAddress.Text != text) _copyAddress.Text = text;
-            _copyAddress.Enabled = _bestAddress != null;
+            _copyAddress.Enabled = _bestAddress != null || (HostMode && RelayOnlyNow);
         }
 
         private void CopyAddress()
         {
+            if (HostMode && RelayOnlyNow && RelayTargetHere() is Relay.Target only)
+            {
+                string how = only.ToString();
+                ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(how)));
+                Say("Copied " + how + ". Other PCs type that as the address, or choose Connect to a PC, Through a Kova Relay.");
+                return;
+            }
             FillMyAddress();
             if (_bestAddress is not string ip) { Say("This PC has no network address right now."); return; }
             ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(ip))); // on the clipboard's own thread, never the window's
@@ -459,7 +480,11 @@ namespace TailRemote
             _device.Menu.Available = !host;
             _saved.Menu.Available = _savePc.Available = _forgetPc.Available = !host;
             _listenPassword.Item.Available = host;
-            _relayHost.Available = _relayAddress.Item.Available = _relayName.Item.Available = host;
+            _reach.Menu.Available = host;
+            if (host) FillMyAddress();
+            _relayAddress.Item.Available = _relayName.Item.Available = host && _reach.SelectedIndex != ReachDirect;
+            // Checking a relay: the host's own, or the one the address goes through.
+            _checkRelay.Available = host ? _reach.SelectedIndex != ReachDirect : _address.Text.Contains('@');
 
             _copyAddress.Available = host;
             if (host) FillMyAddress();
@@ -1542,7 +1567,7 @@ namespace TailRemote
                 _port.Text = _settings.Port.ToString();
                 _password.Text = _settings.Password;
                 _listenPassword.Text = _settings.ListenPassword;
-                _relayHost.Checked = _settings.RelayHosting;
+                _reach.SelectedIndex = ReachOf(_settings);
                 _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
                 _relayName.Text = _settings.RelayName;
                 _logging.Checked = _settings.Logging;
@@ -2144,13 +2169,20 @@ namespace TailRemote
             if (!CheckListenPassword()) return;
             string listen = _listenPassword.Text;
             if (!CheckPort(out int port)) return;
-            if (!KovaFirewall.Remember(_settings, port)) TellSaveProblem();
+            var relayTarget = RelayTargetHere();
+            if (_settings.RelayOnly && relayTarget == null)
+            {
+                Say("This PC is set to be reached only through a relay, but no relay is filled in. Choose Host this PC in the File menu to set it up.");
+                return;
+            }
+            bool relayOnly = RelayOnlyNow;
+            if (!relayOnly && !KovaFirewall.Remember(_settings, port)) TellSaveProblem();
             try
             {
                 _host = new Host(port, _password.Text, listen, msg => Later(() => Log(msg)),
-                    _settings.CaptureDevice.Length == 0 ? null : _settings.CaptureDevice, HostIdentityHere());
+                    _settings.CaptureDevice.Length == 0 ? null : _settings.CaptureDevice, HostIdentityHere(), relayOnly);
                 _host.RelayStatus += msg => Later(() => Speak(msg)); // news about the relay: registered, a name taken, the relay gone
-                if (RelayTargetHere() is Relay.Target relay) _host.UseRelay(relay);
+                if (relayTarget != null) _host.UseRelay(relayTarget);
                 _host.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 _host.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 var hosting = _host;
@@ -2159,7 +2191,8 @@ namespace TailRemote
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
                 _host.MicDevice = _settings.MicOutput;
                 _host.StartNvdaHelper(); // the Kova Helper NVDA add-on, if installed here, hands NVDA's speech to controlling PCs
-                Say("Hosting on port " + port + ". Waiting for a connection." + (listen.Length > 0 ? " Listening with the listen-only password is on." : ""));
+                Say((relayOnly ? "Hosting through the relay " + relayTarget!.RelayHost + " only, as " + relayTarget.Name + ". Nothing is opened to the internet. Connecting to the relay."
+                    : "Hosting on port " + port + ". Waiting for a connection.") + (listen.Length > 0 ? " Listening with the listen-only password is on." : ""));
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
                 if (Wasapi.OutputDevices().Count == 0)
@@ -2171,6 +2204,7 @@ namespace TailRemote
             UpdateTitle();
             if (_host == null) return;
             _hostingPort = port;
+            if (relayOnly) return; // nothing to open: the port is this PC's alone
             // Hosting on another port than last time: open this one, and offer to close the old one.
             int before = _settings.HostedPort;
             if (before != 0 && before != port) await OfferPortMove(port, before);
@@ -2288,16 +2322,22 @@ namespace TailRemote
             string name = _relayName.Text.Trim();
             if (name.Length > 0 && !KovaRelayWire.Wire.NameOk(name)) { Later(() => _relayName.Ask(this, "That name cannot be used.")); return; }
             _settings.RelayName = name;
-            _settings.RelayHosting = _relayHost.Checked;
+            _settings.RelayHosting = _reach.SelectedIndex != ReachDirect;
+            _settings.RelayOnly = _reach.SelectedIndex == ReachRelayOnly;
             SaveSettings();
-            if (_relayHost.Checked && _settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
-            if (_relayHost.Checked && _settings.RelayName.Length == 0) { Later(() => _relayName.Ask(this, "Choose this PC's name on the relay.")); return; }
+            UpdateMode();
+            bool wants = _settings.RelayHosting;
+            if (wants && _settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
+            if (wants && _settings.RelayName.Length == 0) { Later(() => _relayName.Ask(this, "Choose this PC's name on the relay.")); return; }
             var target = RelayTargetHere();
+            // Into or out of relay only: the port is taken differently, so hosting here starts again.
+            if (_host != null && _host.RelayOnly != (_settings.RelayOnly && target != null)) { StopHost(); StartHost(); return; }
             if (_host != null) _host.UseRelay(target);
-            if (target == null) { if (ticked) Say("This PC no longer hosts through a relay."); return; }
-            Say(_service.Checked ? "Press Apply settings to the service to host through the relay as " + target.Name + "."
+            if (target == null) { if (ticked) Say("This PC is reached directly, not through a relay."); return; }
+            string how = _settings.RelayOnly ? "only through the relay" : "through the relay too";
+            Say(_service.Checked ? "Press Apply settings to the service to host " + how + " as " + target.Name + "."
                 : _host != null ? "Connecting to the relay as " + target.Name + "."
-                : "This PC will also be reachable through the relay as " + target.Name + " while it hosts. Controlling PCs connect to " + target + ".");
+                : "This PC will be reachable " + how + " as " + target.Name + " while it hosts. Controlling PCs connect to " + target + ".");
         }
 
         /// <summary>The service kept the identity it already had: this window takes it on, so hosting here later is the same PC to controlling PCs.</summary>
@@ -2308,6 +2348,125 @@ namespace TailRemote
             _settings.HostIdentityEnc = Settings.Protect(id);
             _identity = null; // made again from the settings the next time it hosts
             SaveSettings();
+        }
+
+        /// <summary>Hosting through the relay only, with a relay that can be used.</summary>
+        private bool RelayOnlyNow => Relay.OnlyUsable(_settings.RelayOnly, _settings.RelayHosting, _settings.RelayAddress, _settings.RelayName, _settings.RelayPort);
+
+        /// <summary>Relay only chosen but no usable relay: said, and false (the service would otherwise be reachable from nowhere).</summary>
+        private bool RelayOnlyFilledIn()
+        {
+            if (!_settings.RelayOnly || RelayOnlyNow) return true;
+            Say("This PC is set to be reached only through a relay, but no relay is filled in. Choose Host this PC in the File menu to set it up.");
+            return false;
+        }
+
+        /// <summary>Where the service or this window hosts, in words: a port, or the relay alone.</summary>
+        private string HostedWhere() => RelayOnlyNow ? "through the relay " + _settings.RelayAddress + " only, as " + _settings.RelayName : "on port " + _settings.Port;
+
+        private static int ReachOf(Settings s) => !s.RelayHosting ? ReachDirect : s.RelayOnly ? ReachRelayOnly : ReachBoth;
+
+        private bool _checkingRelay;
+
+        /// <summary>Check the relay is up: the host's relay (and that this PC is on it), or the relay the address goes through (and that PC).</summary>
+        private async void CheckRelay()
+        {
+            string relay, name;
+            if (HostMode)
+            {
+                if (_settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
+                relay = _settings.RelayAddress + (_settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + _settings.RelayPort);
+                name = _settings.RelayName;
+            }
+            else if (Relay.Parse(_address.Text.Trim(), KovaRelayWire.Wire.DefaultPort, out string? problem) is Relay.Target t)
+            {
+                relay = t.RelayHost.Contains(':') ? "[" + t.RelayHost + "]:" + t.RelayPort : t.RelayHost + ":" + t.RelayPort;
+                name = t.Name;
+            }
+            else { Say(problem ?? "The address does not go through a relay."); return; }
+            if (_checkingRelay) return;
+            _checkingRelay = true;
+            _checkRelay.Enabled = false;
+            Say("Checking the relay.");
+            try
+            {
+                var found = await System.Threading.Tasks.Task.Run(() => Relay.Check(relay, name.Length > 0 ? name : null));
+                string said = found.Said;
+                if (HostMode && found.Up && _host != null)
+                    said += _host.RelayRegistered ? " This PC is registered on it." : " This PC is not registered on it yet; it keeps trying.";
+                Say(said);
+            }
+            finally { _checkingRelay = false; _checkRelay.Enabled = true; }
+        }
+
+        /// <summary>File, Connect to a PC: a saved PC, or a new one by its address or through a relay, step by step, then connects.</summary>
+        private void ConnectStepByStep()
+        {
+            Doing("connecting step by step");
+            if (_connecting && !_reconnecting) { Say("Still connecting. Wait, or press Disconnect first."); return; }
+            if (_host != null)
+            {
+                if (MessageBox.Show(this, "This PC is hosting. Stop hosting and connect to another PC?", "Connect to a PC", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                StopHost();
+            }
+            int.TryParse(_port.Text.Trim(), out int port);
+            if (port is < 1 or > 65535) port = Protocol.DefaultPort;
+            var answer = ConnectWizard.Run(this, _settings, _address.Text.Trim(), port, _password.Text);
+            if (answer == null) return;
+            if (_reconnecting) StopReconnecting("Stopped reconnecting.", news: false);
+            else if (_client != null) Disconnect("Disconnected.", byUser: true);
+            _mode.SelectedIndex = 0;
+            _address.Text = answer.Address;
+            _port.Text = answer.Port.ToString();
+            _password.Text = answer.Password;
+            SaveSettings();
+            FillSaved();
+            if (answer.Save) SavePc();
+            UpdateMode();
+            Connect(quiet: false);
+        }
+
+        /// <summary>File, Host this PC: how other PCs reach it, the relay (checked), the passwords; then hosts (or applies it to the service).</summary>
+        private void HostStepByStep()
+        {
+            Doing("hosting step by step");
+            if (_client != null || _reconnecting || _connecting || _parked.Count > 0)
+            {
+                if (MessageBox.Show(this, "This PC is connected to another PC. Disconnect and host this PC instead?", "Host this PC", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                if (_reconnecting) StopReconnecting("Stopped reconnecting.", news: false);
+                if (_client != null) Disconnect("Disconnected.", byUser: true);
+                DropBackground();
+            }
+            int.TryParse(_port.Text.Trim(), out int port);
+            if (port is < 1 or > 65535) port = Protocol.DefaultPort;
+            var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked);
+            if (a == null) return;
+            _loadingSettings = true; // filled in all at once: nothing below acts on half of it
+            try
+            {
+                _mode.SelectedIndex = 1;
+                _port.Text = a.Port.ToString();
+                _password.Text = a.Password;
+                _listenPassword.Text = a.ListenPassword;
+                if (a.Relay)
+                {
+                    _relayAddress.Text = a.RelayAddress + (a.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + a.RelayPort);
+                    _relayName.Text = a.RelayName;
+                }
+                _reach.SelectedIndex = !a.Relay ? ReachDirect : a.Direct ? ReachBoth : ReachRelayOnly;
+            }
+            finally { _loadingSettings = false; }
+            if (a.Relay) { _settings.RelayAddress = a.RelayAddress; _settings.RelayPort = a.RelayPort; _settings.RelayName = a.RelayName; }
+            _settings.RelayHosting = a.Relay;
+            _settings.RelayOnly = a.Relay && !a.Direct;
+            SaveSettings();
+            UpdateMode();
+            if (_service.Checked) ApplyService();
+            else
+            {
+                if (_host != null) StopHost();
+                StartHost();
+            }
         }
 
         /// <summary>The relay to host through, from the settings, or null when Host through a relay is off or not filled in.</summary>
@@ -2855,7 +3014,7 @@ namespace TailRemote
             if (MessageBox.Show(this, plan, want ? "Run as a Windows service" : "Remove the service", MessageBoxButtons.OKCancel,
                     want ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
                     want ? MessageBoxDefaultButton.Button1 : MessageBoxDefaultButton.Button2) != DialogResult.OK // removing defaults to Cancel; installing (what the user just asked for) keeps OK
-                || (want && (!CheckPassword() || !CheckPort(out _) || !CheckListenPassword())))
+                || (want && (!CheckPassword() || !CheckPort(out _) || !CheckListenPassword() || !RelayOnlyFilledIn())))
             {
                 SetServiceBox(!want);
                 return;
@@ -2871,8 +3030,8 @@ namespace TailRemote
             _startup.Checked = Startup.IsEnabled();
             if (ok && now == want)
             {
-                if (want) await ServiceGotPort(_settings.Port);
-                Say(want ? "The Kova service is running and hosting this PC on port " + _settings.Port + "." : "The Kova service is removed.");
+                if (want && !RelayOnlyNow) await ServiceGotPort(_settings.Port);
+                Say(want ? "The Kova service is running and hosting this PC " + HostedWhere() + "." : "The Kova service is removed.");
             }
             else
                 Say((want ? "The service was not set up: " : "The service was not removed: ") + ServiceHost.LastError());
@@ -2883,13 +3042,14 @@ namespace TailRemote
         {
             if (!CheckPassword() || !CheckPort(out _) || !CheckListenPassword()) return;
             SaveSettings();
+            if (!RelayOnlyFilledIn()) return;
             Say("Giving the service these settings. Windows asks for administrator permission.");
             HostIdentityHere(); // the service hosts as this same PC
             bool ok = await ServiceHost.SetAsync(true, _settings);
             TakeServiceIdentity();
-            if (ok) await ServiceGotPort(_settings.Port);
+            if (ok && !RelayOnlyNow) await ServiceGotPort(_settings.Port);
             Say(ok
-                ? "The service is hosting with these settings on port " + _settings.Port + "."
+                ? "The service is hosting with these settings " + HostedWhere() + "."
                 : "The service was not changed: " + ServiceHost.LastError());
         }
 

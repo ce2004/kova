@@ -366,6 +366,9 @@ namespace KovaRelay
                     case Wire.Accept:
                         handedOff = await HandleAccept(c!, body, run).ConfigureAwait(false);
                         break;
+                    case Wire.Ping:
+                        await HandlePing(c!, body, run).ConfigureAwait(false);
+                        break;
                     default:
                         await Refuse(c!, Wire.Reason.BadRequest, "it sent a request the relay does not know", run, countFailure: true).ConfigureAwait(false);
                         break;
@@ -591,6 +594,28 @@ namespace KovaRelay
             }
             await Splice(c, hostSide, p, run).ConfigureAwait(false);
             return true;
+        }
+
+        // ---------------------------------------------------------------- Ping
+
+        /// <summary>Kova checking the relay is up, and maybe whether a host is connected. Not a bad request, so never counted against the address.</summary>
+        private async Task HandlePing(Conn c, byte[] body, CancellationToken run)
+        {
+            Wire.PingAnswer answer = Wire.PingAnswer.NoName;
+            if (body.Length > 0)
+            {
+                string? name = Wire.ReadName(body, out int used);
+                if (name is null || used != body.Length)
+                { await Refuse(c, Wire.Reason.BadRequest, "it sent a badly formed check", run, true).ConfigureAwait(false); return; }
+                lock (_gate) answer = _hosts.ContainsKey(Wire.NameKey(name)) ? Wire.PingAnswer.HostHere : Wire.PingAnswer.HostAbsent;
+            }
+            try
+            {
+                using var t = Timeout(run);
+                await SendFrame(c.S, Wire.Ok, new[] { (byte)answer }, t.Token).ConfigureAwait(false);
+                c.S.Shutdown(SocketShutdown.Send);
+            }
+            catch (Exception) { }
         }
 
         // ---------------------------------------------------------------- Accept
