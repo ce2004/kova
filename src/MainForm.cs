@@ -233,7 +233,7 @@ namespace TailRemote
             var clip = new MenuItem("&Clipboard");
             clip.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _takeSent, _transferStop, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
+                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _transferStop, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
             });
             var set = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
@@ -389,7 +389,7 @@ namespace TailRemote
                 _settings.AcceptUnasked = _acceptUnasked.Checked;
                 Client.AcceptUnasked = _acceptUnasked.Checked;
                 SaveSettings();
-                Say(_acceptUnasked.Checked ? "Text and files the remote PC sends are kept, without replacing this clipboard." + (_client != null ? " From the next connection." : "")
+                Say(_acceptUnasked.Checked ? "Text the remote PC sends goes on this clipboard, and files go to your received files folder." + (_client != null ? " From the next connection." : "")
                     : "Only text and files you ask for are taken from the remote PC." + (_client != null ? " From the next connection." : ""));
             };
             _speedHere.Click += (_, _) => Menus.AfterMenu(() => SpeedTestHere());

@@ -119,14 +119,12 @@ namespace TailRemote
                 Send(() => a.SendText("second, unasked"));
                 if (onClipboard != null) return "one ask let two clipboard batches in";
 
-                // Unasked, but taken (the default): kept aside in Downloads, never on the clipboard.
+                // Unasked, but taken (the default): text goes straight onto the clipboard (4.5.1, as before 4.4).
                 b.AcceptUnasked = true;
                 sent.Clear();
-                if (!Send(() => a.SendText("swap me in"))) return "sending unasked text (taken) never ended";
-                if (!Until(() => keptText != null, 5000)) return "unasked text was not handed on as unasked";
-                if (onClipboard != null) return "unasked text replaced the clipboard";
-                if (keptPath == null || File.ReadAllText(keptPath) != "swap me in") return "unasked text was not saved in Downloads";
-                if (Zone(keptPath) != 3) return "the saved unasked text was not marked as from the internet";
+                if (!Send(() => a.SendText("sent from the other PC"))) return "sending unasked text (taken) never ended";
+                if (!Until(() => onClipboard != null, 5000) || onClipboard != "sent from the other PC") return "text sent from the other PC did not replace the clipboard";
+                if (keptText != null || keptPath != null) return "text sent from the other PC was also saved as a file";
 
                 // Unasked clipboard files: to Downloads, not the clipboard.
                 if (!Send(() => a.TestSendEntries(new List<(string, byte[]?)> { ("pushed.txt", Encoding.UTF8.GetBytes("pushed")) }, "pushed.txt"))) return "unasked clipboard files never ended";

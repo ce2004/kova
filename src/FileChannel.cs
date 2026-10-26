@@ -103,10 +103,9 @@ namespace TailRemote
         public bool AcceptUnasked { get; set; } = true;
 
         /// <summary>
-        /// The controlling PC: clipboard text and files arrive on this PC's clipboard only when this side asked
-        /// (ExpectClipboard) in the last 30 seconds. Anything else the other PC sends for the clipboard never
-        /// replaces it (it could swap a copied command for its own just before it is pasted): files go to
-        /// Downloads\Kova like Send files, and text is saved there as a .txt file and handed to UnaskedTextReceived.
+        /// The controlling PC: clipboard files arrive on this PC's clipboard only when this side asked
+        /// (ExpectClipboard) in the last 30 seconds; files sent unasked go to Downloads\Kova like Send files.
+        /// Clipboard text always goes onto the clipboard (4.5.1, the owner's choice; 4.4.0 kept it aside).
         /// False (the host): everything for the clipboard goes there, as before.
         /// </summary>
         public bool ClipboardOnlyWhenAsked { get; set; }
@@ -1691,7 +1690,9 @@ namespace TailRemote
                     old = _in;
                     // Clipboard files not asked for, on a PC that keeps its clipboard: received as Send files are, into
                     // Downloads\Kova, never onto the clipboard. Text not asked for is kept aside the same way (Complete).
-                    bool unasked = ClipboardOnlyWhenAsked && !asked && kind is KindText or KindFiles;
+                    // 4.5.1 (the owner's choice): clipboard text always replaces this clipboard, as before 4.4; only
+                    // unasked clipboard files are still kept aside.
+                    bool unasked = ClipboardOnlyWhenAsked && !asked && kind == KindFiles;
                     byte keptAs = unasked && kind == KindFiles ? KindDownloads : kind;
                     b = new In { Id = id, Kind = keptAs, OfferKind = kind, Asked = asked, Unasked = unasked, Entries = new (string, long)?[count], Into = into, MakeAs = makeAs };
                     b.T.Asked = asked;

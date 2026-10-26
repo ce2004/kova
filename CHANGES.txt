@@ -1,3 +1,6 @@
+4.5.1
+Changed: text the remote PC sends with Send the clipboard goes straight onto your clipboard again, replacing what was there, as it did before 4.4. It is no longer saved as a file, and Put the text the remote PC sent on this clipboard is gone from the Clipboard menu.
+
 4.5.0
 New feature: File, Connect to a PC (Control N), the first thing in the File menu. It asks one thing at a time: a saved PC or a new one, then how you reach it (by its address, or through a Kova Relay), then where it is and its password, and connects. It can save the PC for next time too.
 New feature: File, Host this PC (Control H). It asks how other PCs should reach this PC, then the port or the relay, then the passwords, says what the other PCs need to type, and starts hosting. If the Kova service is on, it sets up the service the same way.
