@@ -24,6 +24,9 @@ namespace TailRemote
         private const byte KeyMessage = (byte)'K', MouseMessage = (byte)'M', TextMessage = (byte)'T', FilesMessage = (byte)'F', GetMessage = (byte)'G';
         // Agent to service: the clipboard it read, in answer to a GetMessage (text, or file paths).
         private const byte ClipTextMessage = (byte)'t', ClipFilesMessage = (byte)'f';
+        // Agent to service: u8 1 when a secure screen (sign-in, lock, UAC) has the keyboard, 0 when the ordinary one is
+        // back. Sent when the link starts and on every change: the service in session 0 cannot see the screen itself.
+        private const byte SecureScreenMessage = (byte)'D';
         // The remote screen, which only the agent can see: the service asks for a viewer's next picture
         // (i32 request, i32 viewer, u8 whole, u16 widest, u8 quality, u8 most a second, i32 H.264 kbit/s, u8 which screen) and the agent
         // answers (i32 request, u8 1 + the update, or u8 0: no picture to take). 'X' (i32 viewer): that
@@ -146,6 +149,10 @@ namespace TailRemote
             /// <summary>What the agent read from its clipboard, in answer to GetClipboard. Raised on the link's read thread.</summary>
             public Action<string>? ClipboardText;
             public Action<string[]>? ClipboardFiles;
+            /// <summary>The agent says a secure screen came (true) or went (false). Raised on the link's read thread.</summary>
+            public Action<bool>? SecureScreenChanged;
+            /// <summary>What the agent said last (false until it says): read once when SecureScreenChanged is set, as the agent may have spoken first.</summary>
+            public volatile bool SecureScreen;
 
             /// <summary>
             /// The clipboard the agent sent back (GetClipboard's answer). One per connected agent: the
@@ -179,6 +186,7 @@ namespace TailRemote
                         {
                             case ClipTextMessage: ClipboardText?.Invoke(Encoding.UTF8.GetString(p)); break;
                             case ClipFilesMessage: ClipboardFiles?.Invoke(Encoding.UTF8.GetString(p).Split('\n', StringSplitOptions.RemoveEmptyEntries)); break;
+                            case SecureScreenMessage when n == 1: SecureScreen = p[0] == 1; SecureScreenChanged?.Invoke(p[0] == 1); break;
                         }
                     }
                 }
@@ -290,7 +298,7 @@ namespace TailRemote
         /// which are written straight back to the service: the answer to a GetMessage.
         /// </summary>
         public static void Run(Action<ushort, ushort, bool, bool> key, Action<byte, int, int> mouse, Action<string> text, Action<string[]> files,
-            Action<Action<string>, Action<string[]>>? getClipboard = null, ScreenVideo? screen = null)
+            Action<Action<string>, Action<string[]>>? getClipboard = null, ScreenVideo? screen = null, Func<bool?>? secureScreen = null)
         {
             byte[] head = new byte[5];
             // Pictures are taken on a thread of their own (below normal: keys first), one at a time, never
@@ -362,6 +370,23 @@ namespace TailRemote
                     newest.Clear();
                     int thisLink = Interlocked.Increment(ref link);
                     if (screen != null) { Volatile.Write(ref forgetAll, 1); pictures.TryAdd(() => { }); }
+                    if (secureScreen != null)
+                    {
+                        // Four times a second, whether a secure screen has the keyboard; said once settled (three readings
+                        // alike, readings that cannot tell passed over) at the start of each link and on every change.
+                        // Ends when this link is replaced by the next.
+                        new Thread(() =>
+                        {
+                            var settle = new NativeService.SecureScreenSettle();
+                            while (Volatile.Read(ref link) == thisLink)
+                            {
+                                bool? reading;
+                                try { reading = secureScreen(); } catch { reading = null; }
+                                if (settle.Next(reading) is bool on) Reply(SecureScreenMessage, new[] { (byte)(on ? 1 : 0) });
+                                Thread.Sleep(250);
+                            }
+                        }) { IsBackground = true, Name = "Kova agent secure screen watch" }.Start();
+                    }
                     while (true)
                     {
                         Protocol.ReadExactly(pipe, head);

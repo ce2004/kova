@@ -67,7 +67,7 @@ namespace TailRemote
             {
                 var c = outputs.Find(d => d.Id == chosen);
                 if (c.Id == null) return (null, null, "Your microphone has nowhere to go: the sound device chosen for it on the remote PC is not connected.");
-                if (Sends(c.Id, c.Name)) return (null, null, "Your microphone is not played on the remote PC: the device chosen for it there, " + c.Name + ", is also what it sends you, so you would hear yourself. Choose another there, in Settings, Microphone from the controlling PC plays into.");
+                if (Sends(c.Id, c.Name)) return (null, null, "Your microphone is not played on the remote PC: the device chosen for it there, " + c.Name + ", is also what it sends you, so you would hear yourself. Choose another there, in Settings, Play the controlling PC's microphone into.");
                 return (c.Id, c.Name, null);
             }
             // Kova's pick: a virtual cable that is not what Kova sends. The second cables first (made for exactly this),
@@ -78,7 +78,7 @@ namespace TailRemote
                     if (!Sends(d.Id, d.Name) && d.Name.Contains(want, StringComparison.OrdinalIgnoreCase)) return (d.Id, d.Name, null);
             return (null, null, outputs.Exists(d => d.Id == captured) && outputs.Count == 1
                 ? "Your microphone has nowhere to go on the remote PC: its only sound device is the one it sends you, so you would hear yourself. Install a second virtual cable there, such as VB-Audio's Hi-Fi Cable, and Kova uses it by itself."
-                : "Your microphone has nowhere to go on the remote PC: it has no virtual cable apart from the one it sends you. Install one there, such as VB-Audio's Hi-Fi Cable, or choose a device there in Settings, Microphone from the controlling PC plays into.");
+                : "Your microphone has nowhere to go on the remote PC: it has no virtual cable apart from the one it sends you. Install one there, such as VB-Audio's Hi-Fi Cable, or choose a device there in Settings, Play the controlling PC's microphone into.");
         }
 
         /// <summary>Two inputs of one virtual cable (the same driver, named in brackets): whatever plays into either comes out of the same side.</summary>

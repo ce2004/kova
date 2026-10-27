@@ -28,27 +28,30 @@ namespace TailRemote
         // 4.5: directly (the port opened), through a relay only (nothing opened: the port is taken on this PC alone), or both.
         private readonly MenuChoice _reach = new("Hos&t: how other PCs reach this PC");
         private const int ReachDirect = 0, ReachRelayOnly = 1, ReachBoth = 2;
-        // 4.5: the step-by-step ways in, first in the File menu, and a check that the relay is up.
+        // 4.5: the step-by-step ways in, first in the File menu. 4.7: Host this PC is "Change how this PC is hosted" while the
+        // service hosts, and Connect to a PC is "Connect to another PC" while connected (the one in front waits in the background).
         private readonly MenuItem _connectWizard = new("&Connect to a PC...") { ShortcutKeys = Keys.Control | Keys.N, WhyNot = "Busy connecting." };
         private readonly MenuItem _hostWizard = new("&Host this PC...") { ShortcutKeys = Keys.Control | Keys.H };
-        private readonly MenuItem _checkRelay = new("Check the &relay") { WhyNot = "Already checking the relay." };
-        private readonly MenuText _relayAddress = new("Relay addr&ess", "The Kova Relay's address, with its port after a colon if it is not 47200, like relay.example.com or relay.example.com:47200:");
-        private readonly MenuText _relayName = new("Relay &name", "The name of this PC on the relay, like office-pc: 1 to 40 letters, digits, dashes, dots or underscores. Controlling PCs connect to it as name@relay:");
 
-        private readonly MenuItem _sendClipboard = new("Send the clip&board") { ShortcutKeys = Keys.Control | Keys.B };
+        // Control B works in this window; Control Shift Alt C (KeyCapture) works even while controlling the remote PC.
+        private readonly MenuItem _sendClipboard = new("Send the clip&board") { ShortcutKeys = Keys.Control | Keys.B, ShortcutKeyDisplayString = "Ctrl+B, Ctrl+Shift+Alt+C" };
         private readonly MenuItem _sendFiles = new("Send f&iles") { ShortcutKeys = Keys.Control | Keys.I };
-        private readonly MenuItem _sendFolder = new("Send a folder and its con&tents") { ShortcutKeys = Keys.Control | Keys.T };
+        private readonly MenuItem _sendFolder = new("Send folders and their con&tents") { ShortcutKeys = Keys.Control | Keys.T };
         // Files: first in the Clipboard menu. While files move, it opens a line per file.
         private readonly MenuStatus _transferStatus = new("");
         private readonly MenuItem _transferStop = new("&Stop the file transfer") { Enabled = false, WhyNot = "Nothing is being sent or received." };
+        // Every transfer, to and from every PC, each with its progress: one (or one thing in one) can be stopped alone.
+        private readonly MenuItem _transfersWindow = new("Stop just &one transfer...") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.T };
         // Where Send files and Send a folder from the other PC are saved: the menu item says where.
         private readonly MenuItem _pickReceiveFolder = new("Pic&k the folder for received files...");
         private readonly MenuItem _logging = Menus.Check("Diagnostic lo&gging");
-        private readonly MenuItem _sounds = new("Notification so&unds...");
+        private readonly MenuItem _sounds = new("Notification &sounds...");
         private readonly MenuItem _speedUp = Menus.Check("Catch up b&y speeding up audio instead of skipping");
         private readonly MenuItem _startup = Menus.CheckAsking("Start &hosting when Windows starts...");
         // (WhyNot for _startup is set in the constructor: CheckAsking makes it.)
         private readonly MenuItem _service = Menus.CheckAsking("Run as a Windows servi&ce (works at the lock screen, sign-in and administrator prompts)...");
+        // Only while the service is installed: settings changed here (logging, the capture device, a restored backup) reach it this way.
+        private readonly MenuItem _applyService = new("App&ly settings to the Kova service");
         private bool _settingService; // set while the checkbox is changed by code, not by the user
         private readonly MenuItem _go = new() { WhyNot = "Still connecting." };
         private readonly MenuItem _toggle = new("Control &remote PC") { ShortcutKeyDisplayString = "Ctrl+Shift+Enter" };
@@ -57,7 +60,7 @@ namespace TailRemote
         private readonly MenuItem _audioRemove = new("Remove audio de&vice...") { WhyNot = "Already working on the audio device." };
         private readonly MenuItem _portEditor = new("Port &editor...");
         private readonly MenuItem _restart = new("Restart rem&ote PC and reconnect...");
-        private readonly MenuItem _updateRemote = new("Update the remote P&C to this PC's version");
+        private readonly MenuItem _updateRemote = new("Update the remote &PC");
         private readonly MenuItem _remoteInfo = new("Remote PC &info...") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.I };
         // The remote screen: a checkbox, off unless ticked (nothing is taken or sent until then). Escape in
         // its window comes back here and leaves it on; unticking it (here or Control Shift S) turns it off.
@@ -72,16 +75,13 @@ namespace TailRemote
         private readonly MenuChoice _micOutput = new("Play the controlling PC's microphone &into");
         private readonly System.Collections.Generic.List<(string Id, string Name)> _micDevices = new(), _micOutputs = new();
         // The remote NVDA: heard through the remote PC's sound, said here as text (and brailled) with no remote sound, or both.
-        private readonly MenuChoice _remoteNvda = new("Remote NVDA spee&ch");
+        private readonly MenuChoice _remoteNvda = new("Remote NVDA s&peech");
         // The Kova Helper NVDA add-on (4.4): on this PC (what it says follows where it stands: install, update or remove),
         // and on the remote PC from here.
         private readonly MenuItem _helperHere = new(NvdaHelper.MenuText(new NvdaHelperState(null, null, NvdaHelper.CarriedVersion, false, false, null))) { WhyNot = "Already working on the Kova Helper." };
         private readonly MenuItem _helperThere = new(NvdaHelper.RemoteMenuText) { WhyNot = "Connect to a PC first, with its control password." };
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
         private readonly MenuItem _getClipboard = new("Get the &remote PC's clipboard") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
-        // 4.4: text the remote PC sent without being asked never replaces this clipboard by itself; this puts it there.
-        private readonly MenuItem _takeSent = new("&Put the text the remote PC sent on this clipboard") { Enabled = false, WhyNot = "The remote PC has not sent any text that is waiting." };
-        private string? _sentText;
         // Whether text and files the other PC sends without being asked are taken at all.
         private readonly MenuItem _acceptUnasked = Menus.Check("Accept text and files sent by the remote PC without askin&g");
         private readonly MenuItem _announceQuality = Menus.Check("A&nnounce audio quality changes");
@@ -109,8 +109,7 @@ namespace TailRemote
         private bool _expectRestart; // the remote PC was asked to restart: say when it is back
         private string? _expectUpdate; // the remote PC said it is updating TailRemote to this version: say when it is back
 
-        // Host: this PC's addresses, to give the other PC. Enter copies the best one.
-        private readonly MenuItem _copyAddress = new() { WhyNot = "This PC has no network address right now." };
+        // Host: this PC's addresses, to give the other PC (Host this PC's last page shows them and copies the best one).
         private string? _bestAddress;
         // Each choice's own list: one shared list put the capture device chosen before (unplugged) among the
         // output devices and the other way round.
@@ -194,15 +193,21 @@ namespace TailRemote
 
             _mode.Add("Control another PC");
             _mode.Add("Host: let this PC be controlled");
-            _copyAddress.Click += (_, _) => Menus.AfterMenu(() => CopyAddress());
-            System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged += (_, _) => Later(FillMyAddress);
-            FillMyAddress();
             _pickReceiveFolder.Click += (_, _) => Menus.AfterMenu(() => PickReceiveFolder());
             _transferStatus.Text = TransferIdle;
             FillHistory();
             _history.DropDownClosed += (_, _) => { if (_historyStale) FillHistory(); };
             _transferStatus.Item.DropDownClosed += (_, _) => { if (_barsStale) ShowFileBars(_barsWanted); };
             _transferStop.Click += (_, _) =>
+            {
+                StopAllTransfers();
+                // The menu closes on Stop and only files coming here are said as they end: without this,
+                // stopping a send gave no word at all.
+                Menus.AfterMenu(() => Say("Stopping the file transfer."));
+            };
+            _transfersWindow.Click += (_, _) => Menus.AfterMenu(() => ShowTransfersWindow());
+
+            void StopAllTransfers()
             {
                 _client?.CancelTransfer();
                 // Transfers waiting for a reconnection are stopped for good, always: one to a PC let go (or
@@ -214,30 +219,31 @@ namespace TailRemote
                 foreach (var p in _parked) p.Client.CancelTransfer();
                 _host?.CancelTransfer();
                 _serviceLink?.CancelTransfer();
-                // The menu closes on Stop and only files coming here are said as they end: without this,
-                // stopping a send gave no word at all.
-                Menus.AfterMenu(() => Say("Stopping the file transfer."));
-            };
+            }
+            _stopAllTransfers = StopAllTransfers;
 
             // The menu bar (Alt, then the arrows): File, Clipboard, Settings.
-            var file = new MenuItem("&File");
+            // File and Settings show only what applies right now (ShowWhatApplies): hosting, connected, or neither.
+            var file = _fileMenu = new MenuItem("&File");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _connectWizard, _hostWizard, _go, _switchTo, _wake, new ToolStripSeparator(),
+                _go, _connectWizard, _hostWizard, _switchTo, _wake, new ToolStripSeparator(),
                 _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
-                _speedHere, _speedRemote, _copyAddress, _checkRelay, new ToolStripSeparator(),
+                _speedHere, _speedRemote, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
+            file.DropDownOpening += (_, _) => ShowWhatApplies();
             var clip = new MenuItem("&Clipboard");
             clip.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _transferStop, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
+                _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _transferStop, _transfersWindow, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
             });
-            var set = new MenuItem("&Settings");
+            // Settings for controlling another PC first, then those for hosting this one; only one group shows at a time.
+            var set = _setMenu = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _captureFrom.Menu, _remoteNvda.Menu, _micDevice.Menu, _micOutput.Menu, _speedUp, _sounds, new ToolStripSeparator(),
-                _startup, _service, _portEditor, _audioSetup, _audioRemove, _helperHere, new ToolStripSeparator(),
+                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds, new ToolStripSeparator(),
+                _captureFrom.Menu, _micOutput.Menu, _startup, _service, _applyService, _portEditor, _audioSetup, _audioRemove, _helperHere, new ToolStripSeparator(),
                 _backup, _restore, _logging,
             });
             // Flow, not the usual single row: a row hides whatever does not fit, with no word to a
@@ -258,8 +264,6 @@ namespace TailRemote
             _reach.Add("Through a Kova Relay only (nothing on this PC is opened to the internet)");
             _reach.Add("Both: directly, and through a Kova Relay");
             _reach.SelectedIndex = ReachOf(_settings);
-            _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
-            _relayName.Text = _settings.RelayName;
             _acceptUnasked.Checked = _settings.AcceptUnasked;
             Client.AcceptUnasked = _settings.AcceptUnasked;
             _speedUp.Checked = _settings.CatchUpBySpeed;
@@ -305,7 +309,8 @@ namespace TailRemote
                 if (_player != null) { _player.SetDevice(device); _playerDevice = device; }
             };
             _captureFrom.SelectedIndexChanged += (_, _) => CaptureChanged();
-            set.DropDownOpening += (_, _) => { FillDevices(); _helperHere.Text = NvdaHelper.MenuText(NvdaHelper.GetState(_host?.NvdaHelperServer)); };
+            set.DropDownOpening += (_, _) => { FillDevices(); _helperHere.Text = NvdaHelper.MenuText(NvdaHelper.GetState(_host?.NvdaHelperServer)); ShowWhatApplies(lookAtAudio: true); };
+            _applyService.Click += (_, _) => Menus.AfterMenu(() => ApplyService());
             _helperHere.Click += (_, _) => Menus.AfterMenu(() => HelperHere());
             _helperThere.Click += (_, _) => Menus.AfterMenu(() =>
             {
@@ -326,7 +331,7 @@ namespace TailRemote
                 if (_fillingDevices) return;
                 SaveSettings();
                 if (_host != null) _host.MicDevice = _settings.MicOutput;
-                if (_service.Checked) Say("Press Apply settings to the service to use this there too.");
+                if (_service.Checked) Say(ToTheService);
             };
             _remoteNvda.Add("through the remote PC's sound");
             _remoteNvda.Add("here, as text and braille from this PC's NVDA, with no remote sound");
@@ -349,20 +354,18 @@ namespace TailRemote
             {
                 SaveSettings();
                 DiagLog.Enabled = _logging.Checked;
-                Say(_logging.Checked ? "Logging to " + DiagLog.FilePath + "." + (_service.Checked ? " Press Apply settings to the service to log there too." : "")
+                Say(_logging.Checked ? "Logging to " + DiagLog.FilePath + "." + (_service.Checked ? " " + ToTheService : "")
                                      : "Logging is off.");
             };
-            _go.Click += (_, _) => Menus.AfterMenu(() => Go());
-            _address.Changed += () => { SaveSettings(); if (!HostMode) _checkRelay.Available = _address.Text.Contains('@'); };
+            // File, Stop hosting while the service hosts removes the service (ServiceChanged asks first). Only from the menu:
+            // Go() is also how a copy started with --connect connects, and must never remove the service.
+            _go.Click += (_, _) => Menus.AfterMenu(() => { if (ServiceHosting) { SetServiceBox(false); ServiceChanged(); } else Go(); });
+            _address.Changed += SaveSettings;
             _port.Changed += PortChanged;
             // A host's identity or ticket learnt on a network thread: saved from the window's thread.
             _settings.TrustChanged = () => Later(SaveSettings);
-            _reach.SelectedIndexChanged += (_, _) => { if (!_loadingSettings) Menus.AfterMenu(() => RelayChanged(ticked: true)); }; // not when filled in by code (a wizard, a restore)
             _connectWizard.Click += (_, _) => Menus.AfterMenu(() => ConnectStepByStep());
             _hostWizard.Click += (_, _) => Menus.AfterMenu(() => HostStepByStep());
-            _checkRelay.Click += (_, _) => Menus.AfterMenu(() => CheckRelay());
-            _relayAddress.Changed += () => RelayChanged(ticked: false);
-            _relayName.Changed += () => RelayChanged(ticked: false);
             _password.Changed += SaveSettings;
             _listenPassword.Changed += SaveSettings;
             _toggle.Click += (_, _) => Menus.AfterMenu(() => _keys?.Toggle());
@@ -373,14 +376,6 @@ namespace TailRemote
             _watch.Click += (_, _) => Menus.AfterMenu(() => ShowScreen());
             _getFiles.Click += (_, _) => Menus.AfterMenu(() => GetFiles());
             _getClipboard.Click += (_, _) => Menus.AfterMenu(() => GetClipboard());
-            _takeSent.Click += (_, _) => Menus.AfterMenu(() =>
-            {
-                if (_sentText is not string held) { Say("The remote PC has not sent any text that is waiting."); return; }
-                ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetDataObject(held, true, 2, 50)));
-                _sentText = null;
-                _takeSent.Enabled = false;
-                Say("The text the remote PC sent is on this clipboard.");
-            });
             _acceptUnasked.CheckedChanged += (_, _) =>
             {
                 if (_loadingSettings) return;
@@ -426,9 +421,9 @@ namespace TailRemote
         }
 
         /// <summary>
-        /// Host: the addresses the other PC can connect to. The LAN one (a network with a router),
-        /// then Tailscale's, then the PC's name. The LAN address is what Copy IP address copies,
-        /// or Tailscale's when there is no LAN.
+        /// Host: the addresses the other PC can connect to, for Host this PC's last page. The LAN one (a network with
+        /// a router), then the VPN's, then the PC's name. The LAN address is what its Copy this PC's address button
+        /// copies, or the VPN's when there is no LAN.
         /// </summary>
         private void FillMyAddress()
         {
@@ -455,10 +450,6 @@ namespace TailRemote
             parts.Add("computer name " + Environment.MachineName);
             _bestAddress = lan.Count > 0 ? lan[0].Ip : tailscale;
             _myAddresses = string.Join(", ", parts);
-            string text = "Copy this PC's a&ddress: " + _myAddresses.Replace("&", "&&");
-            if (HostMode && RelayOnlyNow) text = "Copy the relay a&ddress: " + RelayShown.Replace("&", "&&");
-            if (_copyAddress.Text != text) _copyAddress.Text = text;
-            _copyAddress.Enabled = _bestAddress != null || (HostMode && RelayOnlyNow);
         }
 
         private string _myAddresses = "";
@@ -466,66 +457,98 @@ namespace TailRemote
         /// <summary>The relay this PC hosts through, as people type it: "relay.example.com" or "relay.example.com:47300".</summary>
         private string RelayShown => _settings.RelayAddress + (_settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + _settings.RelayPort);
 
-        private void CopyAddress()
-        {
-            if (HostMode && RelayOnlyNow)
-            {
-                string how = RelayShown;
-                ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(how)));
-                Say("Copied " + how + ". Other computers enter this relay address and this PC's password in Connect to a PC.");
-                return;
-            }
-            FillMyAddress();
-            if (_bestAddress is not string ip) { Say("This PC has no network address right now."); return; }
-            ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(ip))); // on the clipboard's own thread, never the window's
-            Say("Copied " + ip + ".");
-        }
-
         private bool HostMode => _mode.SelectedIndex == 1;
+
+        /// <summary>Connected to some PC, or trying to be (in front, reconnecting, connecting, or only PCs in the background).</summary>
+        private bool Connected => _client != null || _reconnecting || _connecting || _parked.Count > 0;
+
+        /// <summary>
+        /// The Kova service hosts this PC and this window is not controlling another one. Whether the service is installed,
+        /// not the hidden mode: connecting sets the mode to control, and after disconnecting the service still hosts.
+        /// </summary>
+        private bool ServiceHosting => _service.Checked && !Connected;
+
+        /// <summary>Said after a setting the service has its own copy of is changed here.</summary>
+        private const string ToTheService = "To use this in the Kova service too, choose Settings, Apply settings to the Kova service.";
 
         private void UpdateMode()
         {
             bool host = HostMode;
-            _address.Item.Available = !host;
-            _device.Menu.Available = !host;
-            _saved.Menu.Available = _savePc.Available = _forgetPc.Available = !host;
-            _listenPassword.Item.Available = host;
-            _reach.Menu.Available = host;
-            if (host) FillMyAddress();
-            _relayAddress.Item.Available = _relayName.Item.Available = host && _reach.SelectedIndex != ReachDirect;
-            // Checking a relay: the host's own, or the one the address goes through.
-            _checkRelay.Available = host ? _reach.SelectedIndex != ReachDirect : _address.Text.Contains('@');
-
-            _copyAddress.Available = host;
-            if (host) FillMyAddress();
-            _captureFrom.Menu.Available = host;
-            _micOutput.Menu.Available = host;
-            _micItem.Available = _micDevice.Menu.Available = _remoteNvda.Menu.Available = !host;
-            _speedUp.Available = !host; // it is about how this PC plays the sound
-            _sounds.Available = !host; // a host's sounds would go out with its own sound
-            _quality.Menu.Available = !host; // the host always sends the best unless asked for less
-            _streaming.Item.Available = !host;
-            _toggle.Available = !host;
-            _helperThere.Available = !host;
-            _restart.Available = _updateRemote.Available = _remoteInfo.Available = _watch.Available = _getFiles.Available = _getClipboard.Available = _speedRemote.Available = _switchTo.Available = !host;
-            _announceQuality.Available = _announceHealth.Available = _muteLocal.Available = _rideOut.Available = _wake.Available = !host;
-            _takeSent.Available = _acceptUnasked.Available = !host;
-            _startup.Available = host;
-            _service.Available = host;
-            _startup.Enabled = !_service.Checked; // the service replaces the at-sign-in task
-            _startup.WhyNot = "Not needed: the Kova service already starts with Windows.";
+            _getFiles.Available = _getClipboard.Available = !host;
+            _acceptUnasked.Available = !host;
             UpdateButtons();
+        }
+
+        private MenuItem _fileMenu = null!, _setMenu = null!;
+
+        /// <summary>
+        /// File and Settings show only what can be used right now, since NVDA reads every item on the way past.
+        /// Three states: hosting (this window or the service), connected (or connecting) to other PCs, or neither.
+        /// Hosting: Stop hosting and Measure this PC's internet speed (the service also has Change how this PC is
+        /// hosted). Connected: the connection's items. Neither: Connect to a PC and Host this PC. Settings shows the
+        /// settings for hosting while this PC hosts (or last hosted), and those for controlling otherwise. An item that
+        /// could only refuse (no saved PCs to wake, a listen-only connection's control items) is hidden, not refused.
+        /// lookAtAudio: Settings is opening, so whether the Kova audio device is there is looked at too.
+        /// </summary>
+        private void ShowWhatApplies(bool lookAtAudio = false)
+        {
+            if (_fileMenu == null) return; // still building the window
+            bool connected = Connected, hosting = _host != null, service = ServiceHosting;
+            bool idle = !connected && !hosting && !service;
+            bool control = _client is { ListenOnly: false };
+            bool saved = _settings.SavedPcs.Count > 0;
+
+            // File. Alt C and Alt S are the Clipboard and Settings menus, so these use other letters.
+            _go.Text = connected ? "&Disconnect" : service ? "Stop &hosting..." : "Stop &hosting";
+            _go.Available = (connected && (_client != null || _reconnecting || _connecting)) || hosting || service;
+            _connectWizard.Text = connected ? "&Connect to another PC..." : "&Connect to a PC...";
+            _connectWizard.Available = idle || connected;
+            _hostWizard.Text = service ? "&Change how this PC is hosted..." : "&Host this PC...";
+            _hostWizard.Available = idle || service;
+            _switchTo.Available = connected && (saved || _parked.Count > 0);
+            _wake.Available = (idle || connected) && saved;
+            _toggle.Available = _watch.Available = _restart.Available = _remoteInfo.Available = _updateRemote.Available = _helperThere.Available = _speedRemote.Available = control;
+            _micItem.Available = connected && _client?.ListenOnly != true; // it can be turned on before the connection is made
+            _streaming.Item.Available = connected;
+            _speedHere.Available = !idle;
+            TidySeparators(_fileMenu.DropDownItems);
+
+            // Settings: one group or the other, never both.
+            bool hostSide = !connected && (hosting || HostMode || _service.Checked);
+            foreach (var item in new ToolStripItem[] { _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds })
+                item.Available = !hostSide;
+            foreach (var item in new ToolStripItem[] { _captureFrom.Menu, _micOutput.Menu, _service, _portEditor, _helperHere })
+                item.Available = hostSide;
+            _startup.Available = hostSide && !_service.Checked; // the service already starts with Windows, before anyone signs in
+            _applyService.Available = hostSide && _service.Checked;
+            if (lookAtAudio && _audioSetup.Usable) // not while it is being set up or removed
+            {
+                bool installed = AudioSetup.Installed();
+                _audioSetup.Available = hostSide && !(installed && AudioSetup.IsReady());
+                _audioRemove.Available = hostSide && installed;
+            }
+            else if (!hostSide) _audioSetup.Available = _audioRemove.Available = false;
+            _restore.Available = !Busy; // a backup goes in only while nothing is connected or hosted here
+            TidySeparators(_setMenu.DropDownItems);
+        }
+
+        /// <summary>A separator shows only between two groups that both have something showing.</summary>
+        private static void TidySeparators(ToolStripItemCollection items)
+        {
+            bool before = false;
+            ToolStripSeparator? pending = null;
+            foreach (ToolStripItem item in items)
+            {
+                if (item is ToolStripSeparator sep) { sep.Available = false; if (before) pending = sep; before = false; continue; }
+                if (!item.Available) continue;
+                if (pending != null) { pending.Available = true; pending = null; }
+                before = true;
+            }
         }
 
         private void UpdateButtons()
         {
-            bool busy = _client != null || _host != null || _reconnecting || _connecting || _parked.Count > 0;
-            _mode.Menu.Enabled = !busy;
-            // Alt C and Alt S are the Clipboard and Settings menus, so the button uses other letters.
-            if (HostMode) _go.Text = _service.Checked ? "Appl&y settings to the service" : _host == null ? "Start &hosting" : "Stop &hosting";
-            else _go.Text = _client == null && !_reconnecting ? "Co&nnect" : "&Disconnect";
-            // 4.6: connecting and hosting start from the wizards; this item only ends them.
-            _go.Available = HostMode ? _host != null && !_service.Checked : _client != null || _reconnecting || _connecting;
+            ShowWhatApplies();
             bool canUse = _client != null && !_client.ListenOnly;
             string why = _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
             foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere })
@@ -534,7 +557,6 @@ namespace TailRemote
                 item.WhyNot = why;
             }
             if (SpeedRunningOnFront) { _speedRemote.Enabled = false; _speedRemote.WhyNot = "A speed test is already running on the remote PC."; }
-            _mode.Menu.WhyNot = "Disconnect, or stop hosting, first.";
             EnsureServiceLink();
             SaveResumeState();
         }
@@ -547,7 +569,9 @@ namespace TailRemote
         /// </summary>
         private void EnsureServiceLink()
         {
-            bool want = HostMode && _service.Checked;
+            // Whenever the service is installed (it hosts whatever this window does), so a transfer to one of its
+            // controllers is not cut off by connecting somewhere; Send uses it only while ServiceHosting.
+            bool want = _service.Checked;
             if (want && _serviceLink == null)
             {
                 var link = new ServiceLink.Client { ReceiveFolder = _settings.ReceiveFolder };
@@ -555,7 +579,13 @@ namespace TailRemote
                 link.FilesArrived += paths => Later(() => ClipboardFilesArrived(paths));
                 // Only while it is still the link: a report already on its way when it was let go put the Files
                 // line back at "Receiving" after it had said the transfer stopped.
-                link.TransferProgress += t => Later(() => { if (_serviceLink == link) ShowTransfer(t); });
+                link.TransferProgress += t => Later(() =>
+                {
+                    if (_serviceLink != link) return;
+                    if (_fromService.Count > 500) _fromService.IntersectWith(_going.Keys); // only those still showing matter
+                    _fromService.Add(t.Serial);
+                    ShowTransfer(t);
+                });
                 _serviceLink = link;
             }
             else if (!want && _serviceLink != null)
@@ -629,7 +659,7 @@ namespace TailRemote
         {
             client = _client;
             host = _host;
-            link = HostMode && _service.Checked ? _serviceLink : null;
+            link = ServiceHosting ? _serviceLink : null;
             if (link != null)
             {
                 if (!link.Connected)
@@ -637,7 +667,7 @@ namespace TailRemote
                     // An older service has no link to this window yet: it is asked to update itself
                     // (at most once a minute), and what happened is said once that is known.
                     if (ServiceHost.InstalledVersion() is Version v && v < Updater.Current) OfferServiceUpdate(fromSend: true);
-                    else Say("The Kova service is not answering. Check that it is running, or press Apply settings to the service.");
+                    else Say("The Kova service is not answering. Check that it is running, or choose Settings, Apply settings to the Kova service.");
                     return false;
                 }
                 if (!link.HasController) { Say("No one is controlling this PC, so there is no one to send to."); return false; }
@@ -774,8 +804,19 @@ namespace TailRemote
                 {
                     if (folder)
                     {
-                        using var pick = new FolderBrowserDialog { Description = "Choose a folder to send to the other PC, with everything in it", UseDescriptionForTitle = true };
-                        done.TrySetResult(pick.ShowDialog() == DialogResult.OK ? new[] { pick.SelectedPath } : null);
+                        // Several at once (4.7): Windows' own folder picker, which NVDA reads like the file picker. Shift
+                        // with the arrows chooses a run of folders, Control with the arrows and Space picks them one by one.
+                        const string title = "Choose folders to send to the other PC, with everything in them (Shift or Control chooses several)";
+                        string[]? chosen;
+                        try { chosen = FolderPicker.Pick(title); }
+                        catch (Exception e) when (e is System.Runtime.InteropServices.COMException or InvalidCastException)
+                        {
+                            // A Windows without that picker (it has been there since Vista): one folder, the old way.
+                            DiagLog.Write("folder picker: " + e.Message);
+                            using var pick = new FolderBrowserDialog { Description = title, UseDescriptionForTitle = true };
+                            chosen = pick.ShowDialog() == DialogResult.OK ? new[] { pick.SelectedPath } : null;
+                        }
+                        done.TrySetResult(chosen);
                         return;
                     }
                     using var files = new OpenFileDialog { Multiselect = true, Title = "Choose files to send to the other PC" };
@@ -902,7 +943,7 @@ namespace TailRemote
         /// <summary>Control Shift M, or the File menu: turns this PC's microphone on or off for the PC in front.</summary>
         private void ToggleMic()
         {
-            if (HostMode) { Say("Your microphone goes to a PC you control, in Control another PC mode."); return; }
+            if (_host != null) { Say("This PC is hosting. Your microphone goes only to a PC you control."); return; }
             _micOn = !_micOn;
             _micItem.Checked = _micOn;
             ApplyMic();
@@ -971,7 +1012,7 @@ namespace TailRemote
             SaveSettings();
             string id = _settings.CaptureDevice;
             _host?.SetCaptureDevice(id.Length == 0 ? null : id);
-            if (_service.Checked) Say("Press Apply settings to the service to use this there too.");
+            if (_service.Checked) Say(ToTheService);
             else if (_host != null) Say("Now sending " + _capDevices[Math.Max(0, _captureFrom.SelectedIndex)].Name + ".");
         }
 
@@ -1101,7 +1142,8 @@ namespace TailRemote
                 if (c.HostVersion is not Version hv) return; // its features have not come yet
                 _seenClient = c;
                 _qualitySaid = c.AudioQuality;
-                _updateRemote.Text = "Update the remote P&C to this PC's version (it has " + hv + ", this PC has " + Updater.Current + ")";
+                // It goes to the newest Kova on GitHub (or this PC's, if newer), not only to this PC's version.
+                _updateRemote.Text = "Update the remote &PC (it has Kova " + hv + ", this PC has " + Updater.Current + ")";
                 if (hv < Updater.Current && !c.ListenOnly && _versionTold.Add(FrontAddress + ":" + FrontPort + ":" + hv))
                     Speak("The remote PC has Kova " + hv + ", older than this PC's " + Updater.Current + ". File, Update the remote PC brings it up to date.");
                 return;
@@ -1130,10 +1172,9 @@ namespace TailRemote
 
         private void QuickConnect(int n)
         {
-            if (HostMode) { Say("Control 1 to 9 switch between saved PCs, in Control another PC mode."); return; }
             if (n > _settings.SavedPcs.Count)
             {
-                Say(_settings.SavedPcs.Count == 0 ? "There are no saved PCs yet. Use File, Save this PC." : "There is no saved PC " + n + ". There are " + _settings.SavedPcs.Count + ".");
+                Say(_settings.SavedPcs.Count == 0 ? NoSavedPcs : "There is no saved PC " + n + ". There are " + _settings.SavedPcs.Count + ".");
                 return;
             }
             var pc = _settings.SavedPcs[n - 1];
@@ -1175,9 +1216,23 @@ namespace TailRemote
 
         private Parked? FindParked(string address, int port) => _parked.Find(p => SamePc(p.Address, p.Port, address, port));
 
+        /// <summary>Said where a saved PC is needed and there are none.</summary>
+        private const string NoSavedPcs = "There are no saved PCs yet. Choose Connect to a PC in the File menu, and keep Save this PC for next time ticked.";
+
+        /// <summary>
+        /// Before connecting from Control 1 to 9, Switch to PC or Wake: a window that hosts says so and connects nowhere;
+        /// otherwise this window becomes the controlling one (Stop hosting leaves it set to host, which is not shown anywhere).
+        /// </summary>
+        private bool ReadyToControl()
+        {
+            if (_host != null) { Say("This PC is hosting. Choose Stop hosting in the File menu first."); return false; }
+            if (HostMode) _mode.SelectedIndex = 0;
+            return true;
+        }
+
         private void SwitchTo(string address, int port, string password, string name)
         {
-            if (HostMode) { Say("Switching PCs works in Control another PC mode."); return; }
+            if (!ReadyToControl()) return;
             if (_connecting && !_reconnecting) { Say("Still connecting. Try again in a moment."); return; }
             if ((_client != null || _reconnecting) && SamePc(FrontAddress, FrontPort, address, port)) { Say("Already on " + name + "."); return; }
             var target = FindParked(address, port);
@@ -1311,13 +1366,13 @@ namespace TailRemote
                 item.Click += (_, _) => Menus.AfterMenu(() => WakePc(pc));
                 items.Add(item);
             }
-            if (items.Count == 0) items.Add(new MenuStatus("There are no saved PCs yet. Connect to one, then File, Save this PC.").Item);
+            if (items.Count == 0) items.Add(new MenuStatus(NoSavedPcs).Item);
         }
 
         private void WakePc(SavedPc pc)
         {
             Doing("waking " + pc);
-            if (HostMode) { Say("Waking PCs works in Control another PC mode."); return; }
+            if (!ReadyToControl()) return;
             if (_connecting && !_reconnecting) { Say("Still connecting. Try again in a moment."); return; }
             var cards = Wake.Parse(pc.Wake);
             if (cards.Count == 0)
@@ -1380,7 +1435,7 @@ namespace TailRemote
                 items.Add(item);
             }
             // Never an empty or all-greyed-out menu: with nothing NVDA can land on, it froze.
-            if (items.Count == 0) items.Add(new MenuStatus("There are no saved PCs to switch to yet. Connect to one, then File, Save this PC.").Item);
+            if (items.Count == 0) items.Add(new MenuStatus(NoSavedPcs).Item);
             if (_parked.Count > 0)
             {
                 items.Add(new ToolStripSeparator());
@@ -1565,7 +1620,7 @@ namespace TailRemote
             LoadIntoWindow();
             // Not saved: said with it, so "Restored" is not taken to mean it will still be there next time.
             if (saved) _saveProblemSaid = null; else _saveProblemSaid = _settings.SaveProblem;
-            Say("Restored every setting and " + n + (n == 1 ? " saved PC." : " saved PCs.") + (_service.Checked ? " Use Apply settings to the service to give the service them too." : "") +
+            Say("Restored every setting and " + n + (n == 1 ? " saved PC." : " saved PCs.") + (_service.Checked ? " " + ToTheService : "") +
                 (saved ? "" : " But they are only in use until Kova closes: " + (_settings.SaveProblem ?? "Kova could not save its settings.")));
         }
 
@@ -1581,8 +1636,6 @@ namespace TailRemote
                 _password.Text = _settings.Password;
                 _listenPassword.Text = _settings.ListenPassword;
                 _reach.SelectedIndex = ReachOf(_settings);
-                _relayAddress.Text = _settings.RelayAddress.Length == 0 ? "" : _settings.RelayAddress + (_settings.RelayPort == 47200 ? "" : ":" + _settings.RelayPort);
-                _relayName.Text = _settings.RelayName;
                 _logging.Checked = _settings.Logging;
                 DiagLog.Enabled = _settings.Logging;
                 _speedUp.Checked = _settings.CatchUpBySpeed;
@@ -1671,7 +1724,8 @@ namespace TailRemote
 
         /// <summary>
         /// While several files move, the Files line opens a list with a line per file: its name,
-        /// how much has moved, and the percent. Nothing to open when one or none is moving.
+        /// how much has moved, and the percent. Nothing to open when one or none is moving. A Done
+        /// below 0 is a transfer still waiting its turn.
         /// </summary>
         private void ShowFileBars(System.Collections.Generic.IReadOnlyList<(string Name, long Done, long Total)> files)
         {
@@ -1691,7 +1745,7 @@ namespace TailRemote
             {
                 var (name, done, total) = files[i];
                 int percent = total <= 0 ? 0 : (int)Math.Clamp(done * 100 / total, 0, 100);
-                string text = (name + ": " + FileChannel.Size(done) + " of " + FileChannel.Size(total) + ", " + percent + " percent").Replace("&", "&&");
+                string text = (done < 0 ? name + ": waiting its turn" : name + ": " + FileChannel.Size(done) + " of " + FileChannel.Size(total) + ", " + percent + " percent").Replace("&", "&&");
                 if (items[i].Text != text) items[i].Text = text;
             }
         }
@@ -1709,16 +1763,34 @@ namespace TailRemote
             Remember(why);
         }
 
-        // Every transfer going right now (several when this PC hosts many controlling PCs), and
-        // those that ended while others still went: the Files line sums them up once all are done.
+        // Every transfer going right now, or waiting its turn (several when this PC hosts many controlling PCs, or
+        // has PCs in the background, or sends more than one lot), and those that ended while others still went:
+        // the Files line sums them up once all are done.
         private readonly System.Collections.Generic.Dictionary<int, FileChannel.Transfer> _going = new();
         private readonly System.Collections.Generic.List<FileChannel.Transfer> _ended = new();
         private readonly System.Collections.Generic.HashSet<FileChannel.Transfer> _endedBefore = new(System.Collections.Generic.ReferenceEqualityComparer.Instance); // ends already shown
+        // Sends already said to be waiting their turn (said once each).
+        private readonly System.Collections.Generic.HashSet<int> _toldWaiting = new();
+        // Transfers the Kova service runs (hosting as the service): the window only sees copies of them, so it can only
+        // stop all of them at once, through the service.
+        private readonly System.Collections.Generic.HashSet<int> _fromService = new();
+        private Action? _stopAllTransfers;
 
         /// <summary>A transfer of files coming to this PC ended (RemoteFilesForm marks what it asked for).</summary>
         internal static event Action<FileChannel.Transfer>? IncomingFilesEnded;
         /// <summary>Files sent from this PC (not the clipboard) finished going (RemoteFilesForm shows what it sent into a folder).</summary>
         internal static event Action<FileChannel.Transfer>? OutgoingFilesEnded;
+
+        /// <summary>
+        /// Are transfers with more than one PC about (PCs in the background, several controlling this one, or transfers
+        /// with different PCs)? Then each is said with its PC's name.
+        /// </summary>
+        private bool SeveralPcs() =>
+            _parked.Count > 0 || (_host != null && _host.Connected.Controlling > 1)
+            || _going.Values.Concat(_ended).Select(x => x.Peer).Where(p => p.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any();
+
+        /// <summary>"Office PC: " in front of what is said about a transfer, when several PCs are about.</summary>
+        private string WithPeer(FileChannel.Transfer t, string text, bool several) => several && t.Peer.Length > 0 ? t.Peer + ": " + text : text;
 
         /// <summary>
         /// How transfers are going, either way: the Files line and bars. Progress is never spoken, so a lot of
@@ -1727,6 +1799,7 @@ namespace TailRemote
         /// </summary>
         private void ShowTransfer(FileChannel.Transfer t)
         {
+            bool several;
             if (t.Finished)
             {
                 // A progress report queued just before the end arrives after it, holding the same (now
@@ -1734,11 +1807,16 @@ namespace TailRemote
                 if (_endedBefore.Contains(t) || t.Result == null) return; // no result yet: the report with it follows
                 if (_endedBefore.Count > 64) _endedBefore.Clear();
                 _endedBefore.Add(t);
+                several = SeveralPcs(); // before it leaves the list: it counts too
                 _going.Remove(t.Serial); if (!_ended.Contains(t)) _ended.Add(t);
+                _toldWaiting.Remove(t.Serial);
                 // Said as each one ends, not once all have: "Sent small.txt" waited for an unrelated 40
                 // megabyte Get to finish, then cut off "Received big.bin". Files coming here are said (you
                 // may be busy in another window, like Get files, when they arrive), queued as news.
-                if (!t.Outgoing && !t.Clipboard && t.Result != null) Speak(t.Result);
+                if (!t.Outgoing && !t.Clipboard && t.Result != null) Speak(WithPeer(t, t.Result, several));
+                // Each one in the history as it ends, with its PC's name when there are several: lots sent one
+                // after another to one PC, or to several, each have their own line.
+                Remember(WithPeer(t, t.Result ?? "Ended.", several));
                 if (!t.Clipboard) (t.Outgoing ? OutgoingFilesEnded : IncomingFilesEnded)?.Invoke(t);
                 // The clipboard's own sounds play when it is sent and when it arrives; file sounds are
                 // for Send files only; and stopping (or replacing) on purpose is never an error.
@@ -1746,43 +1824,81 @@ namespace TailRemote
                 else if (!t.Failed && !t.Clipboard) Tone(t.Outgoing ? Sounds.Tone.FileSent : Sounds.Tone.FileReceived);
             }
             else if (_endedBefore.Contains(t)) return;
-            else _going[t.Serial] = t;
+            else
+            {
+                _going[t.Serial] = t;
+                // A send that has to wait for the one before it: said once, or pressing Send again seemed to do nothing.
+                if (t.Queued && t.Outgoing && !t.Clipboard && _toldWaiting.Add(t.Serial))
+                    Say(t.What + " waits its turn, and goes once what is being sent " + (t.Peer.Length > 0 && SeveralPcs() ? "to " + t.Peer + " " : "") + "now is done.");
+            }
+            several = SeveralPcs();
             _transferShown = _going.Values.FirstOrDefault();
             if (_going.Count == 0)
             {
-                // All ended: one line for all of them on the Files line (each was said as it ended).
+                // All ended: one line for all of them on the Files line (each was said, and remembered, as it ended).
                 var ends = _ended.ToList();
                 _ended.Clear();
                 if (ends.Count == 0) return;
                 ShowFileBars(Array.Empty<(string, long, long)>());
-                _transferStatus.Text = Summary(ends);
-                Remember(_transferStatus.Text);
+                _transferStatus.Text = Summary(ends, several);
                 _transferStop.Enabled = false;
                 return;
             }
-            var going = _going.Values.ToList();
-            if (going.Count == 1 && _ended.Count == 0)
+            var going = _going.Values.OrderBy(x => x.Serial).ToList();
+            var moving = going.Where(x => !x.Queued).ToList();
+            int waiting = going.Count - moving.Count;
+            string waitWords = waiting == 0 ? "" : " " + waiting + (waiting == 1 ? " more waits its turn." : " more wait their turn.");
+            // One bar per transfer, with its PC's name when there are several, the waiting ones too.
+            System.Collections.Generic.List<(string, long, long)> Bars() =>
+                going.Select(x => ((several && x.Peer.Length > 0 ? x.Peer + ", " : "") + (x.Outgoing ? "sending " : "receiving ") + x.What, x.Queued ? -1L : x.Done, x.Total)).ToList();
+            if (moving.Count == 1 && _ended.Count == 0)
             {
-                var g = going[0];
+                var g = moving[0];
                 string left = g.Left is TimeSpan l ? ", about " + Duration(l) + " left" : "";
-                _transferStatus.Text = (g.Outgoing ? "Sending " : "Receiving ") + g.What + ": " + FileChannel.Size(g.Done) + " of " + FileChannel.Size(g.Total) +
-                    (g.Waiting ? ", waiting for the connection to come back; it carries on from here." : ", " + FileChannel.Speed(g.BytesPerSecond) + left + ".");
-                ShowFileBars(g.Files);
+                string with = several && g.Peer.Length > 0 ? (g.Outgoing ? " to " : " from ") + g.Peer : "";
+                _transferStatus.Text = (g.Outgoing ? "Sending " : "Receiving ") + g.What + with + ": " + FileChannel.Size(g.Done) + " of " + FileChannel.Size(g.Total) +
+                    (g.Waiting ? ", waiting for the connection to come back; it carries on from here." : ", " + FileChannel.Speed(g.BytesPerSecond) + left + ".") + waitWords;
+                ShowFileBars(waiting > 0 ? Bars() : g.Files);
+            }
+            else if (moving.Count == 0)
+            {
+                // Only for a moment: the one ahead has just ended and the next is starting.
+                _transferStatus.Text = waiting + (waiting == 1 ? " transfer is" : " transfers are") + " waiting their turn.";
+                ShowFileBars(Bars());
             }
             else
             {
-                // Several at once (to or from several PCs): the totals, and one bar per PC.
-                var all = going.Concat(_ended).ToList();
+                // Several at once (to or from several PCs, or a clipboard copy beside files): the totals, and one bar each.
+                var all = moving.Concat(_ended).ToList();
                 long done = all.Sum(x => x.Finished ? x.Total : x.Done), total = all.Sum(x => x.Total);
-                bool outgoing = going.All(x => x.Outgoing), incoming = going.All(x => !x.Outgoing);
-                string names = string.Join(", ", going.Select(x => x.What).Distinct().Take(3));
-                _transferStatus.Text = (outgoing ? "Sending " + names + " to " + all.Count + " PCs" : incoming ? "Receiving " + names + " from " + all.Count + " PCs" : "Moving " + all.Count + " transfers") +
-                    (_ended.Count > 0 ? ", " + _ended.Count + " finished" : "") + ": " + FileChannel.Size(done) + " of " + FileChannel.Size(total) + ", " + FileChannel.Speed(going.Sum(x => x.BytesPerSecond)) +
+                int outs = moving.Count(x => x.Outgoing), ins = moving.Count - outs;
+                string names = string.Join(", ", moving.Select(x => x.What).Distinct().Take(3));
+                var peers = moving.Select(x => x.Peer).Where(p => p.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                string head = outs > 0 && ins > 0 ? "Sending " + outs + " and receiving " + ins : (outs > 0 ? "Sending " : "Receiving ") + names;
+                if (several && peers.Count > 0) head += (ins == 0 ? " to " : outs == 0 ? " from " : " with ") + string.Join(", ", peers.Take(3)) + (peers.Count > 3 ? " and " + (peers.Count - 3) + " more PCs" : "");
+                _transferStatus.Text = head + (_ended.Count > 0 ? ", " + _ended.Count + " finished" : "") + ": " + FileChannel.Size(done) + " of " + FileChannel.Size(total) + ", " + FileChannel.Speed(moving.Sum(x => x.BytesPerSecond)) +
                     // They go side by side, so the slowest one says when all are done.
-                    (going.Select(x => x.Left).Where(x => x != null).Max() is TimeSpan most ? ", about " + Duration(most) + " left" : "") + ".";
-                ShowFileBars(going.Select(x => ((x.Peer.Length > 0 ? x.Peer + ", " : "") + x.What, x.Done, x.Total)).ToList());
+                    (moving.Select(x => x.Left).Where(x => x != null).Max() is TimeSpan most ? ", about " + Duration(most) + " left" : "") + "." + waitWords;
+                ShowFileBars(Bars());
             }
             _transferStop.Enabled = true;
+        }
+
+        /// <summary>
+        /// Clipboard, Stop just one transfer: every transfer going or waiting, to and from every PC, each with its
+        /// progress, and the things chosen in each; Delete stops the one selected while the rest carry on.
+        /// </summary>
+        private void ShowTransfersWindow()
+        {
+            Doing("looking at each transfer");
+            using var f = new TransfersForm(
+                () => _going.Values.OrderBy(x => x.Peer, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.Serial).ToList(),
+                (t, item, name) => _fromService.Contains(t.Serial)
+                    ? "That one goes through the Kova service, which can only stop everything at once. Use Stop all."
+                    : FileChannel.StopOne(t.Serial, item, name),
+                () => { _stopAllTransfers?.Invoke(); Say("Stopping every transfer."); },
+                Say);
+            f.ShowDialog(this);
         }
 
         /// <summary>
@@ -1800,17 +1916,27 @@ namespace TailRemote
             return Part(secs, "second");
         }
 
-        /// <summary>One line for transfers that all ended: the one result, or how many PCs got it and what went wrong.</summary>
-        private static string Summary(System.Collections.Generic.List<FileChannel.Transfer> ends)
+        /// <summary>
+        /// One line for transfers that all ended: the one result; for the same thing sent to (or got from) several PCs,
+        /// how many got it and what went wrong; otherwise the results one after another, each with its PC's name when
+        /// there are several.
+        /// </summary>
+        private string Summary(System.Collections.Generic.List<FileChannel.Transfer> ends, bool several)
         {
-            if (ends.Count == 1) return ends[0].Result ?? TransferIdle;
-            // Some sent and some received (a Get while a Send went): each its own line, not "Received
-            // small.txt, big.bin from all 2 PCs".
-            if (ends.Any(e => e.Outgoing) && ends.Any(e => !e.Outgoing))
-                return string.Join(" ", ends.Select(e => e.Result).Where(r => !string.IsNullOrEmpty(r)).Take(5));
+            if (ends.Count == 1) return WithPeer(ends[0], ends[0].Result ?? TransferIdle, several);
+            bool sameWay = ends.All(e => e.Outgoing) || ends.All(e => !e.Outgoing);
+            bool toEach = sameWay && ends.Select(e => e.What).Distinct().Count() == 1
+                && ends.Select(e => e.Peer).Distinct(StringComparer.OrdinalIgnoreCase).Count() == ends.Count;
+            if (!toEach)
+            {
+                // Lots one after another, or some sent and some received: each its own result, not "Received
+                // small.txt, big.bin from all 2 PCs".
+                string each = string.Join(" ", ends.Where(e => !string.IsNullOrEmpty(e.Result)).Take(5).Select(e => WithPeer(e, e.Result!, several)));
+                return ends.Count > 5 ? each + " And " + (ends.Count - 5) + " more: see History of transfers." : each;
+            }
             var good = ends.Where(e => !e.Failed).ToList();
             var bad = ends.Where(e => e.Failed).ToList();
-            string what = string.Join(", ", ends.Select(e => e.What).Distinct().Take(3));
+            string what = ends[0].What;
             string head = ends.All(e => e.Outgoing)
                 ? (bad.Count == 0 ? "Sent " + what + " to all " + ends.Count + " PCs" : "Sent " + what + " to " + good.Count + " of " + ends.Count + " PCs")
                 : (bad.Count == 0 ? "Received " + what + " from all " + ends.Count + " PCs" : "Received from " + good.Count + " of " + ends.Count + " PCs");
@@ -1897,6 +2023,7 @@ namespace TailRemote
             _keys = new KeyCapture(() => _handle);
             _keys.ModeChanged += remote => Later(() => ModeChanged(remote));
             _keys.NotConnected += () => Later(() => Say("Not connected."));
+            _keys.SendClipboardPressed += () => Later(() => SendClipboard());
             _titleTimer.Start();
             if (!_autoHost)
             {
@@ -2167,17 +2294,18 @@ namespace TailRemote
             Doing("pressing " + (_go.Text ?? "").Replace("&", ""));
             if (_connecting && !_reconnecting) return; // a second press while connecting would start a second connection
             SaveSettings();
-            if (HostMode && _service.Checked) ApplyService();
+            // A connection first: Disconnect always disconnects. Removing the service is never done here (see _go.Click):
+            // Go() also runs for --connect and the sign-in task. With the service installed, StartHost only says so.
+            if (_reconnecting) StopReconnecting("Disconnected.");
+            else if (_client != null) Disconnect("Disconnected.", byUser: true);
             else if (HostMode) { if (_host == null) StartHost(); else StopHost(); }
-            else if (_reconnecting) StopReconnecting("Disconnected.");
-            else if (_client == null) Connect(quiet: false);
-            else Disconnect("Disconnected.", byUser: true);
+            else Connect(quiet: false);
         }
 
         private async void StartHost()
         {
             Doing("starting hosting");
-            if (ServiceHost.IsInstalled()) { Say("The Kova service is hosting this PC. Use Apply settings to the service instead."); return; }
+            if (ServiceHost.IsInstalled()) { Say("The Kova service is hosting this PC already. To change how, choose Change how this PC is hosted in the File menu."); return; }
             if (!CheckPassword()) return;
             if (!CheckListenPassword()) return;
             string listen = _listenPassword.Text;
@@ -2204,7 +2332,7 @@ namespace TailRemote
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
                 _host.MicDevice = _settings.MicOutput;
                 _host.StartNvdaHelper(); // the Kova Helper NVDA add-on, if installed here, hands NVDA's speech to controlling PCs
-                Say((relayOnly ? "Hosting through the Kova Relay at " + relayTarget!.RelayHost + ". No ports are opened on this PC."
+                Say((relayOnly ? "Hosting through the Kova Relay at " + RelayShown + ". No ports are opened on this PC."
                     : "Hosting on port " + port + ". Waiting for a connection.") + (listen.Length > 0 ? " The listen-only password is on." : ""));
                 // Audio settings and device names are never changed by themselves (they are other
                 // programs' too): only Set up audio device does that, when pressed.
@@ -2251,7 +2379,7 @@ namespace TailRemote
             if (now == old || !HostMode || Protocol.PortProblem(now.ToString(), out _) != null) return;
             if (_service.Checked)
             {
-                Say("Press Apply settings to the service to move it to port " + now + ". That opens port " + now + " in Windows Firewall and closes port " + old + ".");
+                Say("To move the Kova service to port " + now + ", choose Settings, Apply settings to the Kova service. That opens port " + now + " in Windows Firewall and closes port " + old + ".");
                 return;
             }
             if (_host != null)
@@ -2315,43 +2443,6 @@ namespace TailRemote
             return _identity;
         }
 
-        /// <summary>Host through a relay was ticked or unticked, or its address or name changed: checked, saved, and used at once when hosting here.</summary>
-        private void RelayChanged(bool ticked)
-        {
-            if (_loadingSettings) return;
-            // The address as typed may carry the port: "relay.example.com:47300".
-            string typed = _relayAddress.Text.Trim();
-            if (typed.Length > 0)
-            {
-                if (Relay.Parse("x@" + typed, 47200, out string? problem) is not Relay.Target where)
-                {
-                    Later(() => _relayAddress.Ask(this, problem ?? "That is not a relay address."));
-                    return;
-                }
-                _settings.RelayAddress = where.RelayHost;
-                _settings.RelayPort = where.RelayPort;
-            }
-            else _settings.RelayAddress = "";
-            string name = _relayName.Text.Trim();
-            if (name.Length > 0 && !KovaRelayWire.Wire.NameOk(name)) { Later(() => _relayName.Ask(this, "That name cannot be used.")); return; }
-            _settings.RelayName = name;
-            _settings.RelayHosting = _reach.SelectedIndex != ReachDirect;
-            _settings.RelayOnly = _reach.SelectedIndex == ReachRelayOnly;
-            SaveSettings();
-            UpdateMode();
-            bool wants = _settings.RelayHosting;
-            if (wants && _settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
-            var target = RelayTargetHere();
-            // Into or out of relay only: the port is taken differently, so hosting here starts again.
-            if (_host != null && _host.RelayOnly != (_settings.RelayOnly && target != null)) { StopHost(); StartHost(); return; }
-            if (_host != null) _host.UseRelay(target, ListenRelayTarget());
-            if (target == null) { if (ticked) Say("This PC is reached directly, not through a relay."); return; }
-            string how = _settings.RelayOnly ? "only through the relay" : "through the relay too";
-            Say(_service.Checked ? "Press Apply settings to the service to host " + how + "."
-                : _host != null ? "Connecting to the relay."
-                : "This PC will be reachable " + how + " while it hosts.");
-        }
-
         /// <summary>The service kept the identity it already had: this window takes it on, so hosting here later is the same PC to controlling PCs.</summary>
         private void TakeServiceIdentity()
         {
@@ -2378,40 +2469,10 @@ namespace TailRemote
 
         private static int ReachOf(Settings s) => !s.RelayHosting ? ReachDirect : s.RelayOnly ? ReachRelayOnly : ReachBoth;
 
-        private bool _checkingRelay;
-
-        /// <summary>Check the relay is up: the host's relay (and that this PC is on it), or the relay the address goes through (and that PC).</summary>
-        private async void CheckRelay()
-        {
-            string relay, name;
-            if (HostMode)
-            {
-                if (_settings.RelayAddress.Length == 0) { Later(() => _relayAddress.Ask(this, "Type the relay's address first.")); return; }
-                relay = RelayShown;
-                name = _password.Text.Length > 0 ? Relay.Channel(_password.Text) : "";
-            }
-            else if (Relay.Parse(Relay.WithChannel(_address.Text.Trim(), _password.Text), KovaRelayWire.Wire.DefaultPort, out string? problem) is Relay.Target t)
-            {
-                relay = t.RelayHost.Contains(':') ? "[" + t.RelayHost + "]:" + t.RelayPort : t.RelayHost + ":" + t.RelayPort;
-                name = t.Name;
-            }
-            else { Say(problem ?? "The address does not go through a relay."); return; }
-            if (_checkingRelay) return;
-            _checkingRelay = true;
-            _checkRelay.Enabled = false;
-            Say("Checking the relay.");
-            try
-            {
-                var found = await System.Threading.Tasks.Task.Run(() => Relay.Check(relay, name.Length > 0 ? name : null));
-                string said = found.Said;
-                if (HostMode && found.Up && _host != null)
-                    said += _host.RelayRegistered ? " This PC is connected to it." : " This PC is not connected to it yet, and keeps trying.";
-                Say(said);
-            }
-            finally { _checkingRelay = false; _checkRelay.Enabled = true; }
-        }
-
-        /// <summary>File, Connect to a PC: a saved PC, or a new one by its address or through a relay, step by step, then connects.</summary>
+        /// <summary>
+        /// File, Connect to a PC: a saved PC, or a new one by its address or through a relay, step by step, then connects.
+        /// While connected it is Connect to another PC: the PC in front stays connected in the background, as with Switch to PC.
+        /// </summary>
         private void ConnectStepByStep()
         {
             Doing("connecting step by step");
@@ -2421,15 +2482,8 @@ namespace TailRemote
                 if (MessageBox.Show(this, "This PC is hosting. Stop hosting and connect to another PC?", "Connect to a PC", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 StopHost();
             }
-            var answer = ConnectWizard.Run(this, _settings, () => { SaveNow(); FillSaved(); });
+            var answer = ConnectWizard.Run(this, _settings, () => { SaveNow(); FillSaved(); UpdateButtons(); });
             if (answer == null) return;
-            if (_reconnecting) StopReconnecting("Stopped reconnecting.", news: false);
-            else if (_client != null) Disconnect("Disconnected.", byUser: true);
-            _mode.SelectedIndex = 0;
-            _address.Text = answer.Address;
-            _port.Text = answer.Port.ToString();
-            _password.Text = answer.Password;
-            SaveSettings();
             if (answer.Save)
             {
                 var pc = _settings.SavedPcs.Find(x => string.Equals(x.Address, answer.Address, StringComparison.OrdinalIgnoreCase) && x.Port == answer.Port);
@@ -2438,9 +2492,11 @@ namespace TailRemote
                 if (answer.Name.Length > 0) pc.Name = answer.Name;
                 SaveNow();
             }
-            FillSaved();
+            // Trying to reach a PC that is not answering: given up, so the details just typed are what is used now.
+            if (_reconnecting) StopReconnecting("Stopped reconnecting.", news: false);
+            // Into the background if one is in front, then to the front: a PC already in the background comes back at once.
+            SwitchTo(answer.Address, answer.Port, answer.Password, NameFor(answer.Address, answer.Port));
             UpdateMode();
-            Connect(quiet: false);
         }
 
         /// <summary>File, Host this PC: how other PCs reach it, the relay (checked), the passwords; then hosts (or applies it to the service).</summary>
@@ -2457,7 +2513,8 @@ namespace TailRemote
             int.TryParse(_port.Text.Trim(), out int port);
             if (port is < 1 or > 65535) port = Protocol.DefaultPort;
             FillMyAddress();
-            var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked, _myAddresses);
+            var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked,
+                _bestAddress, _myAddresses, text => ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(text)))); // the clipboard's own thread, never the window's
             if (a == null) return;
             _loadingSettings = true; // filled in all at once: nothing below acts on half of it
             try
@@ -2466,7 +2523,6 @@ namespace TailRemote
                 _port.Text = a.Port.ToString();
                 _password.Text = a.Password;
                 _listenPassword.Text = a.ListenPassword;
-                if (a.Relay) _relayAddress.Text = a.RelayAddress + (a.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + a.RelayPort);
                 _reach.SelectedIndex = !a.Relay ? ReachDirect : a.Direct ? ReachBoth : ReachRelayOnly;
             }
             finally { _loadingSettings = false; }
@@ -2618,7 +2674,7 @@ namespace TailRemote
                 pw = _password.Text;
                 if (address.Length == 0 || pw.Length == 0 || !int.TryParse(_port.Text.Trim(), out port) || port is <= 0 or > 65535)
                 {
-                    StopReconnecting("Stopped trying: the address, port or password is empty or not valid. Fix it, then press Connect.", news: true);
+                    StopReconnecting("Stopped trying: the address, port or password is empty or not valid. Choose Connect to a PC in the File menu to fix it.", news: true);
                     return;
                 }
             }
@@ -2690,16 +2746,17 @@ namespace TailRemote
                 c.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 c.UnaskedClipboardReceived += (text, path) => Later(() =>
                 {
-                    // Kept and offered, never put on the clipboard by itself: a hostile remote PC could otherwise swap what
-                    // you copy for something you would then paste into a command line.
-                    _sentText = text;
-                    _takeSent.Enabled = true;
+                    // Never put on the clipboard by itself: a hostile remote PC could otherwise swap what you copy for
+                    // something you would then paste into a command line. It is kept as a file instead (4.7: the 4.4 menu
+                    // item that put it on the clipboard went in 4.5.1, and this still told people to use it).
                     Tone(Sounds.Tone.ClipboardReceived);
-                    Speak("The remote PC sent some text. Your clipboard was left as it was. To use the text, choose Put the text the remote PC sent on this clipboard, in the Clipboard menu." +
-                        (path != null ? " It is also saved in " + System.IO.Path.GetDirectoryName(path) + "." : ""));
+                    Speak("The remote PC sent some text without being asked. Your clipboard was left as it was." +
+                        (path != null ? " The text is saved in " + System.IO.Path.GetDirectoryName(path) + "." : ""));
                 });
                 c.ClipboardFilesReceived += paths => Later(() => ClipboardFilesArrived(paths));
                 c.TransferProgress += t => Later(() => ShowTransfer(t));
+                // Its transfers go by its saved name, so those with PCs in the background can be told apart.
+                c.NameTransfers(NameFor(address, port));
                 c.HealthAlert += text => Later(() => HealthSaid(c, text));
                 c.WakeInfoKnown += info => Later(() => RememberWake(address, port, info));
                 if (c.WakeInfo is string knownNow) RememberWake(address, port, knownNow); // it can come before the line above
@@ -3042,7 +3099,8 @@ namespace TailRemote
                 ? "Run Kova as a Windows service?" + Environment.NewLine + Environment.NewLine +
                   "The service starts with Windows, before anyone signs in, and has full system access. Whoever knows the Kova password can then use the lock screen, sign in, and approve administrator prompts on this PC, and Control Alt End sends Control Alt Delete." + Environment.NewLine + Environment.NewLine +
                   "It uses this window's port and passwords, opens the port in Windows Firewall, and replaces Start hosting when Windows starts. " + ServiceWhere() + " Windows asks for administrator permission."
-                : "Remove the Kova service? This PC stops hosting until you start hosting here again. Windows asks for administrator permission.";
+                : "Stop hosting and remove the Kova service?" + Environment.NewLine + Environment.NewLine +
+                  "Nobody can connect to this PC until you host it again. If you are controlling this PC from another one right now, you lose it. Windows asks for administrator permission.";
             if (MessageBox.Show(this, plan, want ? "Run as a Windows service" : "Remove the service", MessageBoxButtons.OKCancel,
                     want ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
                     want ? MessageBoxDefaultButton.Button1 : MessageBoxDefaultButton.Button2) != DialogResult.OK // removing defaults to Cancel; installing (what the user just asked for) keeps OK
@@ -3155,7 +3213,7 @@ namespace TailRemote
                 {
                     if (!asked)
                     {
-                        string problem = "Could not ask the Kova service to update itself. If it is still on an older version, press Apply settings to the service.";
+                        string problem = "Could not ask the Kova service to update itself. If it is still on an older version, choose Settings, Apply settings to the Kova service.";
                         if (fromSend) Say(problem); else Speak(problem);
                     }
                     else if (fromSend) Say("The Kova service is still on version " + v + " and has been asked to update itself. Try again in a minute.");

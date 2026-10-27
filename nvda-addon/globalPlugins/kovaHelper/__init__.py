@@ -6,8 +6,10 @@
 # - It only talks to a local named pipe (\\.\pipe\KovaNvda-<session>), never the network. Before sending anything it
 #   checks the pipe is owned by this user, SYSTEM or Administrators (no other signed-in person can make one that
 #   passes) and served by a program called Kova.
-# - It never slows NVDA down: NVDA's threads only put small items on a bounded queue (the oldest go if Kova is
-#   stuck), and one background thread does all the encoding and writing. While Kova is not running it tries again
+# - It never slows NVDA down: NVDA's threads only copy what NVDA said onto a bounded queue (the oldest go if Kova is
+#   stuck), and one background thread does all the reading, encoding and writing. Everything waiting is written in
+#   one go, and speech that a later cut-off would silence anyway is dropped before it is sent, so a console pouring
+#   out text, or a long document read aloud, never builds up a backlog. While Kova is not running it tries again
 #   quietly every few seconds and nothing is queued.
 #
 # Python standard library and NVDA's own modules only. Works with NVDA 2024.1 (Python 3.11, 32-bit) through 2026.x
@@ -34,9 +36,10 @@ PIPE_BASE = "\\\\.\\pipe\\KovaNvda-"
 RETRY_SECONDS = 3.0
 REFUSED_RETRY_SECONDS = 15.0
 KEEPALIVE_SECONDS = 2.0
-QUEUE_MAX = 512
+QUEUE_MAX = 2048
 MAX_UNITS = 4000  # characters (UTF-16 units, as Kova counts them) in one speech or braille event
 MAX_PARTS = 64
+WRITE_MAX = 60000  # bytes in one write to the pipe (Kova's pipe holds 64 KB)
 
 _KOVA_NAME = re.compile(r"(?i)^kova[^\\/]*\.exe(\.old[^\\/]*)?$")
 _WAVE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -170,6 +173,9 @@ def _utf8(s):
 
 def _cut(text, units):
 	"""The start of text holding at most `units` UTF-16 units, and the rest."""
+	# Nearly always the whole text fits: no character takes more than two units, so that is known without counting.
+	if len(text) * 2 <= units or _units(text) <= units:
+		return text, ""
 	n = 0
 	for i, ch in enumerate(text):
 		n += 2 if ord(ch) > 0xFFFF else 1
@@ -213,10 +219,33 @@ def _speakBodies(parts):
 	return out
 
 
+def _coalesce(items):
+	"""
+	What is worth sending of everything waiting, in order. Speech before the last cut-off is dropped (NVDA cut it off
+	already: sent, the other PC would only start it and stop again), and so are the cut-offs before that one. Only the
+	newest braille matters: the display shows one thing at a time. Beeps and sounds all go, as NVDA played them.
+	"""
+	lastCancel = lastBraille = -1
+	for i, it in enumerate(items):
+		if it[0] == "c":
+			lastCancel = i
+		elif it[0] == "r":
+			lastBraille = i
+	out = []
+	for i, it in enumerate(items):
+		kind = it[0]
+		if kind == "r" and i != lastBraille:
+			continue
+		if i < lastCancel and kind in ("s", "c"):
+			continue
+		out.append(it)
+	return out
+
+
 def _encode(item):
 	kind = item[0]
 	if kind == "s":
-		return _speakBodies(item[1])
+		return _speakBodies(_speechParts(item[1]))
 	if kind == "c":
 		return [b"\x02"]
 	if kind == "b":
@@ -237,7 +266,9 @@ class _Link(threading.Thread):
 
 	def __init__(self):
 		super().__init__(name="Kova Helper", daemon=True)
-		self._queue = collections.deque(maxlen=QUEUE_MAX)
+		self._queue = collections.deque()
+		self._lock = threading.Lock()
+		self._lostCancel = False
 		self._wake = threading.Event()
 		self._stopping = False
 		self._handle = None
@@ -248,8 +279,24 @@ class _Link(threading.Thread):
 	def put(self, item):
 		if not self.connected:
 			return
-		self._queue.append(item)
+		with self._lock:
+			if len(self._queue) >= QUEUE_MAX:
+				# Kova is stuck: the oldest goes. A cut-off that goes is still sent, first, so the other PC never
+				# carries on with speech this NVDA cut off.
+				if self._queue.popleft()[0] == "c":
+					self._lostCancel = True
+			self._queue.append(item)
 		self._wake.set()
+
+	def _take(self):
+		"""Everything waiting, worth sending, in order (see _coalesce)."""
+		with self._lock:
+			items = list(self._queue)
+			self._queue.clear()
+			lost, self._lostCancel = self._lostCancel, False
+		if lost:
+			items.insert(0, ("c",))
+		return _coalesce(items)
 
 	def stop(self):
 		self._stopping = True
@@ -279,18 +326,40 @@ class _Link(threading.Thread):
 		if not self._write(bytes([0, len(v)]) + v.encode("ascii")):
 			self._drop()
 			return RETRY_SECONDS
-		self._queue.clear()
+		with self._lock:
+			self._queue.clear()
+			self._lostCancel = False
 		self.connected = True
 		log.info("Kova Helper: connected to Kova")
 		return 0
 
 	def _write(self, body):
+		return self._writeRaw(struct.pack("<I", len(body)) + body)
+
+	def _writeRaw(self, data):
 		h = self._handle
 		if not h:
 			return False
-		data = struct.pack("<I", len(body)) + body
 		done = wintypes.DWORD()
 		return bool(_k32.WriteFile(h, data, len(data), ctypes.byref(done), None)) and done.value == len(data)
+
+	def _sendBatch(self, items):
+		"""Every item's frames, written in as few writes as fit: one call into Windows for a whole burst, not one per line."""
+		buf = bytearray()
+		for item in items:
+			try:
+				bodies = _encode(item)
+			except Exception:
+				log.debugWarning("Kova Helper: could not encode an item", exc_info=True)
+				continue
+			for b in bodies:
+				buf += struct.pack("<I", len(b))
+				buf += b
+				if len(buf) >= WRITE_MAX:
+					if not self._writeRaw(bytes(buf)):
+						return False
+					buf = bytearray()
+		return not buf or self._writeRaw(bytes(buf))
 
 	def _drop(self):
 		was = self.connected
@@ -298,7 +367,9 @@ class _Link(threading.Thread):
 		h, self._handle = self._handle, None
 		if h:
 			_k32.CloseHandle(h)
-		self._queue.clear()
+		with self._lock:
+			self._queue.clear()
+			self._lostCancel = False
 		if was:
 			log.info("Kova Helper: Kova went away; trying again every few seconds")
 
@@ -318,20 +389,11 @@ class _Link(threading.Thread):
 						self._drop()
 					continue
 				self._wake.clear()
+				# Whatever came in while the last batch was being written goes next, as one batch.
 				while self._queue and self._handle is not None and not self._stopping:
-					try:
-						item = self._queue.popleft()
-					except IndexError:
+					if not self._sendBatch(self._take()):
+						self._drop()
 						break
-					try:
-						bodies = _encode(item)
-					except Exception:
-						log.debugWarning("Kova Helper: could not encode an item", exc_info=True)
-						continue
-					for b in bodies:
-						if not self._write(b):
-							self._drop()
-							break
 			except Exception:
 				log.debugWarning("Kova Helper: link problem", exc_info=True)
 				self._drop()
@@ -341,12 +403,26 @@ class _Link(threading.Thread):
 			_k32.CloseHandle(h)
 
 
+_commands = None
+
+
+def _commandTypes():
+	global _commands
+	if _commands is None:
+		try:
+			from speech.commands import PitchCommand, CharacterModeCommand
+			_commands = (PitchCommand, CharacterModeCommand)
+		except Exception:
+			_commands = ((), ())
+	return _commands
+
+
 def _speechParts(sequence):
-	"""The words of an NVDA speech sequence, with the pitch, capital and spelling NVDA gave them."""
-	try:
-		from speech.commands import PitchCommand, CharacterModeCommand
-	except Exception:
-		PitchCommand = CharacterModeCommand = ()
+	"""
+	The words of an NVDA speech sequence, with the pitch, capital and spelling NVDA gave them. The words go exactly as
+	NVDA was given them (before NVDA's own symbol processing), apostrophes, quotes and all.
+	"""
+	PitchCommand, CharacterModeCommand = _commandTypes()
 	parts = []
 	pitch = 0
 	spelled = False
@@ -371,6 +447,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._undo = []
 		self._spoke = False
 		self._braille = None
+		self._cancellable = None
 		try:
 			import globalVars
 			if getattr(getattr(globalVars, "appArgs", None), "secure", False):
@@ -460,15 +537,38 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if link is None or not link.connected or not speechSequence:
 			return
 		try:
-			parts = _speechParts(speechSequence)
+			# Only a copy here (NVDA changes the list in place right after this); it is read on the add-on's own thread.
+			seq = list(speechSequence)
+			self._expired(link, seq)
 		except Exception:
 			return
-		if parts:
-			self._spoke = True
-			link.put(("s", parts))
+		self._spoke = True
+		link.put(("s", seq))
+
+	def _expired(self, link, seq):
+		"""
+		NVDA drops what it was about to say for a control that has lost the focus since, without a cut-off (its
+		"cancellable" speech). When the last speech handed over was such speech and it has expired by the time
+		NVDA says something new, the other PC is told to cut it off too, before the new words.
+		"""
+		last = self._cancellable
+		self._cancellable = None
+		for item in seq:
+			# NVDA puts in a subclass (eventHandler's FocusLossCancellableSpeechCommand): found by its base's name.
+			if any(c.__name__ == "_CancellableSpeechCommand" for c in type(item).__mro__):
+				self._cancellable = item
+		if last is not None and self._spoke:
+			try:
+				gone = bool(last.isCancelled)
+			except Exception:
+				gone = False
+			if gone:
+				self._spoke = False
+				link.put(("c",))
 
 	def _onCancel(self, **kwargs):
 		link = self._link
+		self._cancellable = None
 		# Only after something was said: NVDA cancels often when there is nothing to cut off.
 		if link is None or not link.connected or not self._spoke:
 			return

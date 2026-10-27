@@ -1,7 +1,9 @@
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -19,20 +21,21 @@ namespace KovaRelay
     ///
     /// The most memory the relay can use under these limits, roughly (managed memory, on top of the .NET runtime's
     /// own 20 to 30 MB):
-    ///   - Spliced pairs: each paired connection has one 32 KB copy buffer (one per direction of a pair), so 600
-    ///     connections hold at most 600 x 32 KB = about 19 MB (they come from the shared array pool and go back).
-    ///   - Connections still asking: a 36-byte hello and at most a 1027-byte frame each, 600 x ~1.1 KB = under 1 MB.
-    ///   - Per-address table: at most 20,000 entries of about 200 bytes with their dictionary slot, about 4 MB.
-    ///   - Connected hosts and pending pairings: bounded by connections.
-    ///   - UDP: one 64 KB receive buffer; packets are forwarded straight from it, never queued.
+    ///   - Spliced pairs: a copy buffer (SpliceBuffer) is held only while bytes are actually moving in that direction;
+    ///     a pair waiting for data holds none (it waits with a zero-byte read). So memory follows the traffic, not the
+    ///     number of connections: a thousand busy directions at once hold 64 MB, idle ones hold nothing. Each
+    ///     connection costs about 2 KB of bookkeeping besides.
+    ///   - Connections still asking: a 36-byte hello and at most a 1027-byte frame each.
+    ///   - Per-address table: at most MaxAddressEntries entries of about 200 bytes with their dictionary slot, about 4 MB.
+    ///   - Connected hosts, pending pairings and recently used pairing ids: bounded by connections and by time.
+    ///   - UDP: one 64 KB receive buffer on its own thread; packets are forwarded straight from it, never queued.
     ///   - Log: at most 2,000 queued lines, under 1 MB.
-    /// So about 25 MB of the relay's own at the very worst, plus Windows' socket buffers (in the kernel, by default
-    /// up to 64 KB each way per connection: 600 x 128 KB = about 77 MB of kernel memory at the absolute worst,
-    /// which Windows bounds by itself).
+    /// Plus Windows' socket buffers in the kernel, which Windows sizes and bounds by itself.
+    /// No thread per connection: everything TCP is asynchronous; UDP has one dedicated thread.
     /// </summary>
     internal static class Limits
     {
-        public const int MaxConnections = 600;          // every TCP connection at once, host control lines included
+        public const int MaxConnections = 20_000;       // every TCP connection at once, host control lines included
         public const int PerAddressConnections = 64;    // one controlling PC uses up to about 20 (main, 16 file lanes, screen)
         public const int PerAddressUnpaired = 40;       // still asking (not yet a host line or a pair): a controlling PC opens its main line, 16 file lanes and the screen at once
         public const double BucketSize = 40;            // new connections per address: a burst of 40...
@@ -44,16 +47,28 @@ namespace KovaRelay
         public const long ForgetAddressAfterMs = 60 * 60_000; // an idle address entry is dropped after an hour
         public const int MissesPerHour = 30;            // DIFFERENT absent hosts asked for (different wrong passwords, in effect), per address per hour
         public const long MissWindowMs = 3_600_000;     // ...after which the address's lookups are turned away until the hour is up
-        public const int HostAddressFactor = 8;         // an address with a registered host: 8 times the connections, no rate bucket (HostLines)
-        public const int PendingPerHost = 64;           // pairings waiting for one host to dial back (two PCs connecting at once ask for about 40)
+        // An address with a registered host gets more room, because its host dials back once for every lane a controlling
+        // PC opens (about 20 each). Registering costs nothing (any password will do), so the extra room comes mostly from
+        // live pairs, which need a real controlling PC each, and it stays small: one address can never take a large share.
+        public const int HostBaseFactor = 2;            // any registered host: twice the connections and twice the rate bucket...
+        public const int PairsPerExtraFactor = 16;      // ...plus once more for every 16 live pairs its hosts carry...
+        public const int MaxHostRoomFactor = 8;         // ...up to 8 times in all (512 connections; an office of PCs behind one router)
+        public const int MaxHostsPerAddress = 32;       // hosts one address may have registered at once
+        public const int PendingPerHost = 128;          // pairings waiting for one host to dial back (two PCs connecting at once ask for about 40)
         public const int PendingPerClient = 40;         // pairings waiting, asked for from one address (one PC asks for about 20 at once)
-        public const int SpliceBuffer = 32 * 1024;      // one per direction of a pair
+        public const int SpliceBuffer = 64 * 1024;      // held per direction of a pair only while bytes are moving
         public const long SpliceIdleMs = 15 * 60_000;   // a pair with no bytes either way for 15 minutes is closed
         public const int SendTimeoutMs = 10_000;        // a frame the other side will not take in 10 s ends that line
         public const double UdpBytesPerSecond = 2 * 1024 * 1024; // per pairing, per direction
         public const double UdpBurstBytes = 256 * 1024;
         public const long RefusalNoteMs = 60_000;       // at most one log line about refusals per address per minute
         public const int Ipv6PrefixBits = 64;           // IPv6 addresses count by their /64; IPv4 by the whole address
+        // A host whose control line just dropped is usually back within a second or two (a Wi-Fi blip, a router
+        // hiccup): a controlling PC asking for it in that gap waits for it instead of being told it is not there.
+        public const long HostGoneGraceMs = 15_000;     // how long after its line dropped a host counts as "coming back"
+        public const int HostReturnWaitMs = 8_000;      // how long a connect waits for such a host to register again
+        public const long RecentIdMs = 60_000;          // a late or repeated dial-back for a pairing that just ended is not a bad request
+        public const int UdpReceiveBuffer = 4 << 20;    // kernel room for bursts of sound from many pairs at once
     }
 
     /// <summary>Counts and rows for the window and the tray tooltip.</summary>
@@ -71,8 +86,10 @@ namespace KovaRelay
     /// There is no list of names: a name belongs to whichever host holds it right now (Kova derives it from the hosted
     /// PC's password, like NVDA Remote's key). A host with a different public key is refused the name only while the
     /// current holder is connected.
-    /// All shared state is guarded by one lock (_gate); nothing slow (network, disk) happens while holding it.
-    /// Every connection runs on async sockets (no thread per connection) inside its own try/catch, so one bad
+    /// Shared state is guarded by one lock (_gate); nothing slow (network, disk) happens while holding it. The two
+    /// tables the UDP path reads (pairings and host UDP keys) are concurrent dictionaries, written under _gate but read
+    /// without it, so sound never waits for the lock.
+    /// Every TCP connection runs on async sockets (no thread per connection) inside its own try/catch, so one bad
     /// connection never affects another.
     /// </summary>
     internal sealed class RelayServer : IDisposable
@@ -82,9 +99,11 @@ namespace KovaRelay
 
         private readonly Dictionary<AddrKey, AddrState> _addrs = new();
         private readonly Dictionary<string, HostLine> _hosts = new(StringComparer.Ordinal);   // connected, by name key
-        private readonly Dictionary<ulong, HostLine> _hostsByUdpKey = new();
+        private readonly ConcurrentDictionary<ulong, HostLine> _hostsByUdpKey = new();
         private readonly Dictionary<ulong, Pending> _pending = new();
-        private readonly Dictionary<ulong, Pairing> _pairings = new();                        // spliced, live
+        private readonly ConcurrentDictionary<ulong, Pairing> _pairings = new();              // spliced, live
+        private readonly Dictionary<ulong, (byte[] Token, long At)> _recentIds = new();       // pairings that ended or were claimed lately
+        private readonly Dictionary<string, long> _gone = new(StringComparer.Ordinal);         // name key -> when its host's line dropped
         private readonly HashSet<Conn> _conns = new();
         private int _total;
         private readonly Dictionary<(string Name, string Client), int> _pcPairs = new();  // live pairs per host and client address
@@ -124,11 +143,15 @@ namespace KovaRelay
                 udp.ExclusiveAddressUse = true;
                 tcp.Bind(new IPEndPoint(any, port));
                 udp.Bind(new IPEndPoint(any, port));
-                tcp.Listen(512);
+                // The system's largest backlog: hundreds of hosts reconnecting at once after the relay restarts must
+                // not be turned away by Windows before the relay even sees them.
+                tcp.Listen();
                 // Without this, Windows reports an ICMP "port unreachable" from some earlier send as an error on the
                 // next receive, which would make one vanished PC disturb everyone's UDP.
                 const int SIO_UDP_CONNRESET = -1744830452;
                 try { udp.IOControl(SIO_UDP_CONNRESET, new byte[4], null); } catch (Exception) { }
+                try { udp.ReceiveBufferSize = Limits.UdpReceiveBuffer; } catch (Exception) { }
+                try { udp.SendBufferSize = Limits.UdpReceiveBuffer; } catch (Exception) { }
             }
             catch (SocketException e)
             {
@@ -157,9 +180,16 @@ namespace KovaRelay
                 _listener = tcp; _udp = udp; _run = run;
                 Port = port; Running = true; Problem = null;
             }
+            // The relay only moves bytes between other people's PCs: a little above normal keeps it ahead of whatever
+            // else runs on the same PC (a build, a backup), which would otherwise show up as lag at both ends.
+            try { using var me = Process.GetCurrentProcess(); if (me.PriorityClass == ProcessPriorityClass.Normal) me.PriorityClass = ProcessPriorityClass.AboveNormal; }
+            catch (Exception) { }
             _log.Write($"Started on port {port}" + (LoopbackOnly ? " (this PC only)." : "."));
+            // Two accepts outstanding at once, so a burst of connections is taken in as fast as Windows hands them over.
             _ = Task.Run(() => AcceptLoop(tcp, run.Token));
-            _ = Task.Run(() => UdpLoop(udp, run.Token));
+            _ = Task.Run(() => AcceptLoop(tcp, run.Token));
+            // UDP on its own thread with blocking calls: no allocation per packet, and never stuck behind busy pool threads.
+            new Thread(() => UdpLoop(udp, run.Token)) { IsBackground = true, Name = "Kova Relay UDP", Priority = ThreadPriority.AboveNormal }.Start();
             return null;
         }
 
@@ -180,6 +210,7 @@ namespace KovaRelay
                 pending = _pending.Values.ToList();
                 foreach (Pending p in pending) RemovePendingLocked(p);
                 foreach (HostLine h in hosts) RemoveHostLocked(h);
+                _gone.Clear();
             }
             if (run is null) return;
             try { run.Cancel(); } catch (Exception) { }
@@ -239,6 +270,23 @@ namespace KovaRelay
             }
         }
 
+        /// <summary>
+        /// No Nagle delay (every keystroke and sound packet goes at once), and TCP keep-alive so a PC that vanished
+        /// without closing (sleep, a dropped router) is noticed by Windows even when nothing is being sent.
+        /// </summary>
+        internal static void Tune(Socket s, int idleSeconds, int intervalSeconds, int probes)
+        {
+            try { s.NoDelay = true; } catch (Exception) { }
+            try
+            {
+                s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, idleSeconds);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, intervalSeconds);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, probes);
+            }
+            catch (Exception) { }   // older Windows: the plain keep-alive above still applies
+        }
+
         private enum Admit { Yes, Blocked, Busy }
 
         private async Task HandleConnection(Socket s, CancellationToken run)
@@ -260,9 +308,10 @@ namespace KovaRelay
                     if (st.BlockedUntil > now) { verdict = Admit.Blocked; NoteRefusalLocked(st, "it is blocked for sending bad requests", now); }
                     else
                     {
-                        st.Refill(now);
-                        int hostRoom = st.HostLines > 0 ? Limits.HostAddressFactor : 1;
-                        if (st.Tokens < 1 && st.HostLines == 0) busyWhy = "it opened connections too quickly";
+                        int hostRoom = st.HostLines == 0 ? 1
+                            : Math.Min(Limits.HostBaseFactor + (st.LivePairsAsHost + Limits.PairsPerExtraFactor - 1) / Limits.PairsPerExtraFactor, Limits.MaxHostRoomFactor);
+                        st.Refill(now, hostRoom);
+                        if (st.Tokens < 1) busyWhy = "it opened connections too quickly";
                         else if (_total >= Limits.MaxConnections) busyWhy = "the relay has as many connections as it takes";
                         else if (st.Active >= Limits.PerAddressConnections * hostRoom) busyWhy = "it has too many connections open";
                         else if (st.Unpaired >= Limits.PerAddressUnpaired * hostRoom) busyWhy = "it has too many connections waiting";
@@ -284,16 +333,15 @@ namespace KovaRelay
                     try
                     {
                         s.Blocking = false;
-                        byte[] hello = NewHello(out _);
-                        byte[] refusal = { Wire.Refused, 0, 1, (byte)Wire.Reason.Busy };
-                        s.Send(hello.Concat(refusal).ToArray(), SocketFlags.None, out _);
+                        s.Send(BusyBytes, SocketFlags.None, out _);
                     }
                     catch (Exception) { }
                     s.Dispose();
                     return;
                 }
 
-                s.NoDelay = true;
+                // Every connection may become a splice or a host line: both want no delay and a dead peer noticed.
+                Tune(s, idleSeconds: 30, intervalSeconds: 5, probes: 6);
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(run);
                 deadline.CancelAfter(Wire.RequestDeadlineMs);
                 byte[] helloBytes = NewHello(out byte[] challenge);
@@ -382,8 +430,9 @@ namespace KovaRelay
             byte[] keyHash = SHA256.HashData(spki);
             string nameKey = Wire.NameKey(name);
             byte[] udpKeyBytes = new byte[Wire.IdBytes];
-            bool taken = false;
+            bool taken = false, cameBack = false, tooMany = false;
             HostLine? old = null, line = null;
+            var moved = new List<Pending>();
             lock (_gate)
             {
                 // Nobody holds the name now: this host takes it. The same key: the host reconnected, and its new line
@@ -392,6 +441,11 @@ namespace KovaRelay
                 if (_hosts.TryGetValue(nameKey, out old) && !CryptographicOperations.FixedTimeEquals(old.KeyHash, keyHash))
                 {
                     taken = true;
+                    old = null;
+                }
+                else if (c.Addr.HostLines >= Limits.MaxHostsPerAddress && (old is null || old.Conn.Addr != c.Addr))
+                {
+                    tooMany = true;
                     old = null;
                 }
                 else
@@ -405,7 +459,31 @@ namespace KovaRelay
                     _hostsByUdpKey[udpKey] = line;
                     c.Addr.HostLines++;
                     MarkPairedLocked(c);
+                    cameBack = _gone.Remove(nameKey);
+                    // Same name, same key: the same host on a new line. Connections still waiting for its dial-back are
+                    // offered again on the new line (they would otherwise fail after their 10 s), and live pairs send
+                    // their sound to it; until its UDP announcement arrives, to where its old line said.
+                    foreach (Pending q in _pending.Values)
+                    {
+                        if (q.Host == line || q.Host.NameKey != nameKey || !CryptographicOperations.FixedTimeEquals(q.Host.KeyHash, keyHash)) continue;
+                        q.Host.Pending--;
+                        q.Host = line;
+                        line.Pending++;
+                        moved.Add(q);
+                    }
+                    foreach (Pairing pr in _pairings.Values)
+                    {
+                        HostLine was = pr.Host;
+                        if (was == line || pr.NameKey != nameKey || !CryptographicOperations.FixedTimeEquals(was.KeyHash, keyHash)) continue;
+                        if (was.Udp is SocketAddress u) pr.HostUdpBefore = u;
+                        pr.Host = line;
+                    }
                 }
+            }
+            if (tooMany)
+            {
+                await Refuse(c, Wire.Reason.Busy, $"it already has {Limits.MaxHostsPerAddress} hosts registered", run, countFailure: false).ConfigureAwait(false);
+                return;
             }
             if (taken || line is null)
             {
@@ -413,32 +491,46 @@ namespace KovaRelay
                 return;
             }
 
-            old?.Close(true);
+            if (old is not null) { old.Replaced = true; _ = TellReplacedAndClose(old); }
             _log.Write(old is not null
                 ? $"A host connected again from {c.Text}. Its previous connection from {old.Conn.Text} was closed."
-                : $"A host connected from {c.Text}.");
+                : cameBack ? $"A host connected again from {c.Text}." : $"A host connected from {c.Text}.");
             try
             {
                 // The line's send lock starts held, so no Incoming can go out before this Ok.
                 using (var t = Timeout(run)) await SendFrame(c.S, Wire.Ok, udpKeyBytes, t.Token).ConfigureAwait(false);
+                // A control line carries little but keep-alives: tighter TCP keep-alive than a splice gets.
+                Tune(c.S, idleSeconds: 15, intervalSeconds: 3, probes: 5);
                 line.SendLock.Release();
+                foreach (Pending q in moved)
+                    if (!await line.Send(Wire.Incoming, IncomingBody(q), run).ConfigureAwait(false)) { line.Close(); break; }
                 await RunHostLine(line, run).ConfigureAwait(false);
             }
             finally
             {
                 bool wasCurrent;
-                List<Pending> dropped;
                 lock (_gate)
                 {
                     wasCurrent = _hosts.TryGetValue(nameKey, out var cur) && cur == line;
-                    if (wasCurrent) RemoveHostLocked(line);
-                    dropped = _pending.Values.Where(p => p.Host == line).ToList();
-                    foreach (Pending p in dropped) RemovePendingLocked(p);
+                    if (wasCurrent)
+                    {
+                        RemoveHostLocked(line);
+                        // Remembered briefly, so a connect in the gap before it registers again waits for it. Waiting
+                        // pairings stay too: they are offered again if it comes back, or time out as before.
+                        if (Running) _gone[nameKey] = Environment.TickCount64;
+                    }
                 }
-                foreach (Pending p in dropped) p.Done.TrySetResult(null);
                 line.Close();
                 if (!line.Replaced) _log.Write($"The host at {c.Text} disconnected.");
             }
+        }
+
+        /// <summary>Tells a replaced control line why it is being closed (a 4.7 host then waits before trying again), then closes it.</summary>
+        private static async Task TellReplacedAndClose(HostLine old)
+        {
+            try { await old.Send(Wire.Refused, new[] { (byte)Wire.Reason.Replaced }, CancellationToken.None, 2000).ConfigureAwait(false); }
+            catch (Exception) { }
+            old.Close(true);
         }
 
         private static bool IsP256(ECDsa ec)
@@ -449,41 +541,68 @@ namespace KovaRelay
             return oid == "1.2.840.10045.3.1.7" || friendly is "nistP256" or "ECDSA_P256" or "secp256r1";
         }
 
-        /// <summary>The host's control line: KeepAlive out every KeepAliveMs, anything in within DeadAfterMs, or it is dropped.</summary>
+        /// <summary>
+        /// The host's control line: anything the host sends counts as a sign of life; a 4.7 host's probe is answered at
+        /// once. The watch loop sends keep-alives and drops a line that went silent (ProbedDeadAfterMs for a host that
+        /// probes, SilentDeadAfterMs for a 4.6 one).
+        /// </summary>
         private async Task RunHostLine(HostLine line, CancellationToken run)
         {
             using var stop = CancellationTokenSource.CreateLinkedTokenSource(run, line.Closed.Token);
-            Task keepAlive = KeepAliveLoop(line, stop.Token);
+            Task watch = WatchHostLine(line, stop.Token);
             try
             {
                 byte[] head = new byte[3];
                 byte[] body = new byte[Wire.MaxBody];
                 while (!stop.IsCancellationRequested)
                 {
-                    using var dead = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
-                    dead.CancelAfter(Wire.DeadAfterMs);
-                    if (!await ReceiveExactly(line.Conn.S, head, dead.Token).ConfigureAwait(false)) return;
+                    if (!await ReceiveExactly(line.Conn.S, head, stop.Token).ConfigureAwait(false)) return;
                     int len = BinaryPrimitives.ReadUInt16BigEndian(head.AsSpan(1));
                     if (len > Wire.MaxBody) { Fail(line.Conn, "sent a malformed frame on its host line"); return; }
-                    if (len > 0 && !await ReceiveExactly(line.Conn.S, body.AsMemory(0, len), dead.Token).ConfigureAwait(false)) return;
-                    // KeepAlive, or a frame type this relay does not know (a newer Kova): either way the line is alive.
+                    if (len > 0 && !await ReceiveExactly(line.Conn.S, body.AsMemory(0, len), stop.Token).ConfigureAwait(false)) return;
+                    Volatile.Write(ref line.LastHeard, Environment.TickCount64);
+                    if (head[0] == Wire.KeepAlive && len >= 1 && body[0] == Wire.ProbeAsk)
+                    {
+                        line.Probes = true;
+                        _ = AnswerProbe(line, run);
+                    }
+                    // Otherwise a KeepAlive, or a frame type this relay does not know (a newer Kova): either way the line is alive.
                 }
             }
             catch (OperationCanceledException) { }
             finally
             {
                 stop.Cancel();
-                try { await keepAlive.ConfigureAwait(false); } catch (Exception) { }
+                try { await watch.ConfigureAwait(false); } catch (Exception) { }
             }
         }
 
-        private async Task KeepAliveLoop(HostLine line, CancellationToken ct)
+        private static readonly byte[] ProbeAnswerBody = { Wire.ProbeAnswer };
+
+        private static async Task AnswerProbe(HostLine line, CancellationToken run)
+        {
+            try { if (!await line.Send(Wire.KeepAlive, ProbeAnswerBody, run).ConfigureAwait(false)) line.Close(); }
+            catch (Exception) { line.Close(); }
+        }
+
+        private async Task WatchHostLine(HostLine line, CancellationToken ct)
         {
             try
             {
+                long lastSent = Environment.TickCount64;
                 while (!ct.IsCancellationRequested)
                 {
-                    await Task.Delay(Wire.KeepAliveMs, ct).ConfigureAwait(false);
+                    await Task.Delay(2500, ct).ConfigureAwait(false);
+                    long now = Environment.TickCount64;
+                    long quiet = now - Volatile.Read(ref line.LastHeard);
+                    if (quiet > (line.Probes ? Wire.ProbedDeadAfterMs : Wire.SilentDeadAfterMs))
+                    {
+                        _log.Write($"The host at {line.Conn.Text} stopped answering for {quiet / 1000} seconds; its connection was closed.");
+                        line.Close();
+                        return;
+                    }
+                    if (now - lastSent < Wire.RelayKeepAliveMs) continue;
+                    lastSent = now;
                     if (!await line.Send(Wire.KeepAlive, Array.Empty<byte>(), ct).ConfigureAwait(false)) { line.Close(); return; }
                 }
             }
@@ -493,6 +612,17 @@ namespace KovaRelay
 
         // ---------------------------------------------------------------- Connect
 
+        private static byte[] IncomingBody(Pending p)
+        {
+            byte[] text = Encoding.ASCII.GetBytes(p.Client.Text);
+            byte[] incoming = new byte[Wire.IdBytes + Wire.TokenBytes + 1 + text.Length];
+            p.IdBytes.CopyTo(incoming, 0);
+            p.Token.CopyTo(incoming, Wire.IdBytes);
+            incoming[Wire.IdBytes + Wire.TokenBytes] = (byte)text.Length;
+            text.CopyTo(incoming, Wire.IdBytes + Wire.TokenBytes + 1);
+            return incoming;
+        }
+
         /// <returns>true if the connection's life was handed to the splice (it releases it).</returns>
         private async Task<bool> HandleConnect(Conn c, byte[] body, CancellationToken run)
         {
@@ -501,35 +631,49 @@ namespace KovaRelay
             { await Refuse(c, Wire.Reason.BadRequest, "it sent a badly formed connect request", run, true).ConfigureAwait(false); return false; }
             string nameKey = Wire.NameKey(name);
             Pending? p = null;
+            HostLine? target = null;
             Wire.Reason? no = null;
             string why = "";
-            lock (_gate)
+            long waitUntil = 0;
+            while (true)
             {
-                if (!MayAskLocked(c.Addr, nameKey)) { no = Wire.Reason.Busy; why = "it asked for too many different hosts that were not connected this hour"; }
-                else if (!_hosts.TryGetValue(nameKey, out HostLine? host)) { no = Wire.Reason.NoSuchHost; why = "it asked for a host that is not connected (no host is using that password)"; MissLocked(c.Addr, nameKey); }
-                else if (host.Pending >= Limits.PendingPerHost) { no = Wire.Reason.Busy; why = $"it asked for the host at {host.Conn.Text}, which has too many connections waiting"; }
-                else if (c.Addr.PendingAsClient >= Limits.PendingPerClient) { no = Wire.Reason.Busy; why = "it has too many connection requests waiting"; }
-                else
+                bool wait = false;
+                lock (_gate)
                 {
-                    byte[] idBytes = new byte[Wire.IdBytes];
-                    ulong id;
-                    do { RandomNumberGenerator.Fill(idBytes); id = BinaryPrimitives.ReadUInt64BigEndian(idBytes); }
-                    while (id == 0 || _pending.ContainsKey(id) || _pairings.ContainsKey(id));
-                    p = new Pending(id, idBytes, RandomNumberGenerator.GetBytes(Wire.TokenBytes), host, c, Environment.TickCount64);
-                    _pending[id] = p;
-                    host.Pending++;
-                    c.Addr.PendingAsClient++;
+                    long now = Environment.TickCount64;
+                    if (!MayAskLocked(c.Addr, nameKey)) { no = Wire.Reason.Busy; why = "it asked for too many different hosts that were not connected this hour"; }
+                    else if (!_hosts.TryGetValue(nameKey, out HostLine? host))
+                    {
+                        // Its host dropped its line moments ago and is most likely registering again right now.
+                        if (_gone.TryGetValue(nameKey, out long goneAt) && now - goneAt < Limits.HostGoneGraceMs && (waitUntil == 0 || now < waitUntil))
+                        {
+                            if (waitUntil == 0) waitUntil = now + Limits.HostReturnWaitMs;
+                            wait = true;
+                        }
+                        else { no = Wire.Reason.NoSuchHost; why = "it asked for a host that is not connected (no host is using that password)"; MissLocked(c.Addr, nameKey); }
+                    }
+                    else if (host.Pending >= Limits.PendingPerHost) { no = Wire.Reason.Busy; why = $"it asked for the host at {host.Conn.Text}, which has too many connections waiting"; }
+                    else if (c.Addr.PendingAsClient >= Limits.PendingPerClient) { no = Wire.Reason.Busy; why = "it has too many connection requests waiting"; }
+                    else
+                    {
+                        byte[] idBytes = new byte[Wire.IdBytes];
+                        ulong id;
+                        do { RandomNumberGenerator.Fill(idBytes); id = BinaryPrimitives.ReadUInt64BigEndian(idBytes); }
+                        while (id == 0 || _pending.ContainsKey(id) || _pairings.ContainsKey(id) || _recentIds.ContainsKey(id) || _hostsByUdpKey.ContainsKey(id));
+                        p = new Pending(id, idBytes, RandomNumberGenerator.GetBytes(Wire.TokenBytes), host, c, now);
+                        _pending[id] = p;
+                        host.Pending++;
+                        c.Addr.PendingAsClient++;
+                        target = host;
+                    }
                 }
+                if (!wait) break;
+                await Task.Delay(100, run).ConfigureAwait(false);
             }
-            if (p is null) { await Refuse(c, no!.Value, why, run, countFailure: false).ConfigureAwait(false); return false; }
+            if (p is null || target is null) { await Refuse(c, no!.Value, why, run, countFailure: false).ConfigureAwait(false); return false; }
 
-            byte[] text = Encoding.ASCII.GetBytes(c.Text);
-            byte[] incoming = new byte[Wire.IdBytes + Wire.TokenBytes + 1 + text.Length];
-            p.IdBytes.CopyTo(incoming, 0);
-            p.Token.CopyTo(incoming, Wire.IdBytes);
-            incoming[Wire.IdBytes + Wire.TokenBytes] = (byte)text.Length;
-            text.CopyTo(incoming, Wire.IdBytes + Wire.TokenBytes + 1);
-            if (!await p.Host.Send(Wire.Incoming, incoming, run).ConfigureAwait(false)) p.Host.Close();
+            // If this send fails, the line is closed; should the host register again in time, the offer goes out again on its new line.
+            if (!await target.Send(Wire.Incoming, IncomingBody(p), run).ConfigureAwait(false)) target.Close();
 
             Conn? hostSide = null;
             Task<Conn?> done = p.Done.Task;
@@ -609,17 +753,23 @@ namespace KovaRelay
             if (body.Length != Wire.IdBytes + Wire.TokenBytes)
             { await Refuse(c, Wire.Reason.BadRequest, "it sent a badly formed accept", run, true).ConfigureAwait(false); return false; }
             ulong id = BinaryPrimitives.ReadUInt64BigEndian(body);
+            byte[] token = body.AsSpan(Wire.IdBytes, Wire.TokenBytes).ToArray();
             Pending? claimed = null;
+            bool late = false;
             lock (_gate)
             {
                 if (_pending.TryGetValue(id, out Pending? p)
-                    && CryptographicOperations.FixedTimeEquals(p.Token, body.AsSpan(Wire.IdBytes, Wire.TokenBytes))
+                    && CryptographicOperations.FixedTimeEquals(p.Token, token)
                     && Environment.TickCount64 - p.Created <= Wire.PairWaitMs
                     && RemovePendingLocked(p))
                     claimed = p;
+                // A dial-back with the right token for a pairing that was just claimed or timed out: the host was slow,
+                // or was offered it twice (once on a line that dropped, again on its new one). Not a bad request.
+                else if (_recentIds.TryGetValue(id, out var r) && CryptographicOperations.FixedTimeEquals(r.Token, token))
+                    late = true;
             }
             if (claimed is null)
-            { await Refuse(c, Wire.Reason.BadRequest, "it sent an accept that matched no waiting connection", run, true).ConfigureAwait(false); return false; }
+            { await Refuse(c, Wire.Reason.BadRequest, "it sent an accept that matched no waiting connection", run, countFailure: !late).ConfigureAwait(false); return false; }
             if (!claimed.Done.TrySetResult(c)) return false;
             return true;
         }
@@ -628,12 +778,14 @@ namespace KovaRelay
 
         private async Task Splice(Conn client, Conn host, Pending p, CancellationToken run)
         {
-            var pair = new Pairing(p.Id, p.Host.NameKey, p.Host.Conn.Text, client.Text);
+            Pairing pair;
             bool first;
             lock (_gate)
             {
+                pair = new Pairing(p.Id, p.Host, p.Host.Conn.Text, client.Text);
                 MarkPairedLocked(client);
                 MarkPairedLocked(host);
+                host.Addr.LivePairsAsHost++;
                 var k = (pair.NameKey, pair.ClientText);
                 _pcPairs.TryGetValue(k, out int had);
                 _pcPairs[k] = had + 1;
@@ -666,7 +818,8 @@ namespace KovaRelay
                 bool last;
                 lock (_gate)
                 {
-                    _pairings.Remove(pair.Id);
+                    _pairings.TryRemove(pair.Id, out _);
+                    host.Addr.LivePairsAsHost--;
                     var k = (pair.NameKey, pair.ClientText);
                     int left = _pcPairs.TryGetValue(k, out int had) ? had - 1 : 0;
                     if (left <= 0) _pcPairs.Remove(k); else _pcPairs[k] = left;
@@ -678,88 +831,122 @@ namespace KovaRelay
             }
         }
 
-        /// <summary>Copies one direction with one fixed 32 KB buffer: read, write all of it, repeat. No queue anywhere.</summary>
+        /// <summary>
+        /// Copies one direction. While nothing arrives it waits with a zero-byte read, holding no buffer; when bytes
+        /// arrive it borrows one, copies everything that is there, and gives it back as soon as the line goes quiet. So
+        /// thousands of idle lanes cost no memory, and a busy one copies 64 KB at a time with no allocation. No queue
+        /// anywhere: a slow receiver slows its sender (TCP's own flow control), it never piles up here.
+        /// </summary>
         private static async Task Pump(Socket from, Socket to, Pairing pair, CancellationToken ct)
         {
-            byte[] buf = ArrayPool<byte>.Shared.Rent(Limits.SpliceBuffer);
+            byte[]? buf = null;
             try
             {
-                Memory<byte> mem = buf.AsMemory(0, Limits.SpliceBuffer);
                 while (true)
                 {
-                    int n = await from.ReceiveAsync(mem, SocketFlags.None, ct).ConfigureAwait(false);
+                    if (buf is null)
+                    {
+                        await from.ReceiveAsync(Memory<byte>.Empty, SocketFlags.None, ct).ConfigureAwait(false);
+                        buf = ArrayPool<byte>.Shared.Rent(Limits.SpliceBuffer);
+                    }
+                    int n = await from.ReceiveAsync(buf.AsMemory(0, Limits.SpliceBuffer), SocketFlags.None, ct).ConfigureAwait(false);
                     if (n <= 0) return;
-                    await SendAll(to, mem[..n], ct).ConfigureAwait(false);
+                    await SendAll(to, buf.AsMemory(0, n), ct).ConfigureAwait(false);
                     Volatile.Write(ref pair.LastActivity, Environment.TickCount64);
+                    if (from.Available == 0)
+                    {
+                        ArrayPool<byte>.Shared.Return(buf);
+                        buf = null;
+                    }
                 }
             }
             catch (Exception) { }   // either side closing or failing ends the pair; the caller closes both
-            finally { ArrayPool<byte>.Shared.Return(buf); }
+            finally { if (buf is not null) ArrayPool<byte>.Shared.Return(buf); }
         }
 
         // ---------------------------------------------------------------- UDP
 
-        private async Task UdpLoop(Socket udp, CancellationToken ct)
+        /// <summary>
+        /// One thread, blocking calls, one buffer, no locks and no allocation per packet: each packet is read, its
+        /// pairing looked up in a concurrent table, and sent straight on. Addresses are compared and kept as Windows'
+        /// own SocketAddress bytes, so nothing is converted per packet either.
+        /// </summary>
+        private void UdpLoop(Socket udp, CancellationToken ct)
         {
-            byte[] buf = new byte[65536];
-            EndPoint any = new IPEndPoint(udp.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+            byte[] buf = GC.AllocateUninitializedArray<byte>(65536, pinned: true);
+            var from = new SocketAddress(udp.AddressFamily);
+            int fullSize = from.Size;
             while (!ct.IsCancellationRequested)
             {
-                SocketReceiveFromResult r;
-                try { r = await udp.ReceiveFromAsync(buf, SocketFlags.None, any, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { break; }
-                catch (ObjectDisposedException) { break; }
-                catch (SocketException) { continue; }
-                catch (Exception e) { Unexpected("receiving UDP", e); continue; }
+                int n;
                 try
                 {
-                    int n = r.ReceivedBytes;
-                    if (n < Wire.UdpHead || n > Wire.UdpHead + Wire.MaxUdpPayload || buf[0] != Wire.Udp0 || buf[1] != Wire.Udp1) continue;
-                    if (r.RemoteEndPoint is not IPEndPoint src) continue;
-                    ulong id = BinaryPrimitives.ReadUInt64BigEndian(buf.AsSpan(2));
-                    IPEndPoint? dest = null;
-                    lock (_gate)
-                    {
-                        if (n == Wire.UdpHead && _hostsByUdpKey.TryGetValue(id, out HostLine? h)) { h.Udp = src; continue; }
-                        if (!_pairings.TryGetValue(id, out Pairing? p)) continue;
-                        // The pair's host by name now (the same key; it may have reconnected its control line).
-                        _hosts.TryGetValue(p.NameKey, out HostLine? host);
-                        long now = Environment.TickCount64;
-                        if (host?.Udp is not null && host.Udp.Equals(src))
-                        {
-                            if (p.ClientUdp is not null && p.ToClient.Take(n, now)) dest = p.ClientUdp;
-                        }
-                        else
-                        {
-                            p.ClientUdp = src;   // the latest address the controlling PC sent this id from
-                            if (host?.Udp is not null && p.ToHost.Take(n, now)) dest = host.Udp;
-                        }
-                    }
-                    if (dest is not null)
-                        await udp.SendToAsync(buf.AsMemory(0, r.ReceivedBytes), SocketFlags.None, dest, ct).ConfigureAwait(false);
+                    from.Size = fullSize;
+                    n = udp.ReceiveFrom(buf, SocketFlags.None, from);
                 }
-                catch (OperationCanceledException) { break; }
-                catch (ObjectDisposedException) { break; }
+                catch (ObjectDisposedException) { return; }
+                catch (SocketException) { if (ct.IsCancellationRequested) return; continue; }
+                catch (Exception e) { if (ct.IsCancellationRequested) return; Unexpected("receiving UDP", e); continue; }
+                try
+                {
+                    if (n < Wire.UdpHead || n > Wire.UdpHead + Wire.MaxUdpPayload || buf[0] != Wire.Udp0 || buf[1] != Wire.Udp1) continue;
+                    ulong id = BinaryPrimitives.ReadUInt64BigEndian(buf.AsSpan(2));
+                    if (n == Wire.UdpHead && _hostsByUdpKey.TryGetValue(id, out HostLine? h))
+                    {
+                        // The host saying where its UDP is. Copied only when it changed.
+                        if (h.Udp is not SocketAddress was || !was.Equals(from)) h.Udp = Copy(from);
+                        continue;
+                    }
+                    if (!_pairings.TryGetValue(id, out Pairing? p)) continue;
+                    // The pair's host: the line it was paired on, or the newer line the same host registered since.
+                    SocketAddress? hostUdp = p.Host.Udp ?? p.HostUdpBefore;
+                    SocketAddress? dest = null;
+                    long now = Environment.TickCount64;
+                    if (hostUdp is not null && hostUdp.Equals(from))
+                    {
+                        if (p.ClientUdp is SocketAddress cu && p.ToClient.Take(n, now)) dest = cu;
+                    }
+                    else
+                    {
+                        // The latest address the controlling PC sent this id from.
+                        if (p.ClientUdp is not SocketAddress cu || !cu.Equals(from)) p.ClientUdp = Copy(from);
+                        if (hostUdp is not null && p.ToHost.Take(n, now)) dest = hostUdp;
+                    }
+                    if (dest is not null) udp.SendTo(buf.AsSpan(0, n), SocketFlags.None, dest);
+                }
+                catch (ObjectDisposedException) { return; }
                 catch (SocketException) { }
                 catch (Exception e) { Unexpected("relaying UDP", e); }
             }
+        }
+
+        private static SocketAddress Copy(SocketAddress a)
+        {
+            var c = new SocketAddress(a.Family, a.Size);
+            a.Buffer.Span[..a.Size].CopyTo(c.Buffer.Span);
+            return c;
         }
 
         // ---------------------------------------------------------------- housekeeping
 
         private async Task HousekeepingLoop()
         {
+            int tick = 0;
             while (!_disposed)
             {
                 try { await Task.Delay(1000).ConfigureAwait(false); } catch (Exception) { }
+                // Every 5 seconds is plenty (idle pairs are closed after 15 minutes, notes once a minute), and it keeps
+                // this walk over tens of thousands of entries out of the lock most of the time.
+                if (++tick % 5 != 0) continue;
                 try
                 {
                     var notes = new List<string>();
-                    List<Pairing> idle;
+                    var idle = new List<Pairing>();
+                    long now = Environment.TickCount64;
+                    foreach (Pairing p in _pairings.Values)
+                        if (now - Volatile.Read(ref p.LastActivity) > Limits.SpliceIdleMs) idle.Add(p);
                     lock (_gate)
                     {
-                        long now = Environment.TickCount64;
-                        idle = _pairings.Values.Where(p => now - Volatile.Read(ref p.LastActivity) > Limits.SpliceIdleMs).ToList();
                         List<AddrKey>? forget = null;
                         foreach (var kv in _addrs)
                         {
@@ -777,6 +964,12 @@ namespace KovaRelay
                                 (forget ??= new()).Add(kv.Key);
                         }
                         if (forget is not null) foreach (AddrKey k in forget) _addrs.Remove(k);
+                        List<ulong>? oldIds = null;
+                        foreach (var kv in _recentIds) if (now - kv.Value.At > Limits.RecentIdMs) (oldIds ??= new()).Add(kv.Key);
+                        if (oldIds is not null) foreach (ulong id in oldIds) _recentIds.Remove(id);
+                        List<string>? back = null;
+                        foreach (var kv in _gone) if (now - kv.Value > Limits.HostGoneGraceMs) (back ??= new()).Add(kv.Key);
+                        if (back is not null) foreach (string k in back) _gone.Remove(k);
                     }
                     foreach (Pairing p in idle)
                     {
@@ -833,13 +1026,14 @@ namespace KovaRelay
             if (!_pending.Remove(p.Id)) return false;
             p.Host.Pending--;
             p.Client.Addr.PendingAsClient--;
+            _recentIds[p.Id] = (p.Token, Environment.TickCount64);
             return true;
         }
 
         private void RemoveHostLocked(HostLine h)
         {
             if (_hosts.TryGetValue(h.NameKey, out var cur) && cur == h) { _hosts.Remove(h.NameKey); h.Conn.Addr.HostLines--; }
-            if (_hostsByUdpKey.TryGetValue(h.UdpKey, out var u) && u == h) _hostsByUdpKey.Remove(h.UdpKey);
+            if (_hostsByUdpKey.TryGetValue(h.UdpKey, out var u) && u == h) _hostsByUdpKey.TryRemove(h.UdpKey, out _);
         }
 
         private void Release(Conn c)
@@ -892,6 +1086,20 @@ namespace KovaRelay
 
         // ---------------------------------------------------------------- helpers
 
+        /// <summary>A hello and a Busy refusal in one send, for connections turned away before anything is read.</summary>
+        private static readonly byte[] BusyBytes = MakeBusy();
+
+        private static byte[] MakeBusy()
+        {
+            byte[] b = new byte[Wire.ServerHelloBytes + 4];
+            Wire.Magic.CopyTo(b, 0);
+            RandomNumberGenerator.Fill(b.AsSpan(4, Wire.ChallengeBytes));   // never used: nothing is read after it
+            b[Wire.ServerHelloBytes] = Wire.Refused;
+            b[Wire.ServerHelloBytes + 2] = 1;
+            b[Wire.ServerHelloBytes + 3] = (byte)Wire.Reason.Busy;
+            return b;
+        }
+
         private static byte[] NewHello(out byte[] challenge)
         {
             challenge = RandomNumberGenerator.GetBytes(Wire.ChallengeBytes);
@@ -901,10 +1109,10 @@ namespace KovaRelay
             return hello;
         }
 
-        private static CancellationTokenSource Timeout(CancellationToken run)
+        private static CancellationTokenSource Timeout(CancellationToken run, int ms = Limits.SendTimeoutMs)
         {
             var t = CancellationTokenSource.CreateLinkedTokenSource(run);
-            t.CancelAfter(Limits.SendTimeoutMs);
+            t.CancelAfter(ms);
             return t;
         }
 
@@ -986,6 +1194,7 @@ namespace KovaRelay
             // controlling PC opens (about 20 each), so its address gets far more room: each dial-back still needs its
             // one-time token, and a wrong one counts as a failure as always.
             public int HostLines;
+            public int LivePairsAsHost;        // live pairs whose host side dialled back from this address
             public HashSet<string>? MissNames; // the different absent hosts asked for in this window (Limits.MissesPerHour)
             public long MissSince;
             public double Tokens = Limits.BucketSize;
@@ -999,9 +1208,10 @@ namespace KovaRelay
 
             public AddrState(string text, long now) { Text = text; LastUsed = now; TokensAt = now; FailSince = now; }
 
-            public void Refill(long now)
+            /// <summary>factor: the address's room (1 for most; more for an address with hosts), which scales both the burst and the rate.</summary>
+            public void Refill(long now, int factor)
             {
-                Tokens = Math.Min(Limits.BucketSize, Tokens + (now - TokensAt) * Limits.BucketPerSecond / 1000.0);
+                Tokens = Math.Min(Limits.BucketSize * factor, Tokens + (now - TokensAt) * Limits.BucketPerSecond * factor / 1000.0);
                 TokensAt = now;
             }
         }
@@ -1032,18 +1242,20 @@ namespace KovaRelay
             public readonly ulong UdpKey;
             public readonly SemaphoreSlim SendLock = new(0, 1);   // starts held: the Ok goes first
             public readonly CancellationTokenSource Closed = new();
-            public IPEndPoint? Udp;      // where the host's UDP is, from its announcements (guarded by _gate)
-            public int Pending;          // guarded by _gate
+            public volatile SocketAddress? Udp;   // where the host's UDP is, from its announcements (read by the UDP thread without a lock)
+            public int Pending;                   // guarded by _gate
+            public long LastHeard = Environment.TickCount64;
+            public volatile bool Probes;          // a 4.7 host: it asks "are you there?", so silence is judged sooner
             public volatile bool Replaced;
             private int _closed;
 
             public HostLine(Conn conn, string nameKey, byte[] keyHash, ulong udpKey) { Conn = conn; NameKey = nameKey; KeyHash = keyHash; UdpKey = udpKey; }
 
-            public async Task<bool> Send(byte type, byte[] body, CancellationToken run)
+            public async Task<bool> Send(byte type, byte[] body, CancellationToken run, int timeoutMs = Limits.SendTimeoutMs)
             {
                 try
                 {
-                    using var t = Timeout(run);
+                    using var t = Timeout(run, timeoutMs);
                     await SendLock.WaitAsync(t.Token).ConfigureAwait(false);
                     try { await SendFrame(Conn.S, type, body, t.Token).ConfigureAwait(false); }
                     finally { SendLock.Release(); }
@@ -1065,7 +1277,7 @@ namespace KovaRelay
         {
             public readonly ulong Id;
             public readonly byte[] IdBytes, Token;
-            public readonly HostLine Host;
+            public HostLine Host;                // guarded by _gate: moves to the host's newer line if it registers again
             public readonly Conn Client;
             public readonly long Created;
             public readonly TaskCompletionSource<Conn?> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1078,15 +1290,17 @@ namespace KovaRelay
         {
             public readonly ulong Id;
             public readonly string NameKey, HostText, ClientText;
+            public volatile HostLine Host;               // the host's current line (written under _gate, read by the UDP thread)
+            public volatile SocketAddress? HostUdpBefore; // where its previous line said its UDP was, until the new one says
             public long LastActivity = Environment.TickCount64;
             public CancellationTokenSource? Cts;
-            public IPEndPoint? ClientUdp;                // guarded by _gate
+            public volatile SocketAddress? ClientUdp;    // written and read only by the UDP thread
             public readonly Bucket ToHost = new(), ToClient = new();
 
-            public Pairing(ulong id, string nameKey, string hostText, string clientText) { Id = id; NameKey = nameKey; HostText = hostText; ClientText = clientText; }
+            public Pairing(ulong id, HostLine host, string hostText, string clientText) { Id = id; Host = host; NameKey = host.NameKey; HostText = hostText; ClientText = clientText; }
         }
 
-        /// <summary>UDP bytes allowed per direction of a pair: about 2 MB a second, beyond that packets are dropped.</summary>
+        /// <summary>UDP bytes allowed per direction of a pair: about 2 MB a second, beyond that packets are dropped. Only the UDP thread uses it.</summary>
         private sealed class Bucket
         {
             private double _tokens = Limits.UdpBurstBytes;

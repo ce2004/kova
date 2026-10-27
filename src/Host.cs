@@ -165,8 +165,8 @@ namespace TailRemote
             // The host's NVDA as text (NvdaWant): what it asked for, and its own queue, sent in order by one
             // pool thread at a time, so a PC that stops reading holds up nobody else and lines never swap places.
             public volatile byte NvdaWant;
-            public readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> NvdaOut = new();
-            public int NvdaPumping;
+            public readonly List<byte[]> NvdaOut = new(); // under its own lock
+            public bool NvdaPumping; // under NvdaOut's lock
             // Its microphone: the newest packet number seen (an older one is a replay or hopelessly late), and
             // whether it was told another PC's microphone is already on.
             public uint MicHigh;
@@ -338,15 +338,57 @@ namespace TailRemote
                 h.Event += NvdaEventNow;
                 h.ConnectedChanged += _ => TellNvdaAvailable(null);
                 _helper = h;
+                // The window watches the screen itself. The service (session 0) cannot see the screen: its agent at the
+                // screen says when a secure screen shows (Agent wires that to SetSecureScreen).
+                if (NvdaHelper.MySession() != 0)
+                    new Thread(WatchSecureScreen) { IsBackground = true, Name = "Kova secure screen watch" }.Start();
+            }
+        }
+
+        // ---- Secure screens: sign-in, the lock screen's password box, UAC prompts ----
+        // There Windows runs a separate copy of NVDA that never loads add-ons, so no text comes from the Kova Helper,
+        // and a controlling PC in text-only mode (the host's sound paused) heard nothing at all. While one shows, the
+        // controllers are told the add-on cannot speak (NvdaSecureScreen), so their sound comes back on by itself until
+        // the ordinary screen returns.
+
+        private volatile bool _secureScreen;
+
+        /// <summary>Tests only: stands in for whether a secure screen shows (null: as watched).</summary>
+        internal bool? TestSecureScreen;
+
+        /// <summary>Whether this PC shows a secure screen now (tests that stand in for the add-on never see the real screen).</summary>
+        public bool SecureScreen => TestSecureScreen ?? (TestHelperConnected == null && _secureScreen);
+
+        /// <summary>A secure screen came or went (the window's watch, or the service's agent at the screen).</summary>
+        public void SetSecureScreen(bool on)
+        {
+            if (_secureScreen == on) return;
+            _secureScreen = on;
+            DiagLog.Write("host: " + (on ? "a secure screen shows (sign-in, lock or UAC): NVDA comes through the sound" : "the ordinary screen is back"));
+            TellNvdaAvailable(null);
+        }
+
+        private void WatchSecureScreen()
+        {
+            var settle = new NativeService.SecureScreenSettle(); // three readings alike, 250 ms apart, before anything changes
+            while (!_stop)
+            {
+                try { if (settle.Next(NativeService.InputDesktopIsSecure()) is bool on) SetSecureScreen(on); } catch { }
+                Thread.Sleep(250);
             }
         }
 
         /// <summary>Tells every controller that wants NVDA (or just this one) whether the add-on is there to send it.</summary>
         private void TellNvdaAvailable(Session? only)
         {
-            byte[] m = { Protocol.NvdaAvailable, (byte)(NvdaHelperConnected ? 1 : 0) };
+            byte there = (byte)(NvdaHelperConnected ? 1 : 0);
+            // A controller older than 4.7 takes NvdaSecureScreen as "no add-on" and would say so at every lock or UAC
+            // prompt: it gets what it always got.
+            byte[] plain = { Protocol.NvdaAvailable, there }, secure = { Protocol.NvdaAvailable, Protocol.NvdaSecureScreen };
+            bool onSecure = SecureScreen;
             foreach (var s in only != null ? new[] { only } : AllSessions())
-                if (s.Role == Protocol.RoleControl && s.NvdaWant != 0) Queue(s, m);
+                if (s.Role == Protocol.RoleControl && s.NvdaWant != 0)
+                    Queue(s, onSecure && (s.PeerFeatures & Protocol.FeatureNvdaSecureScreen) != 0 ? secure : plain);
         }
 
         /// <summary>
@@ -357,10 +399,7 @@ namespace TailRemote
         public void NvdaEventNow(NvdaEvent ev)
         {
             NvdaEventSeen?.Invoke(ev);
-            byte[] body = ev.Encode();
-            byte[] m = new byte[1 + body.Length];
-            m[0] = Protocol.NvdaEventMsg;
-            body.CopyTo(m, 1);
+            byte[] m = NvdaEvent.Message(ev);
             byte flag = ev.Kind == NvdaEventKind.Braille ? Protocol.NvdaBrailleFlag : Protocol.NvdaSpeechFlag;
             foreach (var s in AllSessions()) if (s.Role == Protocol.RoleControl && (s.NvdaWant & flag) != 0) Queue(s, m);
         }
@@ -377,23 +416,63 @@ namespace TailRemote
         /// <summary>What this PC's braille display shows now.</summary>
         public void NvdaBrailleNow(string text) => NvdaEventNow(NvdaEvent.Braille(text.Length > NvdaEvent.MaxText ? text[..NvdaEvent.MaxText] : text));
 
-        /// <summary>Into the PC's own NVDA queue, sent by one pool thread at a time; a PC far behind loses its oldest lines.</summary>
+        /// <summary>
+        /// Into the PC's own NVDA queue, sent by one pool thread at a time. Whatever piles up while a message is on its way
+        /// goes next as one batch, merged into as few messages as it can be (NvdaEvent.Merge): a console pouring out lines
+        /// no longer means one network message per line. A PC far behind loses its oldest messages, never a cut-off.
+        /// </summary>
         private static void Queue(Session s, byte[] m)
         {
-            s.NvdaOut.Enqueue(m);
-            while (s.NvdaOut.Count > 256) s.NvdaOut.TryDequeue(out _);
-            if (Interlocked.CompareExchange(ref s.NvdaPumping, 1, 0) != 0) return;
+            lock (s.NvdaOut)
+            {
+                s.NvdaOut.Add(m);
+                if (s.NvdaOut.Count > NvdaQueueMax)
+                {
+                    var merged = NvdaEvent.Merge(s.NvdaOut);
+                    s.NvdaOut.Clear();
+                    s.NvdaOut.AddRange(merged);
+                    // Only words, braille, beeps and sounds ever go, oldest first. Cut-offs never go, and neither does
+                    // the add-on's state (NvdaAvailable: a lost "secure screen" left the controller without sound); only
+                    // a state a newer one replaces. Nothing left to drop: the queue stays a little longer for now.
+                    while (s.NvdaOut.Count > NvdaQueueMax)
+                    {
+                        int old = s.NvdaOut.FindIndex(IsDroppableNvda);
+                        if (old < 0)
+                        {
+                            int lastState = s.NvdaOut.FindLastIndex(x => x.Length == 2 && x[0] == Protocol.NvdaAvailable);
+                            old = s.NvdaOut.FindIndex(x => x.Length == 2 && x[0] == Protocol.NvdaAvailable);
+                            if (old < 0 || old == lastState) break;
+                        }
+                        s.NvdaOut.RemoveAt(old);
+                    }
+                }
+                if (s.NvdaPumping) return;
+                s.NvdaPumping = true;
+            }
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 while (true)
                 {
-                    while (s.NvdaOut.TryDequeue(out var next)) { try { s.Link.Send(s.Stream, next); } catch { s.NvdaOut.Clear(); } }
-                    Volatile.Write(ref s.NvdaPumping, 0);
-                    // Something came in after the queue looked empty: this thread carries on, unless another took over.
-                    if (s.NvdaOut.IsEmpty || Interlocked.CompareExchange(ref s.NvdaPumping, 1, 0) != 0) return;
+                    List<byte[]> batch;
+                    lock (s.NvdaOut)
+                    {
+                        if (s.NvdaOut.Count == 0) { s.NvdaPumping = false; return; }
+                        batch = new List<byte[]>(s.NvdaOut);
+                        s.NvdaOut.Clear();
+                    }
+                    foreach (var next in batch.Count == 1 ? batch : NvdaEvent.Merge(batch))
+                    {
+                        try { s.Link.Send(s.Stream, next); }
+                        catch { lock (s.NvdaOut) s.NvdaOut.Clear(); break; } // the connection is going: nothing more to send
+                    }
                 }
             });
         }
+
+        private const int NvdaQueueMax = 256;
+        /// <summary>Speech, braille, a beep or a sound: what a PC far behind may lose. Never a cut-off or anything that is not an NVDA event.</summary>
+        internal static bool IsDroppableNvda(byte[] m) => m.Length >= 2 && m[0] == Protocol.NvdaEventMsg
+            && m[1] is (byte)NvdaEventKind.Speak or (byte)NvdaEventKind.Braille or (byte)NvdaEventKind.Beep or (byte)NvdaEventKind.Wave;
 
         /// <summary>A small message to one PC, off the caller's thread (the UDP thread must never wait on a connection).</summary>
         private static void Tell(Session s, byte type, string text) => Tell(s, type, System.Text.Encoding.UTF8.GetBytes(text));
@@ -454,8 +533,15 @@ namespace TailRemote
         {
             // Over the file lanes: confirmed on arrival, and sent again if a connection breaks on the way.
             foreach (var files in ControllerChannels())
-                ThreadPool.QueueUserWorkItem(_ => { try { files.SendText(text); } catch { } });
+                Sending(() => files.SendText(text));
         }
+
+        /// <summary>
+        /// A send on a thread of its own: it holds that thread until it has ended, waiting its turn behind the sends
+        /// before it first (4.7), so sends queued up must not tie up the shared pool keys and folder lists run on.
+        /// </summary>
+        private static void Sending(Action send) =>
+            new Thread(() => { try { send(); } catch { } }) { IsBackground = true, Name = "Kova send files" }.Start();
 
         /// <summary>Copied files from here to every controller's clipboard. Never waits.</summary>
         public void SendClipboardFiles(IReadOnlyList<string> paths, System.Security.Principal.WindowsIdentity? asUser = null) => SendToAll(paths, true, asUser);
@@ -470,9 +556,9 @@ namespace TailRemote
             if (all.Length == 0) { asUser?.Dispose(); return; }
             int left = all.Length;
             foreach (var files in all)
-                ThreadPool.QueueUserWorkItem(_ =>
+                Sending(() =>
                 {
-                    try { files.SendFiles(paths, toClipboard, asUser); } catch { }
+                    try { files.SendFiles(paths, toClipboard, asUser); }
                     finally { if (Interlocked.Decrement(ref left) == 0) asUser?.Dispose(); }
                 });
         }
@@ -1740,12 +1826,13 @@ namespace TailRemote
                             {
                                 // A thread of its own, not the pool's (a batch holds it until it has been sent), and a
                                 // few at a time per PC: a flood of them starved every other PC's clipboard and folder
-                                // lists. A newer batch replaces one still going (SendFiles), so a few is plenty.
-                                if (Interlocked.Increment(ref s.Fetches) > 3)
+                                // lists. Since 4.7 a newer Get waits its turn behind the ones still going (SendFiles) instead
+                                // of replacing them, each holding its thread meanwhile: a handful waiting is plenty.
+                                if (Interlocked.Increment(ref s.Fetches) > 8)
                                 {
                                     Interlocked.Decrement(ref s.Fetches);
                                     // Off this thread: Refuse can wait up to 10 s for file lanes, and keys are read here.
-                                    ThreadPool.QueueUserWorkItem(_ => { try { files.Refuse(paths, "The remote PC is still starting the files asked for before. Try again in a moment."); } catch { } });
+                                    ThreadPool.QueueUserWorkItem(_ => { try { files.Refuse(paths, "The remote PC already has 8 lots of files waiting to be sent. Get more once some have arrived."); } catch { } });
                                     break;
                                 }
                                 try

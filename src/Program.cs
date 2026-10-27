@@ -1137,12 +1137,14 @@ namespace TailRemote
                 for (int i = 0; i < 50 && nvdaGot.Count < 2; i++) System.Threading.Thread.Sleep(20);
                 System.Threading.Thread.Sleep(100);
                 string all = string.Join("|", nvdaGot);
-                if (all != "c Desktop list|c Recycle Bin 1 of 4") return Fail("remote NVDA text: " + all);
+                // 4.7: lines that arrive together may come merged into one (the host batches them); order and
+                // who gets them are what matter.
+                if (all != "c Desktop list|c Recycle Bin 1 of 4" && all != "c Desktop list Recycle Bin 1 of 4") return Fail("remote NVDA text: " + all);
                 c.NvdaText = false;
                 System.Threading.Thread.Sleep(200);
                 host.NvdaLines(new[] { "not wanted" });
                 System.Threading.Thread.Sleep(200);
-                if (nvdaGot.Count != 2) return Fail("remote NVDA text came after it was turned off");
+                if (nvdaGot.Count != (all.Contains('|') ? 2 : 1)) return Fail("remote NVDA text came after it was turned off");
             }
 
             // A flood of logins that never finish must not touch a session that is

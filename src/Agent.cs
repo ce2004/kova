@@ -90,6 +90,10 @@ namespace TailRemote
             // session at the screen), so the controlling PC gets that NVDA's speech, braille, beeps and sounds.
             _host.StartNvdaHelper();
             NvdaHelper.UpdateIfNeeded(null, ServiceHost.Log);
+            // On a secure screen (sign-in, lock, UAC) NVDA runs a copy without add-ons: the agent at the screen says when
+            // one shows, and the controllers then get the sound even in text-only mode.
+            agent.SecureScreenChanged = on => _host?.SetSecureScreen(on);
+            _host.SetSecureScreen(agent.SecureScreen);
             // Also reachable through a Kova Relay, when the window set one up and handed it over.
             // 4.6: on the relay under the code made from the password (no names), as the window does.
             if (cfg.RelayHosting && !string.IsNullOrWhiteSpace(cfg.RelayAddress) && password.Length > 0
@@ -197,7 +201,8 @@ namespace TailRemote
             // the PC's screens, as each viewer chooses.
             var screens = new ScreenSource();
             AgentLink.Run((vk, scan, up, ext) => Native.SendKey(vk, scan, up, ext), (kind, a, b) => Native.SendMouse(kind, a, b), clip.Arrived, clip.FilesArrived, reader.Read,
-                new ScreenVideo(screens.Take, screens.Screens, screens.Idle)); // Idle: nothing of the screen is held while nobody watches
+                new ScreenVideo(screens.Take, screens.Screens, screens.Idle), // Idle: nothing of the screen is held while nobody watches
+                NativeService.InputDesktopIsSecure); // the service hears when a secure screen shows (its NVDA has no add-ons)
             return 0;
         }
 

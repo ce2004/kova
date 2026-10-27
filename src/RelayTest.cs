@@ -68,6 +68,23 @@ namespace TailRemote
                 Native.KeySink = null;
                 Check(keys.Count == 20 && keys.All(k => k.Item1 == F24), "20 key presses and releases arrived through the relay (" + keys.Count + ")");
 
+                // 4.7: the host's line to the relay is cut (as a router dropping it would). It registers again at once,
+                // the controlling PC already connected carries on, and a new one gets in straight away.
+                int regsBefore = Volatile.Read(ref RelayHost.Registrations);
+                sw.Restart();
+                int cut = RelayHost.TestDropLines();
+                for (int i = 0; i < 250 && Volatile.Read(ref RelayHost.Registrations) == regsBefore; i++) Thread.Sleep(20);
+                Check(cut > 0 && Volatile.Read(ref RelayHost.Registrations) > regsBefore, "after its relay line was cut, the host registered again (" + sw.ElapsedMilliseconds + " ms)");
+                keys.Clear();
+                Native.KeySink = (vk, scan, up, ext) => { keys.Enqueue((vk, up)); return true; };
+                for (int i = 0; i < 5; i++) { c.SendKey(F24, 0, false, false); c.SendKey(F24, 0, true, false); }
+                for (int i = 0; i < 100 && keys.Count < 10; i++) Thread.Sleep(20);
+                Native.KeySink = null;
+                Check(keys.Count == 10, "the controlling PC already connected kept working across the host's relay line reconnecting (" + keys.Count + " of 10 keys)");
+                sw.Restart();
+                using (var afterCut = Client.Connect(address, relayPort, Password, new Player(Player.NoDevice, _ => { }), _ => { }))
+                    Check(!afterCut.ListenOnly, "a new controlling PC got in right after the line came back (" + sw.ElapsedMilliseconds + " ms)");
+
                 // UDP both ways through the relay: the sound path's hellos reach the host and its pongs come back.
                 long before = c.UdpBytesReceived;
                 Thread.Sleep(3500);

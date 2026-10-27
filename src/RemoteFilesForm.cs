@@ -11,7 +11,9 @@ namespace TailRemote
     /// folders as you like, and only Get brings the checked ones here, all at once, into the
     /// received files folder. Each one then says ", getting", then ", got" (or ", failed"), and
     /// TailRemote says when they have arrived. The other way, Send files here and Send a folder
-    /// here send files from this PC into the remote folder that is open.
+    /// here send files from this PC into the remote folder that is open. Since 4.7 more can be asked for, or sent,
+    /// while earlier ones are still going: they wait their turn on the sending PC (an older remote PC replaces the
+    /// one going instead, which then says stopped).
     /// </summary>
     internal sealed class RemoteFilesForm : Form
     {
@@ -33,22 +35,20 @@ namespace TailRemote
         private bool _loading, _filling;
         // Checked, in any folder (checks stay when you move between folders), by path.
         private readonly Dictionary<string, Entry> _chosen = new(StringComparer.OrdinalIgnoreCase);
-        // What happened to each one asked for: "getting", "got" or "failed", by path.
+        // What happened to each one asked for: "getting", "got", "stopped" or "failed", by path.
         private readonly Dictionary<string, string> _state = new(StringComparer.OrdinalIgnoreCase);
-        // The ones on their way now (one Get at a time: the remote PC replaces a sending with a newer one).
-        private List<Entry>? _pending;
-        // The remote folder files are being sent into now (one at a time: a newer sending replaces it).
-        private string? _sentInto;
-        // Which transfer is this window's: begun after it asked (a higher serial) and named as it asked. Any end
-        // used to count, so the host's own Send files ending marked a Get as "got" while it was still coming.
-        private int _askedAfter, _sentAfter;
-        private string? _sentWhat;
+        // Gets on their way now, oldest first (4.7: a newer one waits its turn on the remote PC).
+        private readonly List<Asking> _pending = new();
+        // Sends into a remote folder on their way now, oldest first.
+        private readonly List<Sending> _sent = new();
         private bool _picking;
-        // Which connection each was asked on, and when: see ForgetStale.
-        private Client? _pendingOn, _sentOn;
-        private long _pendingAt, _sentAt;
 
         private sealed record Entry(bool Folder, string Path, string Name, long Bytes, long Ticks);
+        // Which transfer is which of this window's: begun after it was asked for (a higher serial) and named as it was
+        // asked for. Any end used to count, so the host's own Send files ending marked a Get as "got" while it was
+        // still coming. On: the connection it was asked on, and At when (see ForgetStale).
+        private sealed record Asking(List<Entry> Items, int After, Client On, long At);
+        private sealed record Sending(string Into, string What, int After, Client On, long At);
 
         public RemoteFilesForm(Func<Client?> client, Action<string> say, Action<string> tell)
         {
@@ -56,7 +56,10 @@ namespace TailRemote
             _say = say;
             _tell = tell;
             Text = "Get files from the remote PC";
-            Font = new System.Drawing.Font("Segoe UI", 10f);
+            // Let go of when the window closes: it is opened again and again over months.
+            var font = new System.Drawing.Font("Segoe UI", 10f);
+            Font = font;
+            FormClosed += (_, _) => font.Dispose();
             StartPosition = FormStartPosition.CenterParent;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
@@ -126,9 +129,23 @@ namespace TailRemote
         /// <summary>A transfer coming here ended (MainForm says what arrived): the ones asked for are marked.</summary>
         private void Arrived(FileChannel.Transfer t)
         {
-            if (IsDisposed || _pending == null || t.Outgoing || t.Clipboard || t.Serial <= _askedAfter || !Asked(_pending, t.What)) return;
-            foreach (var e in _pending) _state[e.Path] = t.Failed ? "failed" : "got";
-            _pending = null;
+            if (IsDisposed || t.Outgoing || t.Clipboard) return;
+            var p = _pending.Find(a => t.Serial > a.After && Asked(a.Items, t.What));
+            if (p == null) return;
+            _pending.Remove(p);
+            // The things in it come in the order they were asked for, each by the name it got here ("Photos (2)" when
+            // Photos was already there): matched in that order, so a renamed one (or two of the same name) still finds
+            // its own line. One the remote PC no longer had is simply not among them.
+            int next = 0;
+            foreach (var e in p.Items)
+            {
+                bool stoppedAlone = false;
+                string asked = FileChannel.TopName(e.Path);
+                for (int j = next; j < t.Items.Count; j++)
+                    if (SameName(asked, t.Items[j].Name)) { stoppedAlone = t.Items[j].Stopped; next = j + 1; break; }
+                // One of several stopped on its own (Clipboard, Stop just one transfer) says so; the rest came.
+                _state[e.Path] = stoppedAlone || (t.Failed && t.Cancelled) ? "stopped" : t.Failed ? "failed" : "got";
+            }
             Relabel();
         }
 
@@ -170,7 +187,6 @@ namespace TailRemote
             if (!c.CanSendTo) { _say("The remote PC has an older Kova that cannot take files into a folder. Update it first."); return; }
             if (_picking) { _say("The file picker is already open."); return; }
             ForgetStale();
-            if (_sentInto != null) { _say("Still sending the last ones into " + _sentInto + ". Send more when they have gone."); return; }
             string into = _path;
             string[]? paths;
             _picking = true;
@@ -179,20 +195,20 @@ namespace TailRemote
             finally { _picking = false; }
             if (IsDisposed || paths == null || paths.Length == 0) return;
             string what = paths.Length == 1 ? FileChannel.TopName(paths[0]) : paths.Length + " items"; // as the transfer will be called
-            _sentAfter = FileChannel.Transfer.Latest;
-            _sentWhat = what;
+            int after = FileChannel.Transfer.Latest;
             if (_client() is not Client now || !now.SendFilesTo(paths, into)) { _say("Not connected to the remote PC, so nothing was sent."); return; }
-            _sentInto = into;
-            _sentOn = now;
-            _sentAt = Environment.TickCount64;
+            _sent.Add(new Sending(into, what, after, now, Environment.TickCount64));
             _say("Sending " + what + " into " + into + " on the remote PC. Kova says when it has gone.");
         }
 
         /// <summary>Files sent from here finished going: said, and the folder they went into shows them.</summary>
         private async void Sent(FileChannel.Transfer t)
         {
-            if (IsDisposed || _sentInto is not string into || t.Serial <= _sentAfter || !string.Equals(t.What, _sentWhat, StringComparison.OrdinalIgnoreCase)) return;
-            _sentInto = null;
+            if (IsDisposed) return;
+            var s = _sent.Find(x => t.Serial > x.After && string.Equals(t.What, x.What, StringComparison.OrdinalIgnoreCase));
+            if (s == null) return;
+            _sent.Remove(s);
+            string into = s.Into;
             // News, queued: it ends by itself, often while something else is being said.
             if (t.Result != null) _tell(t.Result);
             if (!t.Failed && string.Equals(_path, into, StringComparison.OrdinalIgnoreCase)) await LoadFolder(_path, Current?.Path);
@@ -285,30 +301,30 @@ namespace TailRemote
         {
             var now = _client();
             long ms = Environment.TickCount64;
-            if (_pending != null && (now != _pendingOn || (FileChannel.Transfer.Latest == _askedAfter && ms - _pendingAt > 60_000)))
+            // Stale: asked on another connection, or over a minute ago with nothing coming or going on this one now (an
+            // ask waiting its turn on the remote PC has the ones ahead of it arriving meanwhile). "No transfer began since"
+            // stopped working once a newer ask's transfer had begun, and older asks then waited for good.
+            bool busy = now?.Files?.HasWork == true;
+            foreach (var p in _pending.Where(p => p.On != now || (!busy && ms - p.At > 60_000)).ToList())
             {
-                foreach (var e in _pending)
+                foreach (var e in p.Items)
                     if (_state.TryGetValue(e.Path, out var st) && st == "getting") _state.Remove(e.Path); // no longer known
-                _pending = null;
+                _pending.Remove(p);
                 Relabel();
             }
-            if (_sentInto != null && (now != _sentOn || (FileChannel.Transfer.Latest == _sentAfter && ms - _sentAt > 60_000)))
-                _sentInto = null;
+            _sent.RemoveAll(s => s.On != now || (!busy && ms - s.At > 60_000));
         }
 
         private void Get()
         {
             ForgetStale();
-            if (_pending != null) { _say("Still getting the last ones. Check more meanwhile, and Get them when those have arrived."); return; }
             var chosen = _chosen.Values.ToList();
             if (chosen.Count == 0) { _say("Nothing is checked. Check files and folders with Space, or Enter on a file, then Get."); return; }
             // Whole drives are too much to mean: a folder on one is fine.
             if (chosen.Any(c => c.Path.TrimEnd('\\').Length <= 2)) { _say("A whole drive is too much: open it and check folders or files in it."); return; }
-            _askedAfter = FileChannel.Transfer.Latest; // only a transfer begun after this can be the answer
+            int after = FileChannel.Transfer.Latest; // only a transfer begun after this can be the answer
             if (_client() is not Client client || !client.Fetch(chosen.Select(c => c.Path))) { _say("Not connected to the remote PC, so nothing was asked for."); return; }
-            _pending = chosen;
-            _pendingOn = client;
-            _pendingAt = Environment.TickCount64;
+            _pending.Add(new Asking(chosen, after, client, Environment.TickCount64));
             foreach (var c in chosen) _state[c.Path] = "getting";
             _chosen.Clear();
             _filling = true;
@@ -327,7 +343,10 @@ namespace TailRemote
         public RemoteInfoForm(Func<Client?> client, string first, Action<string> say)
         {
             Text = "Remote PC info";
-            Font = new System.Drawing.Font("Segoe UI", 10f);
+            // Let go of when the window closes: it is opened again and again over months.
+            var font = new System.Drawing.Font("Segoe UI", 10f);
+            Font = font;
+            FormClosed += (_, _) => font.Dispose();
             StartPosition = FormStartPosition.CenterParent;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;

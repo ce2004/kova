@@ -111,7 +111,8 @@ namespace TailRemote
         // 0x8C and 0x8D were NVDA's Speech Viewer text and braille (4.3): never reuse them.
         public const byte NvdaNote = 0x8E;    // UTF-8 sentence about the host's NVDA text (installing the Kova Helper there, and how it went)
         public const byte NvdaEventMsg = 0x90; // one thing the host's NVDA did (NvdaEvent.Encode: speech with pitch and capitals, a cut-off, a beep, a sound, braille), from the Kova Helper add-on
-        public const byte NvdaAvailable = 0x91; // u8 1 = the Kova Helper add-on is talking to the host, so NVDA comes as text; 0 = it is not (only the sound carries NVDA)
+        public const byte NvdaAvailable = 0x91; // u8 1 = the Kova Helper add-on is talking to the host, so NVDA comes as text; 0 = it is not (only the sound carries NVDA); NvdaSecureScreen = the host shows a secure screen (sign-in, lock, UAC), where NVDA runs without add-ons: only the sound carries it (4.6.2 and older take it as 0)
+        public const byte NvdaSecureScreen = 2;
         public const byte DeviceTicket = 0x8F; // 32 bytes (HostIdentity.NewTicket): shown in later logins, it lets this PC in while strangers are being turned away
         public const byte Leaving = 0x83; // u8 why (Leaving*), then UTF-8 detail (the new version when updating): sent just before the host closes on purpose
         // 0x84 was CaptureBurst (1.7.x): no longer sent, never reuse it
@@ -153,6 +154,7 @@ namespace TailRemote
         public const uint FeatureWake = 2048;  // WakeRequest
         public const uint FeatureMic = 4096;   // takes the controller's microphone (UdpMic, MicState)
         public const uint FeatureNvda = 8192;  // sends its NVDA's speech and braille as text (NvdaWant)
+        public const uint FeatureNvdaSecureScreen = 16384; // a controller that understands NvdaAvailable = NvdaSecureScreen (older ones are never sent it)
 
         /// <summary>
         /// The bitrate steps, best first. 5 ms packets down to 128 kbit/s (Opus's
@@ -174,7 +176,7 @@ namespace TailRemote
         public static int WireKbps(int step) => OpusSteps[step].Kbps + 1000 / OpusSteps[step].Ms * PacketOverheadBytes * 8 / 1000;
 
         /// <summary>What this version supports, sent to the other side after login.</summary>
-        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda;
+        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda | FeatureNvdaSecureScreen;
 
 
         // ---- The login, damage-proof ----

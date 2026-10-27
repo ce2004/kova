@@ -123,6 +123,7 @@ namespace TailRemote
         internal const int RemoteLinesPerSecond = 100; // past this, the rest of a message is joined into one line, never lost
         internal const int RemoteJoinedPerSecond = 20; // joined lines on top of that before anything is dropped
         private const int RemoteQueueMax = 64;
+        private const int RemoteCallMax = 4 * RemoteLineMax; // characters handed to NVDA in one call when lines have piled up
 
         /// <summary>
         /// Text from the other PC, made safe to hand to NVDA: control characters (other than tab) and the invisible
@@ -247,6 +248,19 @@ namespace TailRemote
                 {
                     while (RemotePending.Count == 0) Monitor.Wait(RemoteGate);
                     u = RemotePending.Dequeue();
+                    // Plain lines that piled up while NVDA took the last one go over as one call: each call into NVDA
+                    // costs a round trip and an entry in its speech queue, and lots of text fell behind that way.
+                    if (!u.CancelOnly && u.Ssml == null)
+                    {
+                        StringBuilder? joined = null;
+                        while (RemotePending.Count > 0 && RemotePending.Peek() is { CancelOnly: false, Ssml: null, Interrupt: false } next
+                            && (joined?.Length ?? u.Message.Length) + 1 + next.Message.Length <= RemoteCallMax)
+                        {
+                            joined ??= new StringBuilder(u.Message);
+                            joined.Append(' ').Append(RemotePending.Dequeue().Message);
+                        }
+                        if (joined != null) u = u with { Message = joined.ToString() };
+                    }
                 }
                 try
                 {

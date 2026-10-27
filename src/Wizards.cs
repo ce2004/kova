@@ -35,6 +35,8 @@ namespace TailRemote
             public Func<Control?>? Focus { get; init; }
             /// <summary>Buttons beside the main one, shown only on this page.</summary>
             public Button[] Buttons { get; init; } = Array.Empty<Button>();
+            /// <summary>Whether one of Buttons applies right now (a button that could only refuse is not shown at all).</summary>
+            public Func<Button, bool> ButtonShown { get; init; } = _ => true;
             internal GroupBox? Box;
         }
 
@@ -64,6 +66,8 @@ namespace TailRemote
             foreach (var p in pages)
             {
                 var box = new GroupBox { Text = p.Question, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Visible = false, Padding = new Padding(8), MinimumSize = new Size(480, 0) };
+                // Unnamed, Windows Forms names it after a label from the page before ("Port: leave it at 47120..." on the relay
+                // page). Naming it empty ("") stopped UI Automation choosing the radio buttons inside it, so it stays as it is.
                 var inner = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
                 inner.Controls.AddRange(p.Controls);
                 box.Controls.Add(inner);
@@ -98,7 +102,7 @@ namespace TailRemote
             _at = i;
             var page = _pages[i];
             page.Box!.Visible = true;
-            foreach (var b in page.Buttons) b.Visible = true;
+            foreach (var b in page.Buttons) b.Visible = page.ButtonShown(b);
             _back.Enabled = Enumerable.Range(0, i).Any(j => _pages[j].Shown());
             ShowStatus("", speak: false);
             _warnedFor = null;
@@ -170,10 +174,15 @@ namespace TailRemote
 
         internal static RadioButton Choice(string text, bool chosen = false) => new() { Text = text, AutoSize = true, Checked = chosen, MaximumSize = new Size(460, 0) };
 
-        internal static (Label Label, TextBox Box) Field(string label, string text, bool secret = false)
+        /// <summary>
+        /// A labelled box: "Password: at least 6 characters...". The box's name is the whole label, so NVDA says what to
+        /// type and why as the box gets focus (a description was not certain to be read); it starts with the short label.
+        /// </summary>
+        internal static (Label Label, TextBox Box) Field(string label, string text, bool secret = false, string? help = null)
         {
-            var l = new Label { Text = label, AutoSize = true, MaximumSize = new Size(460, 0), Margin = new Padding(3, 8, 3, 0) };
-            var b = new TextBox { Text = text, Width = 440, UseSystemPasswordChar = secret, AccessibleName = label.Replace("&", "").TrimEnd(':') };
+            string shown = help == null ? label : label + ": " + help;
+            var l = new Label { Text = shown, AutoSize = true, MaximumSize = new Size(460, 0), Margin = new Padding(3, 8, 3, 0) };
+            var b = new TextBox { Text = text, Width = 440, UseSystemPasswordChar = secret, AccessibleName = shown.Replace("&", "") };
             return (l, b);
         }
 
@@ -290,6 +299,8 @@ namespace TailRemote
     {
         internal sealed record Answer(string Address, int Port, string Password, bool Save, string Name, SavedPc? Saved);
 
+        internal const string AddressHelp = "the PC's name or IP address, or the address of the Kova Relay it hosts through. Add a colon and the port number only if it is not the usual one.";
+
         /// <param name="savedChanged">Called after a saved PC is edited or deleted here, to save the settings at once.</param>
         public static Answer? Run(IWin32Window owner, Settings settings, Action savedChanged)
         {
@@ -298,17 +309,22 @@ namespace TailRemote
             var editPc = new Button { Text = "&Edit PC..." };
             var deletePc = new Button { Text = "&Delete PC" };
 
-            var (addrLabel, addr) = WizardForm.Field("&Address: the PC's name or IP address, or the address of a Kova Relay. Add a colon and the port number only if it is not the standard one.", "");
-            var (pwLabel, pwBox) = WizardForm.Field("Pass&word:", "", secret: true);
-            var save = new CheckBox { Text = "Sa&ve this PC", AutoSize = true, Checked = true };
-            var (nameLabel, nameBox) = WizardForm.Field("&Name for this PC (optional, for example Office PC):", "");
-            save.CheckedChanged += (_, _) => nameBox.Enabled = save.Checked;
+            var (addrLabel, addr) = WizardForm.Field("&Address", "", help: AddressHelp);
+            var (pwLabel, pwBox) = WizardForm.Field("Pass&word", "", secret: true, help: "the password chosen on that PC.");
+            var save = new CheckBox { Text = "Sa&ve this PC for next time", AutoSize = true, Checked = true };
+            var (nameLabel, nameBox) = WizardForm.Field("&Name for this PC", "", help: "optional, for example Office PC.");
+            save.CheckedChanged += (_, _) => nameLabel.Enabled = nameBox.Enabled = save.Checked;
 
             WizardForm? form = null;
+            WizardForm.Page? choosePage = null;
             Route.Found? found = null;
             SavedPc? Chosen() => radios.FirstOrDefault(r => r.Radio.Checked).Pc;
 
-            void EditButtons() => editPc.Enabled = deletePc.Enabled = Chosen() != null;
+            // Edit PC and Delete PC only while a saved PC is chosen: on A new PC they could only refuse.
+            void EditButtons()
+            {
+                if (choosePage?.Box?.Visible == true) editPc.Visible = deletePc.Visible = Chosen() != null;
+            }
             void Fill(SavedPc? select)
             {
                 foreach (Control c in list.Controls.Cast<Control>().ToList()) { list.Controls.Remove(c); c.Dispose(); }
@@ -325,19 +341,20 @@ namespace TailRemote
                 EditButtons();
             }
 
-            var choosePage = new WizardForm.Page
+            choosePage = new WizardForm.Page
             {
-                Question = "Choose a PC",
+                Question = "Which PC do you want to connect to?",
                 Controls = new Control[] { list },
                 Shown = () => settings.SavedPcs.Count > 0,
                 FinishesHere = () => Chosen() != null,
                 NextText = () => Chosen() != null ? "&Connect" : "&Next",
                 Focus = () => radios.FirstOrDefault(r => r.Radio.Checked).Radio,
                 Buttons = new[] { editPc, deletePc },
+                ButtonShown = _ => Chosen() != null,
             };
             var detailsPage = new WizardForm.Page
             {
-                Question = "Connection details",
+                Question = "The PC's address and password",
                 Controls = new Control[] { addrLabel, addr, pwLabel, pwBox, WizardForm.ShowPassword(pwBox), save, nameLabel, nameBox },
                 Shown = () => Chosen() == null,
                 NextText = () => "&Connect",
@@ -398,14 +415,14 @@ namespace TailRemote
             string shownAddress = Relay.IsByPassword(pc.Address) ? Relay.Shown(pc.Address)
                 : pc.Port == Protocol.DefaultPort ? pc.Address
                 : (pc.Address.Contains(':') ? "[" + pc.Address + "]" : pc.Address) + ":" + pc.Port;
-            var (nameLabel, nameBox) = WizardForm.Field("&Name (for example Office PC):", pc.Name);
-            var (addrLabel, addr) = WizardForm.Field("&Address: the PC's name or IP address, or the address of a Kova Relay:", shownAddress);
-            var (pwLabel, pwBox) = WizardForm.Field("Pass&word:", Settings.Unprotect(pc.PasswordEnc), secret: true);
+            var (nameLabel, nameBox) = WizardForm.Field("&Name", pc.Name, help: "for example Office PC.");
+            var (addrLabel, addr) = WizardForm.Field("&Address", shownAddress, help: ConnectWizard.AddressHelp);
+            var (pwLabel, pwBox) = WizardForm.Field("Pass&word", Settings.Unprotect(pc.PasswordEnc), secret: true, help: "the password chosen on that PC.");
             WizardForm? form = null;
             Route.Found? found = null;
             var page = new WizardForm.Page
             {
-                Question = "PC details",
+                Question = "Change this saved PC",
                 Controls = new Control[] { nameLabel, nameBox, addrLabel, addr, pwLabel, pwBox, WizardForm.ShowPassword(pwBox) },
                 NextText = () => "&Save",
                 Check = async () =>
@@ -430,59 +447,86 @@ namespace TailRemote
         }
     }
 
-    /// <summary>Host this PC: how other computers connect to it (through a relay, directly, or both), the relay, the passwords.</summary>
+    /// <summary>Host this PC: how other computers reach it (through a relay, directly, or both), the relay, the passwords.</summary>
     internal static class HostWizard
     {
         internal sealed record Answer(bool Direct, bool Relay, int Port, string RelayAddress, int RelayPort, string Password, string ListenPassword);
 
-        public static Answer? Run(IWin32Window owner, Settings settings, int port, string password, string listen, bool registeredNow, bool service, string? myAddresses)
+        /// <param name="bestAddress">The address other computers on this network would type (null when this PC has none).</param>
+        /// <param name="myAddresses">All of this PC's addresses, in words, for the summary.</param>
+        /// <param name="copy">Puts text on the clipboard (on Kova's clipboard thread).</param>
+        public static Answer? Run(IWin32Window owner, Settings settings, int port, string password, string listen, bool registeredNow, bool service,
+            string? bestAddress, string? myAddresses, Action<string> copy)
         {
             int was = !settings.RelayHosting ? 1 : settings.RelayOnly ? 0 : 2;
-            var viaRelay = WizardForm.Choice("Through a Kova &Relay. Recommended when this PC is behind a router or firewall. No ports are opened on this PC.", chosen: was == 0);
-            var direct = WizardForm.Choice("&Directly, using this PC's network address. Kova opens a port in Windows Firewall.", chosen: was == 1);
-            var both = WizardForm.Choice("B&oth: through a Kova Relay, and directly.", chosen: was == 2);
+            var viaRelay = WizardForm.Choice("Through a Kova &Relay. Works from anywhere, and nothing needs opening on this PC or your router.", chosen: was == 0);
+            var direct = WizardForm.Choice("&Directly, by this PC's own address. For computers on the same network or a VPN. Kova opens a port in Windows Firewall.", chosen: was == 1);
+            var both = WizardForm.Choice("B&oth ways: through the relay from anywhere, and directly from the same network or a VPN.", chosen: was == 2);
             bool UsesRelay() => viaRelay.Checked || both.Checked;
             bool UsesDirect() => direct.Checked || both.Checked;
 
-            var (portLabel, portBox) = WizardForm.Field("&Port number (the standard port is 47120):", port.ToString());
+            var (portLabel, portBox) = WizardForm.Field("&Port", port.ToString(), help: "leave it at " + Protocol.DefaultPort + " unless another program on this PC uses that port.");
             string relayText = settings.RelayAddress.Length == 0 ? "" : settings.RelayAddress + (settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + settings.RelayPort);
-            var (relayLabel, relayBox) = WizardForm.Field("&Relay address. Add a colon and the port number only if it is not the standard one, 47200.", relayText);
-            var (pwLabel, pwBox) = WizardForm.Field("Pass&word (at least 6 characters). Other computers need it to connect.", password, secret: true);
-            var relayNote = WizardForm.Note("If you use a Kova Relay, the password also identifies this PC on the relay, so give each PC its own password.");
-            var (listenLabel, listenBox) = WizardForm.Field("&Listen-only password (optional). It lets someone hear this PC without controlling it.", listen, secret: true);
+            var (relayLabel, relayBox) = WizardForm.Field("&Relay address", relayText,
+                help: "for example relay.example.com. Add a colon and the port number only if the relay does not use " + KovaRelayWire.Wire.DefaultPort + ".");
+            var (pwLabel, pwBox) = WizardForm.Field("Pass&word", password, secret: true, help: "at least " + MainForm.MinPasswordLength + " characters. Anyone who has it can control this PC.");
+            var relayNote = WizardForm.Note("On a relay, the password is also how other computers find this PC there, so give each PC its own password.");
+            var (listenLabel, listenBox) = WizardForm.Field("&Listen-only password", listen, secret: true,
+                help: "optional. It lets someone hear this PC without controlling it. Leave it empty if nobody needs that.");
             var summary = WizardForm.Reading("");
+            var copyAddress = new Button { Text = "Copy this PC's &address" };
+            var copyRelay = new Button { Text = "Copy the r&elay address" };
+            void ReachChosen() => relayNote.Visible = UsesRelay();
+            foreach (var r in new[] { viaRelay, direct, both }) r.CheckedChanged += (_, _) => ReachChosen();
+            ReachChosen();
+
+            string PortText() => portBox.Text.Trim() == Protocol.DefaultPort.ToString() ? "" : ":" + portBox.Text.Trim();
+            string DirectAddress() => (bestAddress ?? "") + PortText();
 
             WizardForm? form = null;
             string Summary()
             {
                 var lines = new List<string>();
+                string how = "On the other computer, choose Connect to a PC in Kova's File menu, then enter ";
                 if (UsesRelay())
-                    lines.Add("To connect through the relay, other computers choose Connect to a PC, then enter the relay address " + relayBox.Text.Trim() + " and this PC's password.");
+                    lines.Add((UsesDirect() ? "From anywhere, through the relay: " : "") + how + "the address " + relayBox.Text.Trim() + " and this PC's password.");
                 if (UsesDirect())
-                    lines.Add("To connect directly, other computers enter this PC's address" + (string.IsNullOrEmpty(myAddresses) ? "" : " (" + myAddresses + ")") +
-                        (portBox.Text.Trim() == Protocol.DefaultPort.ToString() ? "" : " followed by :" + portBox.Text.Trim()) + " and the password. Kova opens port " + portBox.Text.Trim() + " in Windows Firewall.");
-                if (viaRelay.Checked) lines.Add("No ports are opened on this PC. Every connection comes through the relay.");
-                if (service) lines.Add("The Kova service is installed, so it will host this way from now on.");
+                {
+                    lines.Add((UsesRelay() ? "From the same network or a VPN: " : "") + how +
+                        (bestAddress != null ? "the address " + DirectAddress() : "this PC's address" + PortText()) + " and this PC's password.");
+                    if (!string.IsNullOrEmpty(myAddresses)) lines.Add("This PC's addresses: " + myAddresses + ".");
+                    lines.Add("Port " + portBox.Text.Trim() + " must be open in Windows Firewall. If it is not, Kova asks to open it.");
+                }
+                if (viaRelay.Checked) lines.Add("Nothing is opened on this PC: every connection comes through the relay.");
+                if (service) lines.Add("The Kova service hosts this PC this way from now on, even before anyone signs in.");
                 return string.Join(Environment.NewLine, lines);
             }
+
+            void Copy(string text)
+            {
+                copy(text);
+                form!.ShowStatus("Copied " + text + ".", speak: true);
+            }
+            copyAddress.Click += (_, _) => Copy(DirectAddress());
+            copyRelay.Click += (_, _) => Copy(relayBox.Text.Trim());
 
             var pages = new List<WizardForm.Page>
             {
                 new()
                 {
-                    Question = "How will other computers connect to this PC?",
+                    Question = "How should other computers reach this PC?",
                     Controls = new Control[] { viaRelay, direct, both },
                 },
                 new()
                 {
-                    Question = "Port",
+                    Question = "Port for direct connections",
                     Controls = new Control[] { portLabel, portBox },
                     Shown = UsesDirect,
                     Check = () => Task.FromResult<(string, bool)?>(Protocol.PortProblem(portBox.Text.Trim(), out _) is string p ? (p, false) : null),
                 },
                 new()
                 {
-                    Question = "Kova Relay",
+                    Question = "Which Kova Relay?",
                     Controls = new Control[] { relayLabel, relayBox },
                     Shown = UsesRelay,
                     Check = async () =>
@@ -524,9 +568,12 @@ namespace TailRemote
                 },
                 new()
                 {
-                    Question = "Ready",
+                    Question = service ? "Ready to give the Kova service these settings" : "Ready to host",
                     Controls = new Control[] { summary },
                     NextText = () => service ? "&Apply to the Kova service" : "Start &hosting",
+                    // A copy button for each address other computers type: the relay's, and this PC's own.
+                    Buttons = new[] { copyRelay, copyAddress },
+                    ButtonShown = b => b == copyRelay ? UsesRelay() : UsesDirect() && bestAddress != null,
                 },
             };
 

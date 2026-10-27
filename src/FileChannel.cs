@@ -33,7 +33,11 @@ namespace TailRemote
     /// Sending is paced (Rate): the controlling PC watches the audio path's ping and
     /// slows file data the moment it starts hurting the sound, then speeds back up. At low
     /// speeds fewer lanes and smaller pieces are used, so nothing queues up anywhere.
-    /// A new batch replaces the one still going.
+    ///
+    /// Send files and folders wait their turn (4.7): a new batch goes after the ones already going or
+    /// waiting, never in their place. Only the clipboard replaces: a newer copy stops an older copy still
+    /// going. When both PCs have 4.7, clipboard batches go alongside a long file batch instead of waiting
+    /// for it (Can), and one of the things chosen in a batch can be stopped while the rest carries on (Skip).
     /// </summary>
     internal sealed class FileChannel : IDisposable
     {
@@ -52,6 +56,23 @@ namespace TailRemote
         // receiver does not wait a week holding its files open. (Added in 4.1.4; older copies never answer.)
         private const byte Have = 0x69;
         private const byte Note = 0x6A;     // u32 id, UTF-8 text: what the sender had to leave out (folders it could not open, links), for the receiver's result
+        // u32 id, u8 from (SkipBySender, SkipByReceiver), u32 first entry, u32 entries: one of the things chosen in a batch
+        // (a top-level file or folder, all its entries) is stopped; the rest carries on. Added in 4.7: an older sender
+        // ignores it and sends that part anyway (this side then confirms its pieces without writing them), and a sender
+        // only ever sends it to a PC that said it understands it (Can).
+        private const byte Skip = 0x6B;
+        private const byte SkipBySender = 0, SkipByReceiver = 1;
+        // u32 flags: what this side's Kova can do, sent first on every lane (4.7). Older copies never send it and
+        // ignore it, so with them nothing new is tried.
+        private const byte Can = 0x6C;
+        private const uint CanSeveral = 1;  // takes several batches at once (a clipboard copy alongside a file batch)
+        private const uint CanSkip = 2;     // understands Skip from its sender
+        private const uint CanStopQueue = 4; // understands StopQueue
+        private const uint CanAll = CanSeveral | CanSkip | CanStopQueue;
+        // Nothing more: Stop the file transfer was pressed on the other PC, so whatever this side has waiting its turn to
+        // send there (Get files asked for while others came) is not sent either. 4.7; only sent to a PC that said it
+        // understands it (Can), and never sent again on a lane that joins later (it would end sends asked for since).
+        private const byte StopQueue = 0x6D;
         internal const byte KindFiles = 1, KindText = 2, KindDownloads = 3; // clipboard files, clipboard text, Send files
         internal const byte KindTo = 4; // Send files into a folder the controller chose in Get files (the offer carries it)
         private const byte EndedWell = 0, EndedBadly = 1, EndedStopped = 2;
@@ -69,7 +90,7 @@ namespace TailRemote
         /// <summary>The most files and folders in one batch (the receiver keeps a slot for each).</summary>
         public const int MaxEntries = 1_000_000;
         private const int GiveUpMs = 60_000, StallMs = 10_000, QuietMs = 12_000, PingMs = 3_000, OfferPartBytes = 1 << 20, HaveMs = 5_000;
-        private long _haveAt; // when this side last asked its sender whether it still has the transfer (WatchLoop only)
+        private volatile uint _peerCan; // what the other PC said it can do (Can); nothing until it says
 
         private static long Now => Environment.TickCount64;
 
@@ -191,13 +212,13 @@ namespace TailRemote
         public bool Gone => _closed;
 
         /// <summary>True while a batch is going either way (the client then measures its ping more often).</summary>
-        public bool Busy => _out != null || (_in is In b && Now - b.LastActivity < 60_000); // a receiver waiting for its sender to come back is not busy
+        public bool Busy => _outs.Length > 0 || _ins.Any(b => Now - b.LastActivity < 60_000); // a receiver waiting for its sender to come back is not busy
         /// <summary>
         /// Anything not yet ended, however long it has been waiting. Whether to keep a channel for a
         /// reconnecting PC goes by this, not Busy: a send paused over a minute ago is still not to
         /// be thrown away when the connection drops again before its next piece.
         /// </summary>
-        public bool HasWork => _out != null || _in != null;
+        public bool HasWork { get { if (_outs.Length > 0 || _ins.Length > 0) return true; lock (_queueGate) return _queue.Count > 0; } }
 
         public sealed class Transfer
         {
@@ -224,12 +245,101 @@ namespace TailRemote
             public long Done, Total;
             /// <summary>Each file moving right now, with how far it has got (a fresh list each report).</summary>
             public IReadOnlyList<(string Name, long Done, long Total)> Files = Array.Empty<(string, long, long)>();
+            /// <summary>Going out, and waiting its turn behind other transfers to the same PC (nothing has moved yet).</summary>
+            public bool Queued;
+            /// <summary>
+            /// The things chosen in it (each top-level file or folder), with how far each has got, and whether it was
+            /// stopped on its own (a fresh list each report; empty for clipboard text).
+            /// </summary>
+            public IReadOnlyList<Item> Items = Array.Empty<Item>();
             public double BytesPerSecond;
             public string? Result;
             // Read once (another thread changes it), and at most a year: a stalled line's speed falls towards
             // nothing, and huge numbers of seconds made TimeSpan throw on the window's thread.
             public TimeSpan? Left { get { double bps = BytesPerSecond; long rest = Total - Done; return bps > 1 && rest > 0 ? TimeSpan.FromSeconds(Math.Min(rest / bps, 365.0 * 86400)) : null; } }
         }
+
+        /// <summary>One of the things chosen in a transfer: its name, how much of it has moved, and whether it was stopped on its own.</summary>
+        public readonly record struct Item(string Name, long Done, long Total, bool Stopped);
+
+        /// <summary>
+        /// One thing chosen in a batch (a top-level file or folder) and the entries that make it up. Both PCs work these
+        /// out the same way from the same list, so a Skip names one by its first entry and count.
+        /// </summary>
+        private sealed record Top(string Name, int First, int Count, long Bytes);
+
+        /// <summary>The batch's things chosen, from its entries' paths: a run of entries with the same first name is one thing.</summary>
+        private static Top[] TopsOf(int count, Func<int, string> rel, Func<int, long> length)
+        {
+            var tops = new List<Top>();
+            string? name = null;
+            int first = 0;
+            long bytes = 0;
+            for (int i = 0; i <= count; i++)
+            {
+                string? n = null;
+                if (i < count)
+                {
+                    string r = rel(i);
+                    int cut = r.IndexOfAny(new[] { '\\', '/' });
+                    n = cut < 0 ? r : r[..cut];
+                }
+                if (i > 0 && (i == count || !string.Equals(n, name, StringComparison.Ordinal)))
+                {
+                    tops.Add(new Top(name!, first, i - first, bytes));
+                    first = i;
+                    bytes = 0;
+                }
+                if (i < count) { name = n; bytes += Math.Max(0, length(i)); }
+            }
+            return tops.ToArray();
+        }
+
+        /// <summary>Which of the tops entry e belongs to (they are in order and cover every entry).</summary>
+        private static int TopOf(Top[] tops, int e)
+        {
+            int lo = 0, hi = tops.Length - 1;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) / 2;
+                if (tops[mid].First <= e) lo = mid; else hi = mid - 1;
+            }
+            return lo;
+        }
+
+        /// <summary>The most items listed per transfer (a pick of thousands of files would make the list unreadable).</summary>
+        private const int MaxItemsShown = 500;
+
+        private static Item[] ItemsOf(Top[] tops, long[] done, byte[] stopped) =>
+            tops.Length <= 1 && stopped.All(s => s == 0) ? Array.Empty<Item>()
+                : tops.Take(MaxItemsShown).Select((t, k) => new Item(t.Name, stopped[k] != 0 ? Math.Min(done[k], t.Bytes) : done[k], t.Bytes, stopped[k] != 0)).ToArray();
+
+        private static byte[] SkipMessage(uint id, byte from, Top top)
+        {
+            byte[] m = new byte[14];
+            m[0] = Skip;
+            BitConverter.TryWriteBytes(m.AsSpan(1), id);
+            m[5] = from;
+            BitConverter.TryWriteBytes(m.AsSpan(6), top.First);
+            BitConverter.TryWriteBytes(m.AsSpan(10), top.Count);
+            return m;
+        }
+
+        /// <summary>The words for things stopped on their own, added to a result: "" when none was.</summary>
+        private static string StoppedWords(Top[] tops, byte[] stopped, bool sending)
+        {
+            var mine = new List<string>();
+            var theirs = new List<string>();
+            for (int k = 0; k < tops.Length; k++)
+                if (stopped[k] == StoppedHere) mine.Add(tops[k].Name); else if (stopped[k] == StoppedThere) theirs.Add(tops[k].Name);
+            static string Names(List<string> n) => n.Count <= 3 ? string.Join(", ", n) : string.Join(", ", n.Take(3)) + " and " + (n.Count - 3) + " more";
+            string s = "";
+            if (mine.Count > 0) s += " You stopped " + Names(mine) + (sending ? " before all of it was sent." : " before all of it arrived.");
+            if (theirs.Count > 0) s += " The other PC stopped " + Names(theirs) + (sending ? " before all of it was sent." : " before all of it arrived.");
+            return s;
+        }
+
+        private const byte StoppedHere = 1, StoppedThere = 2;
 
         /// <summary>Where arriving clipboard files are held until pasted: %LOCALAPPDATA%\TailRemote\Clipboard.</summary>
         public static string Staging => StagingOverride ?? Path.Combine(Names.LocalDir, "Clipboard");
@@ -271,14 +381,51 @@ namespace TailRemote
         {
             Id = id ?? RandomNumberGenerator.GetBytes(16);
             _nextId = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
+            lock (Registry)
+            {
+                Registry.RemoveAll(w => !w.TryGetTarget(out var f) || f._closed);
+                Registry.Add(new WeakReference<FileChannel>(this));
+            }
             new Thread(WatchLoop) { IsBackground = true, Name = "Kova files watch" }.Start();
             new Thread(DialLoop) { IsBackground = true, Name = "Kova files dial" }.Start();
+        }
+
+        // Every channel open in this Kova (to every PC, in front, in the background or reconnecting), so the window can
+        // stop one transfer by its serial without knowing which PC it is with.
+        private static readonly List<WeakReference<FileChannel>> Registry = new();
+
+        /// <summary>
+        /// Stops one transfer (item -1), or one of the things chosen in it (its index in Transfer.Items), while
+        /// everything else carries on, whichever PC it is with; the other PC is told. Returns what to say.
+        /// </summary>
+        /// <param name="name">The item's name as shown (Transfer.Items): if the list has changed since (an item taken out of a
+        /// batch still waiting), the item is found by it again, and nothing is stopped if it is no longer there.</param>
+        public static string StopOne(int serial, int item = -1, string? name = null)
+        {
+            FileChannel[] all;
+            lock (Registry) all = Registry.Select(w => w.TryGetTarget(out var f) ? f : null).OfType<FileChannel>().Where(f => !f._closed).ToArray();
+            foreach (var f in all)
+                if (f.TryStop(serial, item, name) is string said) return said;
+            return "That one has already ended.";
+        }
+
+        /// <summary>
+        /// The index of an item now: as given if its name still matches (or none was given), otherwise the one item of that
+        /// name, or -1 if there is not exactly one.
+        /// </summary>
+        private static int ItemNow(Top[] tops, int item, string? name)
+        {
+            if (name == null || (item >= 0 && item < tops.Length && tops[item].Name == name)) return item;
+            int found = -1;
+            for (int k = 0; k < tops.Length; k++)
+                if (tops[k].Name == name) { if (found >= 0) return -1; found = k; }
+            return found;
         }
 
         /// <summary>The controlling PC only: opens one more lane to the host, or returns null.</summary>
         public Func<(TcpClient Tcp, SecureLink Link)?>? Dial
         {
-            set { _dial = value; Interlocked.Exchange(ref _detachedAt, 0); if (value != null) _out?.Unpark(); _dialWake.Set(); }
+            set { _dial = value; Interlocked.Exchange(ref _detachedAt, 0); if (value != null) foreach (var o in _outs) o.Unpark(); _dialWake.Set(); }
         }
 
         /// <summary>
@@ -305,7 +452,7 @@ namespace TailRemote
             foreach (var l in _lanes) Kill(l);
             // The files being sent are let go while paused: an editor saving one (by writing a new copy and
             // moving it over the old) was refused while Kova held it. Reopened, and checked, on the way back.
-            _out?.Park();
+            foreach (var o in _outs) o.Park();
         }
 
         /// <summary>
@@ -315,7 +462,7 @@ namespace TailRemote
         /// </summary>
         public void SenderGone()
         {
-            if (_in is In b)
+            foreach (var b in _ins)
                 ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedBadly, NoLongerHas, NoLongerHas, null, tell: false));
         }
 
@@ -325,11 +472,14 @@ namespace TailRemote
         public void Dispose()
         {
             if (_closed) return;
-            if (_out is Out o) EndOut(o, EndedStopped, "Stopped sending " + o.What + ": the connection was closed.", tell: true);
-            var incoming = _in;
+            foreach (var o in _outs) EndOut(o, EndedStopped, "Stopped sending " + o.What + ": the connection was closed.", tell: true);
+            var incoming = _ins;
             _closed = true;
+            // A send waiting its turn sees the channel closed and ends itself, on its own thread (this one may hold the host's lock).
+            lock (_queueGate) Monitor.PulseAll(_queueGate);
             _dial = null;
             _dialWake.Set();
+            lock (Registry) Registry.RemoveAll(w => !w.TryGetTarget(out var f) || f == this);
             Lane[] lanes;
             lock (_lanesGate) lanes = _lanes; // after _closed is set: AddLane checks it under this lock, so no lane is missed
             // Off this thread: ending what comes in waits up to 2 seconds for writes still landing, and this is
@@ -337,7 +487,8 @@ namespace TailRemote
             // the window. Then a moment for the goodbyes to go out, then the lanes close.
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                if (incoming is In b) try { EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ": the connection was closed.", "The other PC closed the connection.", null, tell: true); } catch { }
+                foreach (var b in incoming)
+                    try { EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ": the connection was closed.", "The other PC closed the connection.", null, tell: true); } catch { }
                 Thread.Sleep(300);
                 foreach (var l in lanes) Kill(l);
             });
@@ -372,7 +523,12 @@ namespace TailRemote
                 _lanes = list.OrderBy(l => l.Slot).ToArray();
             }
             if (extra != null) Kill(extra);
-            _out?.Unpark(); // a lane joined: the send goes on, and may open its files again
+            foreach (var o in _outs) o.Unpark(); // a lane joined: the send goes on, and may open its files again
+            // First on every lane: what this Kova can do. An older one ignores it.
+            byte[] can = new byte[5];
+            can[0] = Can;
+            BitConverter.TryWriteBytes(can.AsSpan(1), CanAll);
+            lane.Control.Enqueue(can);
             // _detachedAt is not cleared here: a lane arriving just after Detach would make a kept channel think it
             // was attached again, and it never closed. Reattaching is the Dial setter (controller) or Reattached (host).
             // Stops that may not have reached the other PC yet (sent while it was unreachable).
@@ -381,7 +537,7 @@ namespace TailRemote
             // transfer using every core can never hold up a keystroke or the audio.
             new Thread(() => ReadLoop(lane), 256 << 10) { IsBackground = true, Name = "Kova files in", Priority = ThreadPriority.BelowNormal }.Start();
             new Thread(() => WriteLoop(lane), 256 << 10) { IsBackground = true, Name = "Kova files out", Priority = ThreadPriority.BelowNormal }.Start();
-            _out?.Changed.Set();
+            foreach (var o in _outs) o.Changed.Set();
         }
 
         private void Kill(Lane lane)
@@ -398,7 +554,7 @@ namespace TailRemote
             try { lane.Link.Dispose(); } catch { }
             lane.Wake.Set();
             // Its pieces not confirmed yet go again, on the other lanes.
-            if (_out is Out o)
+            foreach (var o in _outs)
             {
                 lock (o.Gate)
                 {
@@ -457,7 +613,7 @@ namespace TailRemote
                 long now = Now;
                 foreach (var l in _lanes)
                     if (now - l.LastIn > QuietMs) { DiagLog.Write("files: a lane went quiet; closing it"); Kill(l); }
-                if (_out is Out o)
+                foreach (var o in _outs)
                 {
                     List<Lane> stalled;
                     lock (o.Gate)
@@ -476,22 +632,26 @@ namespace TailRemote
                 }
                 // Nothing arriving: never given up on (it carries on when the other PC is back), but
                 // the Files line says it is waiting rather than look stuck.
-                if (_in is In b && b.Prepared && !b.Ended)
+                if (_ins.Length > 0) KeepFetchesAsked();
+                foreach (var b in _ins)
                 {
-                    bool waiting = now - b.LastActivity > 10_000;
-                    if (waiting != b.T.Waiting) { b.T.Waiting = waiting; try { Progress?.Invoke(b.T); } catch { } }
-                }
-                // Lanes are up but nothing arrives: the sending PC may have restarted (lost power, crashed) and
-                // come back without this transfer, and then only the receiver knows it exists. Asked every few
-                // seconds; a sender that still has it says nothing, one that does not answers with a Stop.
-                if (_in is In w && !w.Ended && now - w.LastActivity > HaveMs && now - _haveAt > HaveMs && _lanes is { Length: > 0 } up)
-                {
-                    _haveAt = now;
-                    Tell(up[0], IdMessage(Have, w.Id));
+                    if (b.Prepared && !b.Ended)
+                    {
+                        bool waiting = now - b.LastActivity > 10_000;
+                        if (waiting != b.T.Waiting) { b.T.Waiting = waiting; try { Progress?.Invoke(b.T); } catch { } }
+                    }
+                    // Lanes are up but nothing arrives: the sending PC may have restarted (lost power, crashed) and
+                    // come back without this transfer, and then only the receiver knows it exists. Asked every few
+                    // seconds; a sender that still has it says nothing, one that does not answers with a Stop.
+                    if (!b.Ended && now - b.LastActivity > HaveMs && now - b.HaveAt > HaveMs && _lanes is { Length: > 0 } up)
+                    {
+                        b.HaveAt = now;
+                        Tell(up[0], IdMessage(Have, b.Id));
+                    }
                 }
                 // Detached with nothing going: nothing to carry on with, so closed after a minute.
                 long d = Interlocked.Read(ref _detachedAt);
-                if (d != 0 && now - d > GiveUpMs + 10_000 && _out == null && _in == null) { Dispose(); return false; }
+                if (d != 0 && now - d > GiveUpMs + 10_000 && !HasWork) { Dispose(); return false; }
                 // Detached for a week: that PC is not coming back for it (a restarted Kova there has a new
                 // channel). Closed so it holds no files, threads or rights for years; what arrived is kept
                 // as "(incomplete)", as with any transfer that ends early.
@@ -530,10 +690,12 @@ namespace TailRemote
         private bool WriteOne(Lane lane)
         {
             if (lane.Control.TryDequeue(out var c)) { Send(lane, c); return true; }
-            if (_out is Out o && NextPiece(o, lane) is PieceRef p) { SendPiece(o, lane, p); return true; }
+            // The clipboard first (it is first in the list): a copy going alongside a long file batch arrives at once.
+            foreach (var o in _outs)
+                if (NextPiece(o, lane) is PieceRef p) { SendPiece(o, lane, p); return true; }
             if (Now - lane.LastOut >= PingMs) Send(lane, new[] { Ping });
             // Nothing going: the big buffers go too (16 lanes would otherwise hold tens of MB for nothing).
-            if (_out == null && (lane.PieceBuf?.Length > 64 << 10 || lane.OutFrame?.Length > 64 << 10)) { lane.PieceBuf = null; lane.OutFrame = null; }
+            if (_outs.Length == 0 && (lane.PieceBuf?.Length > 64 << 10 || lane.OutFrame?.Length > 64 << 10)) { lane.PieceBuf = null; lane.OutFrame = null; }
             return false;
         }
 
@@ -588,7 +750,7 @@ namespace TailRemote
             if (buf[0] == Piece)
             {
                 if (n > 17) OnPiece(lane, buf, n);
-                if (_in == null && buf.Length > 64 << 10) lane.InBuf = null; // that was the last of it: no big buffer kept
+                if (_ins.Length == 0 && buf.Length > 64 << 10) lane.InBuf = null; // that was the last of it: no big buffer kept
                 return;
             }
             byte[] m = buf.AsSpan(0, n).ToArray();
@@ -598,8 +760,11 @@ namespace TailRemote
                 case Ready when m.Length == 5: OnReady(BitConverter.ToUInt32(m, 1)); break;
                 case Got when m.Length == 21: OnGot(lane, m); break;
                 case Finished when m.Length >= 6:
-                    if (_out is Out o && o.Id == BitConverter.ToUInt32(m, 1)) EndOut(o, m[5], Theirs(Said(m, 6, m.Length - 6)), tell: false);
+                    if (FindOut(BitConverter.ToUInt32(m, 1)) is Out o) EndOut(o, m[5], Theirs(Said(m, 6, m.Length - 6)), tell: false);
                     break;
+                case Can when m.Length >= 5: _peerCan = BitConverter.ToUInt32(m, 1); break;
+                case Skip when m.Length == 14: OnSkip(lane, m); break;
+                case StopQueue when m.Length == 1: OnStopQueue(); break;
                 case Stop when m.Length >= 6: OnStop(BitConverter.ToUInt32(m, 1), m[5], Said(m, 6, m.Length - 6)); break;
                 case Ask when m.Length == 5: OnAsk(lane, BitConverter.ToUInt32(m, 1)); break;
                 case NotSent when m.Length >= 9: OnNotSent(m); break;
@@ -610,7 +775,7 @@ namespace TailRemote
                         uint noteId = BitConverter.ToUInt32(m, 1);
                         // Room for Kova's own three sentences about what was left out; always said as "On the other PC, ...".
                         string said = Clean(Encoding.UTF8.GetString(m, 5, m.Length - 5), 2 * MaxSaid);
-                        if (_in is In b && b.Id == noteId) b.Note = said;
+                        if (FindIn(noteId) is In b) b.Note = said;
                         else _note = (noteId, said); // comes just before its list: kept for the batch it belongs to
                     }
                     break;
@@ -620,7 +785,7 @@ namespace TailRemote
         /// <summary>The receiver asks whether this side still sends that transfer: quiet if so, otherwise a Stop.</summary>
         private void OnHave(Lane lane, uint id)
         {
-            if (_out is Out o && o.Id == id) return; // still going (or ending right now, and saying so itself)
+            if (FindOut(id) != null) return; // still going (or ending right now, and saying so itself)
             lock (_stops)
                 foreach (var (_, stop) in _stops)
                     if (stop[0] == Stop && BitConverter.ToUInt32(stop, 1) == id) { Tell(lane, stop); return; } // how it really ended
@@ -717,8 +882,17 @@ namespace TailRemote
             public readonly object Gate = new();
             public readonly ManualResetEventSlim Changed = new();
             public volatile bool Ready, Ended;
+            public bool ShownWaiting; // under the channel's _queueGate: reported as waiting its turn
+            public long StoppedSeen;  // Run only: StoppedBytes when the speed was last worked out
             public byte Outcome;
             public string Why = "";
+            /// <summary>Made with it, so it can be shown (and stopped) while it waits its turn.</summary>
+            public required Transfer T;
+            public bool Clipboard => Kind is KindFiles or KindText;
+            public Top[] Tops = Array.Empty<Top>();
+            public long[] TopDone = Array.Empty<long>();   // under Gate
+            public byte[] TopStopped = Array.Empty<byte>(); // under Gate: StoppedHere or StoppedThere
+            public long StoppedBytes;                       // under Gate: what was never going to be sent, of things stopped
             // Under Gate:
             public readonly Queue<PieceRef> Retry = new();
             public long[] Next = Array.Empty<long>();         // per file: the next offset to hand out
@@ -871,25 +1045,34 @@ namespace TailRemote
             }
         }
 
-        private readonly object _sendGate = new(), _latestGate = new();
-        private volatile Out? _out;
-        private Out? _latest;
+        // Batches going right now (at most one for the clipboard and one of files; the clipboard first), replaced, never
+        // changed; and those waiting their turn, in order (under _queueGate, which is also pulsed whenever one may start).
+        private volatile Out[] _outs = Array.Empty<Out>();
+        private readonly object _queueGate = new();
+        private readonly List<Out> _queue = new();
         private uint _nextId;
         private readonly List<(long At, byte[] Message)> _stops = new(); // Stop messages, sent again on lanes that join soon after
-        // Counts every request to send (and every Stop): a request still listing a big folder when a newer one,
-        // or Stop, comes is dropped, never sent after it.
-        private long _requests, _lastStop; // _lastStop: the count when Stop was last pressed
+        // A request still listing a big folder is dropped, never sent, when Stop is pressed meanwhile (_stopAll counts the
+        // presses) or, for the clipboard only, when a newer copy is sent (_clipRequests counts clipboard sends).
+        private long _stopAll, _clipRequests;
+
+        private Out? FindOut(uint id)
+        {
+            foreach (var o in _outs) if (o.Id == id) return o;
+            return null;
+        }
 
         /// <summary>
         /// Sends files and folders. toClipboard: onto the other PC's clipboard (Send clipboard), ready for
-        /// Control V; otherwise into its Downloads\TailRemote (Send files). Blocking: run it off the
-        /// window's thread. Replaces any batch still going. into: instead, into this folder on the other
+        /// Control V; otherwise into its Downloads\TailRemote (Send files). Blocking until it has ended: run it
+        /// off the window's thread. Waits its turn behind batches already going; a clipboard copy replaces an
+        /// older clipboard copy only. into: instead, into this folder on the other
         /// PC (a controller sending into the folder it has open in Get files; the host checks it).
         /// </summary>
         public void SendFiles(IReadOnlyList<string> items, bool toClipboard = true, System.Security.Principal.WindowsIdentity? asUser = null, string? into = null)
         {
-            long ticket = Interlocked.Increment(ref _requests);
             byte kind = into != null ? KindTo : toClipboard ? KindFiles : KindDownloads;
+            var ticket = TakeTicket(kind);
             string what = items.Count == 1 ? TopName(items[0]) : items.Count + " items";
             if (into != null && (into.Length == 0 || Encoding.UTF8.GetByteCount(into) > ushort.MaxValue))
             {
@@ -906,8 +1089,8 @@ namespace TailRemote
                 else (listed, note) = List(items);
             }
             catch (Exception e) { problem = Plain(e.Message); }
-            // Something newer was asked for, or Stop pressed, while a big folder was being listed: this one is not wanted.
-            if (Interlocked.Read(ref _requests) != ticket) { Dropped(kind, what, ticket); return; }
+            // Stop pressed (or, for the clipboard, a newer copy sent) while a big folder was being listed: this one is not wanted.
+            if (!Wanted(ticket)) { Dropped(kind, what); return; }
             if (problem != null) { NotSending(kind, what, "Could not send " + what + ": " + problem, "The other PC could not send " + what + ": " + problem); return; }
             if (listed!.Count == 0)
             {
@@ -967,18 +1150,24 @@ namespace TailRemote
         }
 
         /// <summary>
-        /// A request dropped before anything was offered (something newer came, or Stop): said on both PCs as
+        /// A request dropped before anything was offered (Stop, or a newer clipboard copy): said on both PCs as
         /// stopped, so a Get files waiting on the other PC does not keep saying "getting". The clipboard
-        /// replaced by a newer copy needs no word: nothing waits for it.
+        /// stopped or replaced needs no word: nothing waits for it.
         /// </summary>
-        private void Dropped(byte kind, string what, long ticket)
+        private void Dropped(byte kind, string what)
         {
             if (kind is KindText or KindFiles) return;
-            if (Interlocked.Read(ref _lastStop) > ticket)
-                NotSending(kind, what, "Stopped sending " + what + ".", "The other PC stopped sending " + what + ".", EndedStopped);
-            else
-                NotSending(kind, what, "Stopped sending " + what + ": something newer was sent.", "The other PC sent something newer, so " + what + " was stopped.", EndedStopped);
+            NotSending(kind, what, "Stopped sending " + what + ".", "The other PC stopped sending " + what + ".", EndedStopped);
         }
+
+        /// <summary>When a request to send was made: how many Stops, and for the clipboard which copy it is (0 for files).</summary>
+        private readonly record struct Ticket(long StopAt, long Clip);
+
+        private Ticket TakeTicket(byte kind) =>
+            new(Interlocked.Read(ref _stopAll), kind is KindText or KindFiles ? Interlocked.Increment(ref _clipRequests) : 0);
+
+        /// <summary>Still wanted: no Stop since it was asked for, and for the clipboard no newer copy.</summary>
+        private bool Wanted(Ticket t) => Interlocked.Read(ref _stopAll) == t.StopAt && (t.Clip == 0 || Interlocked.Read(ref _clipRequests) == t.Clip);
 
         private void OnNotSent(byte[] m)
         {
@@ -1164,17 +1353,17 @@ namespace TailRemote
             return path.IndexOf(@"\\", 2, StringComparison.Ordinal) < 0;
         }
 
-        /// <summary>Sends clipboard text. Blocking. Replaces any batch still going.</summary>
+        /// <summary>Sends clipboard text. Blocking. Replaces an older clipboard copy still going or waiting.</summary>
         public void SendText(string text)
         {
-            long ticket = Interlocked.Increment(ref _requests);
+            var ticket = TakeTicket(KindText);
             SendBatch(KindText, "clipboard text", new List<Entry> { new("", 0, null, Encoding.UTF8.GetBytes(text)) }, ticket);
         }
 
         /// <summary>Test only (--chaostest): sends a batch with any paths at all, as a hostile PC could.</summary>
         /// <param name="checkCount">false: even more entries than this side would ever offer, to see the receiver refuse them.</param>
         internal void TestSendEntries(List<(string Rel, byte[]? Data)> entries, string what = "test", bool checkCount = true) =>
-            SendBatch(KindFiles, what, entries.Select(e => new Entry(e.Rel, e.Data?.Length ?? -1, null, e.Data)).ToList(), Interlocked.Increment(ref _requests), checkCount: checkCount);
+            SendBatch(KindFiles, what, entries.Select(e => new Entry(e.Rel, e.Data?.Length ?? -1, null, e.Data)).ToList(), TakeTicket(KindFiles), checkCount: checkCount);
 
         /// <summary>
         /// Test only (--securitytest): offers one entry of any kind and length and sends nothing more, as a hostile
@@ -1190,17 +1379,194 @@ namespace TailRemote
             if (_lanes is { Length: > 0 } lanes) Tell(lanes[0], part.ToArray());
         }
 
-        /// <summary>Stops what is being sent and what is being received, if anything.</summary>
+        /// <summary>Test only: whether the other PC said it can take several batches at once and stop one part of one.</summary>
+        internal bool TestPeerCanAll => (_peerCan & CanAll) == CanAll;
+
+        /// <summary>Test only: what the other PC said it can do; set to 0 to act as with a 4.6 PC.</summary>
+        internal uint TestPeerCan { get => _peerCan; set => _peerCan = value; }
+
+        /// <summary>Stops everything being sent, waiting to be sent, and being received.</summary>
         public void CancelSending()
         {
-            Interlocked.Exchange(ref _lastStop, Interlocked.Increment(ref _requests)); // a request still listing its folders is dropped too
-            lock (_latestGate) _latest = null;
-            if (_out is Out o) EndOut(o, EndedStopped, "Stopped sending " + o.What + ".", tell: true);
+            Interlocked.Increment(ref _stopAll); // a request still listing its folders is dropped too
+            // What this side asked for (Get files) and has not had yet is no longer wanted: with Accept unasked off, a lot
+            // the other PC still sends is turned away. A 4.7 sender is also asked to drop all it has waiting its turn,
+            // before the batches arriving now are ended (on each lane this goes first, so their ends never let the next
+            // one start). An older sender has no such waiting line: each new Get replaced the one going.
+            lock (_askGate) _fetches.Clear();
+            if ((_peerCan & CanStopQueue) != 0) foreach (var l in _lanes) Tell(l, new[] { StopQueue });
+            // Those waiting first: ending the ones going would otherwise let the next one start.
+            foreach (var q in TakeQueue()) EndQueued(q, "Stopped sending " + q.What + " before it started.", "The other PC stopped sending " + q.What + ".");
+            foreach (var o in _outs) EndOut(o, EndedStopped, "Stopped sending " + o.What + ".", tell: true);
             // Off the window's thread: ending waits for writes still landing (see Dispose).
-            if (_in is In b) ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ".", "The other PC stopped receiving " + b.T.What + ".", null, tell: true));
+            foreach (var b in _ins) ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ".", "The other PC stopped receiving " + b.T.What + ".", null, tell: true));
         }
 
-        private void SendBatch(byte kind, string what, List<Entry> entries, long ticket, System.Security.Principal.WindowsIdentity? asUser = null, string? into = null, bool checkCount = true, string? note = null)
+        /// <summary>The other PC pressed Stop the file transfer: nothing waiting its turn to go there is sent.</summary>
+        private void OnStopQueue()
+        {
+            foreach (var q in TakeQueue())
+                EndQueued(q, "Did not send " + q.What + ": the other PC stopped its transfers.", "The other PC did not send " + q.What + ": you stopped it before it started.");
+        }
+
+        private List<Out> TakeQueue()
+        {
+            lock (_queueGate) return _queue.ToList();
+        }
+
+        /// <summary>
+        /// Stops one transfer of this channel, or one of the things chosen in it, by the serial of its Transfer: what to
+        /// say, or null if it is not this channel's.
+        /// </summary>
+        private string? TryStop(int serial, int item, string? name)
+        {
+            foreach (var o in _outs)
+                if (o.T.Serial == serial)
+                {
+                    if (item < 0 || o.Tops.Length <= 1) { EndOut(o, EndedStopped, "Stopped sending " + o.What + ".", tell: true); return "Stopping " + o.What + "."; }
+                    if ((_peerCan & CanSkip) == 0)
+                        return "The other PC has an older Kova, which cannot stop just one part of a transfer. Stop all of " + o.What + ", or update Kova there.";
+                    item = ItemNow(o.Tops, item, name);
+                    if (item < 0 || item >= o.Tops.Length) return "That one has already ended.";
+                    return StopTopOut(o, item, StoppedHere) ? "Stopping " + o.Tops[item].Name + "; the rest carries on." : o.Tops[item].Name + " has already ended.";
+                }
+            Out? waiting;
+            lock (_queueGate) waiting = _queue.Find(x => x.T.Serial == serial);
+            if (waiting != null)
+            {
+                if (item < 0 || waiting.Tops.Length <= 1)
+                {
+                    EndQueued(waiting, "Stopped sending " + waiting.What + " before it started.", "The other PC stopped sending " + waiting.What + ".");
+                    return "Stopped " + waiting.What + " before it started.";
+                }
+                return DropWaitingTop(waiting, item, name);
+            }
+            foreach (var b in _ins)
+                if (b.T.Serial == serial)
+                {
+                    if (item < 0 || b.Chosen.Length <= 1)
+                    {
+                        ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedStopped, "Stopped receiving " + b.T.What + ".", "The other PC stopped receiving " + b.T.What + ".", null, tell: true));
+                        return "Stopping " + b.T.What + ".";
+                    }
+                    if (!b.Prepared) return b.T.What + " is still being got ready. Try again in a moment.";
+                    item = ItemNow(b.Chosen, item, name);
+                    if (item < 0 || item >= b.Chosen.Length) return "That one has already ended.";
+                    string shown = b.Chosen[item].Name;
+                    return StopTopIn(b, item, StoppedHere, null) ? "Stopping " + shown + "; the rest carries on." : shown + " has already ended.";
+                }
+            return null;
+        }
+
+        /// <summary>
+        /// One thing chosen in a batch still waiting its turn: taken out of it before anything is offered, so neither PC
+        /// ever hears of it. The rest waits on as before.
+        /// </summary>
+        private string DropWaitingTop(Out o, int k, string? asked)
+        {
+            string name;
+            lock (_queueGate) // a batch only starts under this lock, so it cannot start while it is changed
+            {
+                if (!_queue.Contains(o)) return "That one has already started. Try again.";
+                // Found again by its name: taking one out shifts the others, and a quick second Delete on a list not yet
+                // brought up to date must never take out the wrong one.
+                k = ItemNow(o.Tops, k, asked);
+                if (k < 0 || k >= o.Tops.Length) return "That one is no longer waiting. Try again.";
+                var top = o.Tops[k];
+                name = top.Name;
+                lock (o.Gate)
+                {
+                    var entries = new List<Entry>(o.Entries);
+                    entries.RemoveRange(top.First, top.Count);
+                    o.Entries = entries;
+                    o.Total = entries.Sum(e => Math.Max(0, e.Length));
+                    o.EntryAcked = new long[entries.Count];
+                    o.Next = new long[entries.Count];
+                    o.Handles = new SafeFileHandle?[entries.Count];
+                    o.Seen = new FileMeta?[entries.Count];
+                    o.Tops = TopsOf(entries.Count, i => entries[i].Rel, i => entries[i].Length);
+                    o.TopDone = new long[o.Tops.Length];
+                    o.TopStopped = new byte[o.Tops.Length];
+                    o.T.Total = o.Total;
+                    o.T.Items = ItemsOf(o.Tops, o.TopDone, o.TopStopped);
+                    // Named again, as the receiver will name it: by the one thing left in it, or how many.
+                    o.What = o.T.What = o.Tops.Length == 1 ? o.Tops[0].Name : o.Tops.Length + " items";
+                }
+            }
+            try { Progress?.Invoke(o.T); } catch { }
+            return "Took " + name + " out; the rest still waits its turn.";
+        }
+
+        /// <summary>
+        /// A batch ended before its turn came (Stop, a newer clipboard copy, the channel closing): said here, and for
+        /// Send files the other PC is told too, so a Get files waiting there ends. whyThere null: the other PC is not told.
+        /// </summary>
+        private void EndQueued(Out o, string why, string? whyThere)
+        {
+            lock (o.Gate)
+            {
+                if (o.Ended) return;
+                o.Ended = true;
+                o.Outcome = EndedStopped;
+                o.Why = why;
+            }
+            lock (_queueGate)
+            {
+                _queue.Remove(o);
+                Monitor.PulseAll(_queueGate);
+            }
+            if (!o.Clipboard && whyThere != null)
+            {
+                // As NotSending tells it, but never waiting here for a lane: this can be the window's thread.
+                byte[] w = Encoding.UTF8.GetBytes(o.What.Length > 500 ? o.What[..500] : o.What), y = Encoding.UTF8.GetBytes(whyThere.Length > 2000 ? whyThere[..2000] : whyThere);
+                byte[] m = new byte[9 + w.Length + y.Length];
+                m[0] = NotSent;
+                BitConverter.TryWriteBytes(m.AsSpan(1), Interlocked.Increment(ref _nextId));
+                m[5] = o.Kind;
+                m[6] = EndedStopped;
+                BitConverter.TryWriteBytes(m.AsSpan(7), (ushort)w.Length);
+                w.CopyTo(m, 9);
+                y.CopyTo(m, 9 + w.Length);
+                lock (_stops)
+                {
+                    _stops.Add((Now, m));
+                    if (_stops.Count > 32) _stops.RemoveAt(0);
+                }
+                foreach (var l in _lanes) Tell(l, m);
+            }
+            // A clipboard copy nobody was shown waiting needs no word (as before: a newer copy simply went instead).
+            if (!o.Clipboard || o.ShownWaiting)
+            {
+                var t = o.T;
+                t.Queued = false;
+                t.Failed = t.Cancelled = true;
+                t.Result = why;
+                Volatile.Write(ref t.Finished, true);
+                DiagLog.Write("files: " + why);
+                try { Progress?.Invoke(t); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// May this batch start now (under _queueGate)? Only one clipboard copy and one file batch go at once, and the two
+        /// only side by side when the other PC said it takes several (Can); otherwise one at a time, the clipboard first.
+        /// Batches of the same kind go in the order they were asked for.
+        /// </summary>
+        private bool MayStart(Out o)
+        {
+            bool several = (_peerCan & CanSeveral) != 0;
+            var outs = _outs;
+            if (outs.Length > 0 && !several) return false;
+            foreach (var x in outs) if (x.Clipboard == o.Clipboard) return false;
+            foreach (var q in _queue)
+            {
+                if (q == o) return true;
+                if (!several || q.Clipboard == o.Clipboard) return false;
+            }
+            return false;
+        }
+
+        private void SendBatch(byte kind, string what, List<Entry> entries, Ticket ticket, System.Security.Principal.WindowsIdentity? asUser = null, string? into = null, bool checkCount = true, string? note = null)
         {
             // Refused here, before anything is offered: the other PC would refuse it anyway, and a name too
             // long for the list's two-byte length would arrive as a different, damaged list.
@@ -1218,52 +1584,100 @@ namespace TailRemote
             }
             // Text's length is its bytes'.
             for (int i = 0; i < entries.Count; i++) if (entries[i].Data is byte[] d) entries[i] = entries[i] with { Length = d.Length };
+            long total = entries.Sum(e => Math.Max(0, e.Length));
             var o = new Out
             {
                 Id = Interlocked.Increment(ref _nextId), Kind = kind, What = what, Entries = entries,
-                Total = entries.Sum(e => Math.Max(0, e.Length)),
+                Total = total,
                 AsUser = asUser, Into = into,
+                T = new Transfer { Outgoing = true, What = what, Total = total, Clipboard = kind is KindFiles or KindText, Peer = PeerName },
             };
             o.EntryAcked = new long[entries.Count];
             o.Next = new long[entries.Count];
             o.Handles = new SafeFileHandle?[entries.Count];
             o.Seen = new FileMeta?[entries.Count];
             o.Note = note;
-            // Sending something new replaces what is still going; unless something newer still (or Stop) came
-            // while this one was being got ready.
-            bool replaced;
-            lock (_latestGate)
+            if (kind != KindText)
             {
-                replaced = Interlocked.Read(ref _requests) != ticket;
-                if (!replaced) _latest = o;
+                o.Tops = TopsOf(entries.Count, i => entries[i].Rel, i => entries[i].Length);
+                o.TopDone = new long[o.Tops.Length];
+                o.TopStopped = new byte[o.Tops.Length];
+                o.T.Items = ItemsOf(o.Tops, o.TopDone, o.TopStopped);
             }
-            if (replaced) { Dropped(kind, what, ticket); return; }
-            if (_out is Out old) EndOut(old, EndedStopped, "Stopped sending " + old.What + ": something newer was sent.", tell: true,
-                "The other PC sent something newer, so " + old.What + " was stopped.", replaced: true);
-            lock (_sendGate)
+            // In line behind what is already going or waiting. Only a clipboard copy replaces: an older copy waiting is
+            // dropped and one going is stopped; files and folders never replace anything (4.7: copying a file used to
+            // stop a folder still on its way).
+            List<Out> dropped;
+            bool unwanted = false;
+            lock (_queueGate)
             {
-                lock (_latestGate) replaced = _latest != o; // replaced before it even started (said below, outside this lock)
-                if (!replaced && !_closed)
+                if (_closed) return;
+                if (!Wanted(ticket)) { unwanted = true; dropped = new List<Out>(); }
+                else
                 {
-                    _out = o;
-                    try { Run(o); }
-                    finally
-                    {
-                        _out = null;
-                        o.CloseAll();
-                        int count = o.Entries.Count;
-                        lock (o.Gate) o.Entries = new List<Entry>(); // lets go of the data (a lane still reading finds nothing, and stops)
-                        lock (_latestGate) if (_latest == o) _latest = null; // never keeps what was sent (clipboard text can be 512 MB)
-                        GiveBackMemory(count, o.Total);
-                    }
+                    dropped = o.Clipboard ? _queue.Where(x => x.Clipboard).ToList() : new List<Out>();
+                    _queue.Insert(o.Clipboard ? 0 : _queue.Count, o);
+                    Monitor.PulseAll(_queueGate);
                 }
             }
-            if (replaced) Dropped(kind, what, ticket);
+            if (unwanted) { Dropped(kind, what); return; }
+            foreach (var x in dropped) EndQueued(x, "Stopped sending " + x.What + ": something newer was sent.", null);
+            // A clipboard copy replaces an older one going. With a PC that takes only one batch at a time (an older Kova,
+            // or one whose Can has not come yet) it replaces whatever is going, files too, as 4.6 always did: otherwise
+            // Control B waited, saying nothing, until a long folder had gone. Files waiting their turn still go after it.
+            if (o.Clipboard)
+            {
+                bool alongside = (_peerCan & CanSeveral) != 0;
+                foreach (var old in _outs)
+                    if (old != o && (old.Clipboard || !alongside))
+                        EndOut(old, EndedStopped, "Stopped sending " + old.What + ": something newer was sent.", tell: true,
+                            "The other PC sent something newer, so " + old.What + " was stopped.", replaced: true);
+            }
+            bool started = false;
+            while (true)
+            {
+                bool tell = false;
+                lock (_queueGate)
+                {
+                    if (o.Ended || _closed) break;
+                    if (MayStart(o))
+                    {
+                        _queue.Remove(o);
+                        _outs = _outs.Append(o).OrderBy(x => x.Clipboard ? 0 : 1).ToArray(); // the clipboard's pieces first
+                        started = true;
+                        break;
+                    }
+                    if (o.ShownWaiting) Monitor.Wait(_queueGate, 1000);
+                    else tell = o.ShownWaiting = true;
+                }
+                // Said outside the lock: the window's handler must never run under it.
+                if (tell) { o.T.Queued = true; try { Progress?.Invoke(o.T); } catch { } }
+            }
+            if (!started)
+            {
+                // Closed while it waited (Dispose ends those it finds; one that came in just then is ended here).
+                if (!o.Ended) EndQueued(o, "Did not send " + what + ": the connection was closed.", null);
+                return;
+            }
+            o.T.Queued = false;
+            try { Run(o); }
+            finally
+            {
+                lock (_queueGate)
+                {
+                    _outs = _outs.Where(x => x != o).ToArray();
+                    Monitor.PulseAll(_queueGate); // the next one waiting may go
+                }
+                o.CloseAll();
+                int count = o.Entries.Count;
+                lock (o.Gate) o.Entries = new List<Entry>(); // lets go of the data (a lane still reading finds nothing, and stops)
+                GiveBackMemory(count, o.Total);
+            }
         }
 
         private void Run(Out o)
         {
-            var t = new Transfer { Outgoing = true, What = o.What, Total = o.Total, Clipboard = o.Kind is KindFiles or KindText, Peer = PeerName };
+            var t = o.T;
             var clock = Stopwatch.StartNew();
             double lastReport = 0, speed = 0, moving = 0;
             long lastDone = 0;
@@ -1321,15 +1735,24 @@ namespace TailRemote
                     long done = Interlocked.Read(ref o.Acked);
                     double dt = s - lastReport;
                     if (done > lastDone) moving += dt;
-                    // The speed lately, not since the start: after a pause the time left would be far off.
-                    double rate = (done - lastDone) / dt;
+                    // The speed lately, not since the start: after a pause the time left would be far off. What was
+                    // stopped on its own counts as done, but never as speed.
+                    long stoppedNow;
+                    lock (o.Gate) stoppedNow = o.StoppedBytes;
+                    double rate = Math.Max(0, done - lastDone - (stoppedNow - o.StoppedSeen)) / dt;
+                    o.StoppedSeen = stoppedNow;
                     speed = speed == 0 ? rate : speed * 0.7 + rate * 0.3;
                     lastDone = done;
                     lastReport = s;
                     t.Done = done;
                     t.BytesPerSecond = speed;
                     t.Waiting = lanes.Length == 0;
-                    lock (o.Gate) if (!o.Ended) t.Files = o.Active.Take(32).Select(i => (o.Entries[i].Rel, o.EntryAcked[i], o.Entries[i].Length)).ToArray();
+                    lock (o.Gate)
+                        if (!o.Ended)
+                        {
+                            t.Files = o.Active.Take(32).Select(i => (o.Entries[i].Rel, o.EntryAcked[i], o.Entries[i].Length)).ToArray();
+                            if (o.Tops.Length > 0) t.Items = ItemsOf(o.Tops, o.TopDone, o.TopStopped);
+                        }
                     Progress?.Invoke(t);
                 }
             }
@@ -1337,8 +1760,14 @@ namespace TailRemote
             t.BytesPerSecond = t.Done / Math.Max(0.001, moving > 0.5 ? moving : clock.Elapsed.TotalSeconds); // over the time it was moving, not any waiting
             t.Waiting = false;
             t.Files = Array.Empty<(string, long, long)>();
+            string stopped;
+            lock (o.Gate)
+            {
+                if (o.Tops.Length > 0) t.Items = ItemsOf(o.Tops, o.TopDone, o.TopStopped);
+                stopped = o.Tops.Length > 0 ? StoppedWords(o.Tops, o.TopStopped, sending: true) : "";
+            }
             if (o.Outcome == EndedWell)
-                t.Result = "Sent " + o.What + (o.Kind == KindText ? "" : Summary(o.Entries.Select(e => (e.Rel, e.Length)))) + At(t) + "." + (o.Note != null ? " " + o.Note : "");
+                t.Result = "Sent " + o.What + (o.Kind == KindText ? "" : Summary(o.Entries.Select(e => (e.Rel, e.Length)))) + At(t) + "." + stopped + (o.Note != null ? " " + o.Note : "");
             else { t.Failed = true; t.Cancelled = o.Outcome == EndedStopped; t.Result = o.Why; }
             // Last: the window may be reading this transfer from an earlier report, and must never see it
             // finished without its result.
@@ -1358,27 +1787,115 @@ namespace TailRemote
                 o.Why = why;
             }
             o.CloseAll();
-            if (tell)
-            {
-                var stop = OutcomeMessage(Stop, o.Id, replaced ? EndedReplaced : outcome, whyThere ?? "");
-                lock (_stops)
-                {
-                    _stops.Add((Now, stop));
-                    if (_stops.Count > 32) _stops.RemoveAt(0);
-                }
-                foreach (var l in _lanes) Tell(l, stop);
-            }
+            if (tell) TellAll(OutcomeMessage(Stop, o.Id, replaced ? EndedReplaced : outcome, whyThere ?? ""));
             o.Changed.Set();
+        }
+
+        /// <summary>
+        /// A message the other PC must get even if the lanes are being cut right now: on every lane, and kept for a
+        /// while so lanes that join soon after carry it too (the other PC knows each by its id, so twice does no harm).
+        /// </summary>
+        private void TellAll(byte[] m)
+        {
+            lock (_stops)
+            {
+                _stops.Add((Now, m));
+                if (_stops.Count > 32) _stops.RemoveAt(0);
+            }
+            foreach (var l in _lanes) Tell(l, m);
         }
 
         private void OnReady(uint id)
         {
-            if (_out is not Out o || o.Id != id || o.Ready) return;
+            if (FindOut(id) is not Out o || o.Ready) return;
             o.Ready = true;
             o.Changed.Set();
             foreach (var l in _lanes) l.Wake.Set();
         }
 
+        /// <summary>
+        /// One thing chosen in a batch being sent stops (by: StoppedHere, or StoppedThere when the receiver asked):
+        /// none of the rest of it is sent, and the batch carries on without it. Stopped here, the receiver is told
+        /// (only ever a PC that said it understands, Can). The last thing left stopped is the whole batch stopped.
+        /// False if it had already ended.
+        /// </summary>
+        private bool StopTopOut(Out o, int k, byte by)
+        {
+            bool all, every;
+            Top top;
+            lock (o.Gate)
+            {
+                if (o.Ended || k < 0 || k >= o.Tops.Length || o.TopStopped[k] != 0) return false;
+                o.TopStopped[k] = by;
+                top = o.Tops[k];
+                every = o.TopStopped.All(s => s != 0);
+                if (!every)
+                    for (int e = top.First; e < top.First + top.Count && e < o.Entries.Count; e++)
+                    {
+                        long length = o.Entries[e].Length;
+                        if (length <= 0) continue;
+                        // What is not confirmed yet counts as done now; pieces of it still on their way are confirmed
+                        // as usual but not counted again (OnGot), and none of the rest is handed out (NextPiece).
+                        long rest = length - o.EntryAcked[e];
+                        if (rest > 0) { o.Acked += rest; o.StoppedBytes += rest; }
+                        o.EntryAcked[e] = length;
+                        o.Next[e] = length;
+                        o.Open.Remove(e);
+                        o.Active.Remove(e);
+                    }
+                all = Interlocked.Read(ref o.Acked) == o.Total;
+            }
+            if (every)
+            {
+                // Its files stay open until the batch ends: a lane may be reading one right now.
+                lock (o.Gate) o.TopStopped[k] = 0; // said as the whole batch stopping, not as a part of it
+                EndOut(o, EndedStopped, by == StoppedHere ? "Stopped sending " + o.What + "." : "The other PC stopped receiving " + o.What + ".", tell: by == StoppedHere);
+                return true;
+            }
+            DiagLog.Write("files: " + (by == StoppedHere ? "stopped sending " : "the other PC stopped receiving ") + top.Name + " of " + o.What);
+            if (by == StoppedHere) TellAll(SkipMessage(o.Id, SkipBySender, top));
+            if (all) o.Changed.Set();
+            foreach (var l in _lanes) l.Wake.Set();
+            return true;
+        }
+
+        /// <summary>A Skip from the other PC: one thing chosen in a batch, stopped there.</summary>
+        private void OnSkip(Lane lane, byte[] m)
+        {
+            uint id = BitConverter.ToUInt32(m, 1);
+            byte from = m[5];
+            int first = BitConverter.ToInt32(m, 6), count = BitConverter.ToInt32(m, 10);
+            if (first < 0 || count < 1) return;
+            if (from == SkipByReceiver)
+            {
+                if (FindOut(id) is Out o)
+                {
+                    int k = Array.FindIndex(o.Tops, t => t.First == first && t.Count == count);
+                    if (k >= 0) StopTopOut(o, k, StoppedThere);
+                }
+                return;
+            }
+            if (from != SkipBySender) return;
+            lock (_inGate)
+            {
+                // Its list may still be arriving (the Skip went on every lane, the list on one): applied once it is here.
+                if (FindIn(id) is not In b || !b.Prepared)
+                {
+                    if (_earlySkips.Count >= 64) _earlySkips.RemoveAt(0);
+                    _earlySkips.Add((id, first, count));
+                    return;
+                }
+            }
+            ApplySkips(FindIn(id), lane, id, first, count);
+        }
+
+        /// <summary>Applies a Skip from the sender to a batch whose list is all here.</summary>
+        private void ApplySkips(In? b, Lane? lane, uint id, int first, int count)
+        {
+            if (b == null || b.Id != id) return;
+            int k = Array.FindIndex(b.Chosen, t => t.First == first && t.Count == count);
+            if (k >= 0) StopTopIn(b, k, StoppedThere, lane);
+        }
         /// <summary>The next piece for this lane to send, or null (none left, this lane not needed at this speed, or its share already on the way).</summary>
         private PieceRef? NextPiece(Out o, Lane lane)
         {
@@ -1400,9 +1917,14 @@ namespace TailRemote
                 if (lane.Dead) return null;
                 o.LaneUnacked.TryGetValue(lane, out long unacked);
                 if (unacked > 0 && unacked + size > window) return null;
-                PieceRef p;
-                if (o.Retry.Count > 0) p = o.Retry.Dequeue();
-                else
+                PieceRef? p = null;
+                // A piece of something stopped on its own since it first went is never sent again.
+                while (p == null && o.Retry.Count > 0)
+                {
+                    var again = o.Retry.Dequeue();
+                    if (!StoppedEntry(o, again.Entry)) p = again;
+                }
+                if (p == null)
                 {
                     // Each lane keeps to a file of its own, so many files move side by side, each on
                     // its own thread. With no new file left, it helps the one with the most to go
@@ -1411,7 +1933,8 @@ namespace TailRemote
                     int e = o.LaneFile.TryGetValue(lane, out int mine) && mine < entries.Count && o.Next[mine] < entries[mine].Length ? mine : -1;
                     if (e < 0)
                     {
-                        while (o.Fresh < entries.Count && entries[o.Fresh].Length <= 0) o.Fresh++;
+                        // Past empty files and folders, and files of something stopped on its own (all handed out already).
+                        while (o.Fresh < entries.Count && (entries[o.Fresh].Length <= 0 || o.Next[o.Fresh] >= entries[o.Fresh].Length)) o.Fresh++;
                         if (o.Fresh < entries.Count) e = o.Fresh++;
                         else
                         {
@@ -1465,9 +1988,12 @@ namespace TailRemote
             Send(lane, m.AsSpan(0, size));
         }
 
+        /// <summary>Is entry e part of something stopped on its own? Under o.Gate.</summary>
+        private static bool StoppedEntry(Out o, int e) => o.TopStopped.Length > 0 && e >= 0 && o.TopStopped[TopOf(o.Tops, e)] != 0;
+
         private void OnGot(Lane lane, byte[] m)
         {
-            if (_out is not Out o || o.Id != BitConverter.ToUInt32(m, 1)) return;
+            if (FindOut(BitConverter.ToUInt32(m, 1)) is not Out o) return;
             int e = BitConverter.ToInt32(m, 5);
             long offset = BitConverter.ToInt64(m, 9);
             bool all, entryDone;
@@ -1484,7 +2010,10 @@ namespace TailRemote
                     if (o.LaneUnacked.TryGetValue(on, out long u)) o.LaneUnacked[on] = u - p.Length;
                     o.LaneHeard[on] = Now;
                 }
+                // Part of something stopped on its own: already counted as done when it stopped.
+                if (StoppedEntry(o, e)) return;
                 o.Acked += p.Length;
+                if (o.Tops.Length > 0) o.TopDone[TopOf(o.Tops, e)] += p.Length;
                 entryDone = (o.EntryAcked[e] += p.Length) == o.Entries[e].Length;
                 if (entryDone) o.Active.Remove(e);
                 all = o.Acked == o.Total;
@@ -1538,6 +2067,14 @@ namespace TailRemote
             public readonly Transfer T = new() { What = "files" };
             public readonly Stopwatch Clock = new();
             public long LastActivity = Now;
+            public long HaveAt; // when this side last asked its sender whether it still has this batch (WatchLoop only)
+            // The things chosen in it, worked out once the whole list is here (Prepare): each one's progress, and whether
+            // it was stopped on its own. Under Gate.
+            public Top[] Chosen = Array.Empty<Top>();
+            public long[] ChosenDone = Array.Empty<long>();
+            public byte[] ChosenStopped = Array.Empty<byte>();
+            // Files of something stopped on its own, let go of only once the batch ends (a lane may be writing one now).
+            public readonly List<SafeFileHandle> Retired = new();
             public int Have;
             public bool Prepared, Ended, Completing;
             public string? Folder;
@@ -1594,7 +2131,36 @@ namespace TailRemote
         }
 
         private readonly object _inGate = new();
-        private volatile In? _in;
+        // Batches arriving now, replaced (under _inGate), never changed. Several at once only from a 4.7 sender (a clipboard
+        // copy alongside a file batch); an older one stops each batch before it offers the next.
+        private volatile In[] _ins = Array.Empty<In>();
+        private const int MaxIns = 4; // more than a sender of ours ever has going: the oldest makes room
+        private readonly List<(uint Id, int First, int Count)> _earlySkips = new(); // under _inGate: Skips that came before their list
+
+        private In? FindIn(uint id)
+        {
+            foreach (var b in _ins) if (b.Id == id) return b;
+            return null;
+        }
+
+        /// <summary>A batch has ended: off the list (under _inGate).</summary>
+        private void Forget(In b)
+        {
+            _ins = _ins.Where(x => x != b).ToArray();
+            _earlySkips.RemoveAll(s => s.Id == b.Id);
+            KeepFetchesAsked();
+        }
+
+        /// <summary>
+        /// A Get files asked for may come only once the batches ahead of it on the other PC have gone (4.7 sends wait
+        /// their turn there): while anything is arriving, and for 2 minutes after, what was asked for stays asked for.
+        /// </summary>
+        private void KeepFetchesAsked()
+        {
+            lock (_askGate)
+                for (int i = 0; i < _fetches.Count; i++)
+                    if (_fetches[i].Until >= Now) _fetches[i] = (_fetches[i].Names, Now + FetchAskMs);
+        }
         private readonly Dictionary<uint, (byte Outcome, string Why)> _results = new();
         private readonly Queue<uint> _resultOrder = new();
         private (uint Id, string Text)? _note; // a Note whose list has not arrived yet (under _inGate)
@@ -1664,7 +2230,7 @@ namespace TailRemote
             lock (_inGate)
             {
                 if (_results.TryGetValue(id, out var r)) { makeAs?.Dispose(); Tell(lane, FinishedMessage(id, r.Outcome, r.Why)); return; }
-                if (_in is In cur && cur.Id == id) b = cur;
+                if (FindIn(id) is In cur) b = cur;
                 else
                 {
                     // Clipboard text and files: asked for (Get the remote PC's clipboard) or not. Not asked for, and
@@ -1687,7 +2253,9 @@ namespace TailRemote
                         if (refusal == NotAsked) ThreadPool.QueueUserWorkItem(_ => TellTurnedAway(kind == KindText ? "clipboard text" : "files for the clipboard"));
                         return;
                     }
-                    old = _in;
+                    // Several at once (a 4.7 sender's clipboard copy alongside its file batch); more than any sender of ours
+                    // ever has going means one was left behind (its Stop lost): the oldest makes room, as before 4.7.
+                    if (_ins.Length >= MaxIns) old = _ins[0];
                     // Clipboard files not asked for, on a PC that keeps its clipboard: received as Send files are, into
                     // Downloads\Kova, never onto the clipboard. Text not asked for is kept aside the same way (Complete).
                     // 4.5.1 (the owner's choice): clipboard text always replaces this clipboard, as before 4.4; only
@@ -1700,7 +2268,7 @@ namespace TailRemote
                     b.T.Peer = PeerName;
                     if (kind == KindText) b.T.What = "clipboard text";
                     if (_note is var (noteId, said) && noteId == id) { b.Note = said; _note = null; }
-                    _in = b;
+                    _ins = _ins.Append(b).ToArray();
                 }
             }
             if (makeAs != null && !ReferenceEquals(b.MakeAs, makeAs)) makeAs.Dispose(); // a later part of a batch that already has its user
@@ -1760,6 +2328,10 @@ namespace TailRemote
             if (!ready) return;
             Tell(lane, IdMessage(Ready, id));
             Progress?.Invoke(b.T);
+            // Things the sender stopped on their own before this side had the whole list.
+            List<(uint Id, int First, int Count)> early;
+            lock (_inGate) { early = _earlySkips.Where(x => x.Id == id).ToList(); _earlySkips.RemoveAll(x => x.Id == id); }
+            foreach (var x in early) ApplySkips(b, lane, x.Id, x.First, x.Count);
             bool empty;
             lock (b.Gate) { empty = b.Total == 0 && !b.Completing && !b.Ended; if (empty) b.Completing = true; }
             if (empty) Complete(b, lane);
@@ -1820,6 +2392,9 @@ namespace TailRemote
                 // Named before anything is checked, so a batch refused here still says what it was (and a
                 // Get files waiting for it can tell it is the one it asked for).
                 Firsts(b);
+                // The things chosen in it, by the names the sender gave, before any is changed to suit Windows: the
+                // sender works them out from the same list, so a Skip names the same entries on both PCs.
+                var tops = TopsOf(count, i => b.Entries[i]!.Value.Rel, i => b.Entries[i]!.Value.Length);
                 string folder;
                 if (b.Kind == KindFiles)
                     // Its own folder, even when several PCs send at the same moment.
@@ -1863,6 +2438,17 @@ namespace TailRemote
                     throw;
                 }
                 b.T.What = b.Tops.Count == 1 ? b.Tops[0] : b.Tops.Count + " items";
+                // Each shown by the name it really got here ("Photos (2)" when Photos was taken).
+                string folderNow = b.Folder!;
+                b.Chosen = tops.Select(t =>
+                {
+                    string rel = Path.GetRelativePath(folderNow, b.Finals[t.First]);
+                    int cut = rel.IndexOf(Path.DirectorySeparatorChar);
+                    return t with { Name = cut < 0 ? rel : rel[..cut] };
+                }).ToArray();
+                b.ChosenDone = new long[b.Chosen.Length];
+                b.ChosenStopped = new byte[b.Chosen.Length];
+                b.T.Items = ItemsOf(b.Chosen, b.ChosenDone, b.ChosenStopped);
             }
             b.T.Total = b.Total;
             b.Prepared = true;
@@ -2144,6 +2730,60 @@ namespace TailRemote
             }
         }
 
+        /// <summary>Is entry e part of something stopped on its own? Under b.Gate.</summary>
+        private static bool ChosenStopped(In b, int e) => b.ChosenStopped.Length > 0 && e >= 0 && b.ChosenStopped[TopOf(b.Chosen, e)] != 0;
+
+        /// <summary>
+        /// One thing chosen in a batch arriving stops (by: StoppedHere, or StoppedThere when its sender said so): what
+        /// arrived of it stays (a cut-off file as "(incomplete)"), nothing more of it is written, and the rest carries
+        /// on. Stopped here, the sender is told (an older one ignores that and sends it anyway; it is confirmed unwritten).
+        /// The last thing left stopped is the whole batch stopped. False if it had already ended.
+        /// </summary>
+        private bool StopTopIn(In b, int k, byte by, Lane? lane)
+        {
+            bool every, complete = false;
+            Top top;
+            lock (b.Gate)
+            {
+                if (b.Ended || !b.Prepared || k < 0 || k >= b.Chosen.Length || b.ChosenStopped[k] != 0) return false;
+                top = b.Chosen[k];
+                every = b.ChosenStopped.Count(s => s == 0) == 1;
+                if (!every)
+                {
+                    b.ChosenStopped[k] = by;
+                    for (int e = top.First; e < top.First + top.Count && e < b.Entries.Length; e++)
+                    {
+                        long length = b.Length(e);
+                        if (length <= 0) continue;
+                        // What has not arrived counts as done now (never as speed), so the batch can end without it.
+                        long rest = length - b.Got[e];
+                        if (rest > 0) { b.Done += rest; b.LastDone += rest; }
+                        if (b.Handles[e] is SafeFileHandle h) { b.Retired.Add(h); b.Handles[e] = null; }
+                        b.Claimed[e] = null;
+                        b.Active.Remove(e);
+                    }
+                    b.T.Done = b.Done;
+                    b.T.Items = ItemsOf(b.Chosen, b.ChosenDone, b.ChosenStopped);
+                    if (b.Done == b.Total && !b.Completing) complete = b.Completing = true;
+                }
+            }
+            if (every)
+            {
+                ThreadPool.QueueUserWorkItem(_ => EndIn(b, EndedStopped, by == StoppedHere ? "Stopped receiving " + b.T.What + "." : "The other PC stopped sending " + b.T.What + ".",
+                    "The other PC stopped receiving " + b.T.What + ".", null, tell: by == StoppedHere));
+                return true;
+            }
+            DiagLog.Write("files: " + (by == StoppedHere ? "stopped receiving " : "the other PC stopped sending ") + top.Name + " of " + b.T.What);
+            if (by == StoppedHere) TellAll(SkipMessage(b.Id, SkipByReceiver, top));
+            try { Progress?.Invoke(b.T); } catch { }
+            if (complete)
+            {
+                var l = lane is { Dead: false } ? lane : _lanes.FirstOrDefault();
+                ThreadPool.QueueUserWorkItem(_ => Complete(b, l));
+            }
+            return true;
+        }
+
         /// <summary>A piece, in the lane's own buffer (m, length bytes): written, then confirmed. Nothing may keep m.</summary>
         private void OnPiece(Lane lane, byte[] m, int length)
         {
@@ -2151,7 +2791,7 @@ namespace TailRemote
             int e = BitConverter.ToInt32(m, 5);
             long offset = BitConverter.ToInt64(m, 9);
             int n = length - 17;
-            if (_in is not In b || b.Id != id)
+            if (FindIn(id) is not In b)
             {
                 lock (_inGate)
                     Tell(lane, _results.TryGetValue(id, out var r) ? FinishedMessage(id, r.Outcome, r.Why)
@@ -2174,7 +2814,8 @@ namespace TailRemote
                     // so "length - n" cannot itself go negative in a confusing way once guarded first.
                     if ((uint)e >= (uint)b.Entries.Length || offset < 0 || n < 0 || n > b.Length(e) || offset > b.Length(e) - n) throw new InvalidDataException("a piece that does not fit");
                     // A piece sent again (its confirmation was lost with a lane): confirmed, not written twice.
-                    repeat = b.Got[e] >= b.Length(e) || !(b.Claimed[e] ??= new HashSet<long>()).Add(offset);
+                    // Part of something stopped on its own: confirmed (an older sender sends it anyway), never written.
+                    repeat = b.Got[e] >= b.Length(e) || ChosenStopped(b, e) || !(b.Claimed[e] ??= new HashSet<long>()).Add(offset);
                     h = repeat || text ? null : b.Handles[e];
                     if (text && !repeat) chunks = TextFor(b, offset, n); // its memory is made only now that its data is here
                     // Counted until this piece is written (and its file renamed, if it was the last piece): an
@@ -2200,7 +2841,9 @@ namespace TailRemote
                             lock (b.Gate)
                             {
                                 if (b.Ended) { h.Dispose(); return; }
-                                b.Handles[e] = h;
+                                // Stopped on its own meanwhile: this piece is still written (it is under way), and the
+                                // file let go of when the batch ends.
+                                if (ChosenStopped(b, e)) b.Retired.Add(h); else b.Handles[e] = h;
                             }
                         }
                     }
@@ -2214,8 +2857,10 @@ namespace TailRemote
                 {
                     if (b.Ended) return;
                     b.LastActivity = Now;
-                    if (!repeat)
+                    // Stopped on its own while this was being written: on disk, kept as incomplete, but not counted.
+                    if (!repeat && !ChosenStopped(b, e))
                     {
+                        if (b.Chosen.Length > 0) b.ChosenDone[TopOf(b.Chosen, e)] += n;
                         if ((b.Got[e] += n) == b.Length(e))
                         {
                             closing = b.Handles[e]; // looked at, then closed, outside this lock
@@ -2240,6 +2885,7 @@ namespace TailRemote
                             b.T.BytesPerSecond = b.Speed;
                             b.T.Waiting = false;
                             b.T.Files = b.Active.Take(32).Select(i => (text ? "clipboard text" : Path.GetRelativePath(b.Folder!, b.Finals[i]), b.Got[i], b.Length(i))).ToArray();
+                            if (b.Chosen.Length > 0) b.T.Items = ItemsOf(b.Chosen, b.ChosenDone, b.ChosenStopped);
                             report = true;
                         }
                         if (b.Done == b.Total && !b.Completing) complete = b.Completing = true;
@@ -2356,7 +3002,7 @@ namespace TailRemote
         }
 
         /// <summary>Everything arrived: onto the clipboard, or announced in Downloads.</summary>
-        private void Complete(In b, Lane lane)
+        private void Complete(In b, Lane? lane)
         {
             lock (b.Gate)
             {
@@ -2365,12 +3011,15 @@ namespace TailRemote
             }
             // Another lane may still be renaming the file it just finished: everything is in its place first.
             WaitForWrites(b);
-            lock (b.Gate) for (int i = 0; i < b.Handles.Length; i++) { b.Handles[i]?.Dispose(); b.Handles[i] = null; }
+            lock (b.Gate) LetGoOfFiles(b);
             int unnamed = 0;
+            bool anyStopped = b.ChosenStopped.Any(x => x != 0);
             if (b.Kind != KindText)
                 for (int i = 0; i < b.Entries.Length; i++)
-                    if (b.Length(i) > 0 && !b.Renamed[i])
+                    if (b.Length(i) > 0 && !b.Renamed[i] && !ChosenStopped(b, i))
                         try { Finish(b, i); } catch { unnamed++; } // all of it is there, but it kept its "(incomplete)" name
+            // Things stopped on their own: what arrived of them stays, cut-off files as "(incomplete)".
+            var (_, _, stoppedPart, stoppedMoved) = anyStopped ? KeepWhatArrived(b, onlyStopped: true) : (0, 0, 0, new Dictionary<string, string?>());
             var t = b.T;
             t.Files = Array.Empty<(string, long, long)>();
             t.Done = b.Done;
@@ -2385,10 +3034,11 @@ namespace TailRemote
                     paths = b.Tops.Select(x =>
                     {
                         string whole = Path.Combine(b.Folder!, x);
+                        if (stoppedMoved.TryGetValue(whole, out var moved)) return moved; // stopped: its "(incomplete)" name, or nothing
                         for (int i = 0; i < b.Entries.Length; i++)
                             if (b.Length(i) > 0 && !b.Renamed[i] && string.Equals(b.Finals[i], whole, StringComparison.OrdinalIgnoreCase)) return b.Paths[i];
                         return whole;
-                    }).ToArray();
+                    }).OfType<string>().ToArray();
                 t.Result = "The other PC sent " + t.What + Summary(b.Entries.Select(e => e!.Value)) + " to your clipboard, at " + Speed(t.BytesPerSecond) + ". Press Control V to paste.";
             }
             else if (b.Kind is KindDownloads or KindTo)
@@ -2414,16 +3064,23 @@ namespace TailRemote
                 t.Result = "The other PC sent some text without being asked, so your clipboard was left as it was. " +
                     (keptText != null ? "The text is saved in " + Where(Path.GetDirectoryName(keptText)!) + " as " + Path.GetFileName(keptText) + "." : "It could not be saved.");
             }
+            if (anyStopped)
+            {
+                t.Result += StoppedWords(b.Chosen, b.ChosenStopped, sending: false);
+                if (stoppedPart > 0) t.Result += " What had arrived of " + (b.ChosenStopped.Count(x => x != 0) == 1 ? "it" : "them") + " was kept, " + stoppedPart + (stoppedPart == 1 ? " file" : " files") + " marked incomplete.";
+                t.Items = ItemsOf(b.Chosen, b.ChosenDone, b.ChosenStopped);
+            }
             t.Result += b.Notes();
             if (unnamed > 0) t.Result +=" " + unnamed + (unnamed == 1 ? " file arrived whole but could not be given its own name, so it is still" : " files arrived whole but could not be given their own names, so they are still") + " called incomplete.";
             Volatile.Write(ref t.Finished, true); // last, as in Run: never seen finished without its result
             lock (_inGate)
             {
-                if (_in == b) _in = null;
+                Forget(b);
                 Remember(b.Id, EndedWell, "");
             }
             StagingEnded(b);
-            Tell(lane, FinishedMessage(b.Id, EndedWell, ""));
+            var done = FinishedMessage(b.Id, EndedWell, "");
+            if (lane is { Dead: false }) Tell(lane, done); else foreach (var l in _lanes) Tell(l, done); // none up: the sender asks (Ask)
             DiagLog.Write("files: " + t.Result);
             Progress?.Invoke(t);
             if (paths != null) FilesReceived?.Invoke(paths);
@@ -2577,7 +3234,7 @@ namespace TailRemote
             WaitForWrites(b);
             lock (b.Gate)
             {
-                for (int i = 0; i < b.Handles.Length; i++) { b.Handles[i]?.Dispose(); b.Handles[i] = null; }
+                LetGoOfFiles(b);
                 b.Text = null;
             }
             // Nothing that arrived is thrown away (Conner): finished files stay as they are, a file cut
@@ -2591,7 +3248,7 @@ namespace TailRemote
             if (b.Prepared) why += b.Notes();
             lock (_inGate)
             {
-                if (_in == b) _in = null;
+                Forget(b);
                 Remember(b.Id, outcome, whyThere);
             }
             if (tell)
@@ -2603,6 +3260,7 @@ namespace TailRemote
             DiagLog.Write("files: " + why);
             var t = b.T;
             t.Files = Array.Empty<(string, long, long)>();
+            lock (b.Gate) if (b.Chosen.Length > 0) t.Items = ItemsOf(b.Chosen, b.ChosenDone, b.ChosenStopped);
             t.Failed = true;
             t.Cancelled = outcome == EndedStopped;
             t.Result = why;
@@ -2637,7 +3295,7 @@ namespace TailRemote
         /// where each file not whole now is (by the name it would have had: its "(incomplete)" name, or
         /// null if it went). Called once no lane is writing any more (WaitForWrites).
         /// </summary>
-        private static (int Whole, int Files, int Part, Dictionary<string, string?> Moved) KeepWhatArrived(In b)
+        private static (int Whole, int Files, int Part, Dictionary<string, string?> Moved) KeepWhatArrived(In b, bool onlyStopped = false)
         {
             var moved = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
             if (b.Folder == null || b.Kind == KindText || !b.Prepared) return (0, 0, 0, moved);
@@ -2646,6 +3304,7 @@ namespace TailRemote
             {
                 long length = b.Length(i), got = b.Got[i];
                 if (length < 0) continue; // a folder
+                if (onlyStopped && !ChosenStopped(b, i)) continue; // a batch that finished: only what was stopped on its own
                 files++;
                 if (length == 0 || b.Renamed[i]) { whole++; continue; }
                 string partial = b.Paths[i], final = b.Finals[i];
@@ -2665,6 +3324,14 @@ namespace TailRemote
             return (whole, files, part, moved);
         }
 
+        /// <summary>The batch's open files, those of things stopped on their own included, let go of (under b.Gate, once nothing is writing).</summary>
+        private static void LetGoOfFiles(In b)
+        {
+            for (int i = 0; i < b.Handles.Length; i++) { b.Handles[i]?.Dispose(); b.Handles[i] = null; }
+            foreach (var h in b.Retired) h.Dispose();
+            b.Retired.Clear();
+        }
+
         /// <summary>A folder as the Files line says it: "Downloads, Kova" for the usual one.</summary>
         private static string Where(string folder) =>
             string.Equals(Path.GetFullPath(folder).TrimEnd('\\'), Path.GetFullPath(Path.Combine(MyDownloads.Value, "Kova")).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)
@@ -2675,7 +3342,7 @@ namespace TailRemote
         {
             bool replaced = outcome == EndedReplaced;
             if (outcome != EndedBadly) outcome = EndedStopped; // a stop never means it arrived
-            if (_in is In b && b.Id == id)
+            if (FindIn(id) is In b)
                 EndIn(b, outcome, why.Length > 0 ? Theirs(why) : "The other PC stopped sending " + b.T.What + ".", outcome == EndedStopped ? "Stopped." : why, null, tell: false, replaced: replaced);
             else lock (_inGate) Remember(id, outcome, outcome == EndedStopped || why.Length == 0 ? "Stopped." : why);
         }
@@ -2685,7 +3352,7 @@ namespace TailRemote
             lock (_inGate)
             {
                 if (_results.TryGetValue(id, out var r)) Tell(lane, FinishedMessage(id, r.Outcome, r.Why));
-                else if (_in?.Id != id) Tell(lane, FinishedMessage(id, EndedBadly, "The other PC no longer had this transfer. Send it again."));
+                else if (FindIn(id) == null) Tell(lane, FinishedMessage(id, EndedBadly, "The other PC no longer had this transfer. Send it again."));
             }
         }
 

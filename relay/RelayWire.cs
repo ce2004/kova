@@ -31,6 +31,13 @@ namespace KovaRelayWire
     ///                      text length (1) + ASCII text (what the relay sees: for the host's own
     ///                      counting of wrong passwords, and for showing who connected).
     ///       both ways      KeepAlive 'K', empty, every KeepAliveMs; a line silent for DeadAfterMs is dropped.
+    ///       4.7 additions, both ignored by 4.6 (it reads and drops any frame body, and any frame type it does not know):
+    ///       host -> relay  KeepAlive with body { ProbeAsk } every ProbeMs: "are you there?"
+    ///       relay -> host  KeepAlive with body { ProbeAnswer } at once in reply. Once each side has seen the other
+    ///                      take part, it treats ProbedDeadAfterMs of silence as a dead line (a 4.6 peer keeps the
+    ///                      older, slower timing), so a line a router silently dropped is noticed in seconds.
+    ///       relay -> host  Refused { Replaced } just before the relay closes a control line because the same host
+    ///                      key registered the name again on a newer line (another copy of Kova with this identity).
     ///   Connect (a controlling PC, 'C'): body = name length (1), name. The relay asks the host (Incoming)
     ///     and waits up to PairWaitMs for it to dial back. Ok body: the 8-byte pairing id (for UDP). From
     ///     then on the connection is the host's: the host speaks first, exactly as if connected directly.
@@ -67,8 +74,15 @@ namespace KovaRelayWire
         public const byte Udp0 = 0x4B, Udp1 = 0x52;
         public const int MaxUdpPayload = 1500;
 
-        public const int KeepAliveMs = 15_000;
-        public const int DeadAfterMs = 50_000;
+        public const int KeepAliveMs = 15_000;   // what a 4.6 relay and host send; the oldest peer a newer one must suit
+        public const int DeadAfterMs = 50_000;   // what a 4.6 relay and host allow before dropping a silent line
+
+        // 4.7: quicker dead-line detection, used only once the other side has shown it understands it.
+        public const byte ProbeAsk = 1, ProbeAnswer = 2;   // the body byte of a KeepAlive probe and its answer
+        public const int ProbeMs = 5_000;                 // a 4.7 host asks this often
+        public const int ProbedDeadAfterMs = 15_000;      // three unanswered probes: the line is dead
+        public const int RelayKeepAliveMs = 10_000;       // a 4.7 relay's own keep-alive to every host line
+        public const int SilentDeadAfterMs = 35_000;      // a peer that does not probe: two missed 15 s keep-alives and some slack
         public const int PairWaitMs = 10_000;
         public const int RequestDeadlineMs = 10_000;
 
@@ -83,6 +97,7 @@ namespace KovaRelayWire
             HostDidNotAnswer = 6,// the host did not dial back in time
             BadSignature = 7,    // the host's signature did not check out
             TooManyNames = 8,    // the relay holds as many names as it will
+            Replaced = 9,        // 4.7, on a control line: the same host key registered again on a newer line
         }
 
         /// <summary>1 to 40 characters: letters, digits, dash, underscore, dot. Compared without regard to case.</summary>

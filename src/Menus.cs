@@ -316,7 +316,7 @@ namespace TailRemote
             var label = new Label
             {
                 Text = "Restart the remote PC now? Programs there close as in a normal restart, and may ask to save first." + Environment.NewLine + Environment.NewLine +
-                       "Kova reconnects when it is back. That only happens if the remote PC starts hosting by itself: turn on Start hosting when Windows starts there, or the service.",
+                       "Kova reconnects when it is back. That only happens if the remote PC starts hosting by itself: in its Settings, turn on Start hosting when Windows starts, or Run as a Windows service.",
                 AutoSize = true,
                 MaximumSize = new System.Drawing.Size(360, 0),
             };

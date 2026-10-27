@@ -16,12 +16,12 @@ Kova has two step-by-step windows, both in the File menu. Each asks one question
 
 To set up the PC you want to control:
 1. Run Kova on that PC and choose File, Host this PC (Control H).
-2. Choose how other computers will connect:
-   - Through a Kova Relay. Recommended when the PC is behind a router or firewall. No ports are opened on the PC.
-   - Directly, using the PC's network address. Kova opens a port in Windows Firewall.
-   - Both.
+2. Choose how other computers should reach it:
+   - Through a Kova Relay. Works from anywhere, and nothing needs opening on the PC or your router.
+   - Directly, by the PC's own address. For computers on the same network or a VPN. Kova opens a port in Windows Firewall.
+   - Both ways: through the relay from anywhere, and directly from the same network or a VPN.
 3. Enter the port or the relay address, then the password. A listen-only password is optional.
-4. Kova checks that the relay can be reached, shows what other computers need to enter, and starts hosting.
+4. Kova checks that the relay can be reached, then the last page says exactly what other computers enter. Its Copy the relay address and Copy this PC's address buttons put that address on the clipboard. Start hosting starts.
 
 To connect from your own PC:
 1. Choose File, Connect to a PC (Control N).
@@ -32,6 +32,7 @@ To connect from your own PC:
 Once connected:
 - Control Shift Enter, in the Kova window, sends every key to the remote PC, including the Windows key, Alt Tab and your NVDA key. The mouse goes to the remote PC too. Press Control Shift Enter again to return to your own PC.
 - File, Disconnect ends the connection. On the host, File, Stop hosting ends hosting.
+- File, Connect to another PC connects to one more PC. The one you were using stays connected in the background, as with Switch to PC.
 
 
 Saved PCs
@@ -45,19 +46,20 @@ Menus
 
 The Kova window is intentionally empty: everything is in the menu bar. Press Alt, then use the arrow keys. On a setting, Enter turns it on or off, and the menu stays open so you can change several settings in a row. Settings with several choices, such as Audio quality, are submenus whose name includes the current choice.
 
+The File and Settings menus only show what you can use right now, so they change as you connect and host.
+
 File
-- Connect to a PC, Host this PC, and Disconnect or Stop hosting while one is active.
-- Switch to PC and Wake a saved PC and connect.
-- Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC to this PC's version, Install the Kova Helper on the remote PC, and the streaming status.
-- Measure this PC's internet speed, Measure the remote PC's internet speed, Copy this PC's address, Check the relay, and Exit.
+- When this PC is neither hosting nor connected: Connect to a PC, Host this PC, Wake a saved PC and connect (once you have saved PCs), and Exit.
+- While this PC hosts: Stop hosting, Measure this PC's internet speed, and Exit. While the Kova service hosts it, there is also Change how this PC is hosted, and Stop hosting removes the service.
+- While connected: Disconnect, Connect to another PC, Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC, Install the Kova Helper on the remote PC, the streaming status, Measure this PC's internet speed, Measure the remote PC's internet speed, and Exit. On a listen-only connection, the items that need control are not shown.
 
 Clipboard
 - The current file transfer, the history of transfers, Send the clipboard (Control B), Send files (Control I), Send a folder and its contents (Control T), Get files from the remote PC (Control G), Get the remote PC's clipboard (Control Shift B), Stop the file transfer, the received files folder, and Accept text and files sent by the remote PC without asking.
 
 Settings
-- Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Capture audio from, Remote NVDA speech, Microphone to use, Play the controlling PC's microphone into, Catch up by speeding up audio instead of skipping, and Notification sounds.
-- Start hosting when Windows starts, Run as a Windows service, Port editor, Set up audio device, Remove audio device, and Install the Kova Helper NVDA add-on.
-- Back up settings to a file, Restore settings from a backup, and Diagnostic logging.
+- For controlling another PC, shown unless this PC hosts: Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Remote NVDA speech, Microphone to use, Catch up by speeding up audio instead of skipping, and Notification sounds.
+- For hosting, shown while this PC hosts or after it last hosted: Capture audio from, Play the controlling PC's microphone into, Start hosting when Windows starts (not while the Kova service is installed, which already starts with Windows), Run as a Windows service, Apply settings to the Kova service (while it is installed), Port editor, Set up audio device or Remove audio device, and Install the Kova Helper NVDA add-on.
+- Always: Back up settings to a file, Restore settings from a backup (while nothing is connected or hosted in this window), and Diagnostic logging.
 
 About
 - Check for updates (Control U), View the changelog (Shift F1), Read the guide (F1), Keyboard shortcuts, About Kova, Licences and credits, Open the Kova website, Report a problem on GitHub, and Open the log file. Long text opens as a list: the arrow keys move a line at a time, Control Up and Control Down move between sections, and Control C copies a line.
@@ -81,15 +83,17 @@ Remote NVDA speech
 - This requires the Kova Helper NVDA add-on on the remote PC. Install it there with Settings, Install the Kova Helper NVDA add-on, or from your PC with File, Install the Kova Helper on the remote PC. The add-on only communicates with Kova on the same PC and sends nothing over the internet by itself. NVDA restarts once to complete the installation, and Kova keeps the add-on up to date.
 
 Clipboard and files
-- Send the clipboard (Control B) sends your clipboard to the other PC: text replaces the other PC's clipboard, and copied files go to its received files folder. Get the remote PC's clipboard (Control Shift B) puts the remote clipboard on yours.
-- Send files (Control I) and Send a folder and its contents (Control T) send files to the other PC's received files folder, which is Downloads, Kova unless you choose another. Existing files are never overwritten.
+- Send the clipboard (Control B, or Control Shift Alt C) sends your clipboard to the other PC: text replaces the other PC's clipboard, and copied files go to its received files folder. Control Shift Alt C works even while you are controlling the remote PC, when every other key goes there. Get the remote PC's clipboard (Control Shift B) puts the remote clipboard on yours.
+- Send files (Control I) and Send folders and their contents (Control T) send files to the other PC's received files folder, which is Downloads, Kova unless you choose another. In the folder window, pick several folders with Shift or Control and the arrow keys. Existing files are never overwritten.
+- A new send waits its turn while another is going, and starts as soon as it is done. Only a new clipboard copy replaces an older one.
+- Clipboard, Stop just one transfer (Control Shift T) lists every transfer to and from every PC, with the files and folders in each. Delete, or Alt S, stops only the line you are on and the rest carry on; Alt A stops everything; F5 says the line's progress; Escape closes it. Stopping one part of a transfer you send needs Kova 4.7 on the other PC.
 - Get files from the remote PC (Control G) lists the remote PC's folders and drives. Enter opens a folder, Space selects files and folders, and Backspace goes up. Choose Get the checked files and folders (Alt G) to copy them all at once.
 - Clipboard, Files shows what is being sent or received, the progress, speed and time remaining. Transfers interrupted by a dropped connection continue automatically when you reconnect, and whatever arrived is always kept.
 
 Remote PC tools
 - Remote PC info (Control Shift I) shows the remote PC's name, Windows version, signed-in user, uptime, processor, memory, battery, free disk space, Kova version and current connections.
 - Restart remote PC and reconnect restarts the remote PC and reconnects when it is back.
-- Update the remote PC to this PC's version updates Kova on the remote PC, including the Kova service.
+- Update the remote PC updates Kova on the remote PC to the newest version, including the Kova service. The menu item says which version each PC has.
 - The internet speed tests report download and upload speed, latency and jitter after about 20 seconds. The audio may break up while a test runs.
 - Announce remote PC health alerts reports when the remote PC switches to or from battery power, when its battery is low, when its system drive is nearly full, when its processor has been busy for a full minute, and when it is nearly out of memory.
 
@@ -105,7 +109,8 @@ Running the host as a Windows service
 - In Settings, turn on Run as a Windows service. Windows asks for administrator permission once.
 - The service starts with Windows, before anyone signs in. You can use the sign-in screen, the lock screen and administrator prompts, and Control Alt End sends Control Alt Delete.
 - Anyone who knows the Kova password has this access too, so use a strong password.
-- Host this PC applies its settings to the service while the service is installed.
+- While the service hosts, File, Change how this PC is hosted gives the service new passwords or a new way to be reached, and Settings, Apply settings to the Kova service gives it settings changed in the Settings menu, such as Capture audio from or Diagnostic logging.
+- File, Stop hosting removes the service, after asking first.
 - The service only runs a copy of Kova that only administrators can change. If you turn it on from a folder of your own, Kova installs a copy in Program Files, Kova for the service.
 - When you update Kova with Check for updates, the service updates to the same version straight away.
 - Turn off Run as a Windows service to remove it completely.
@@ -137,7 +142,7 @@ Running Kova Relay
 Updates
 
 - About, Check for updates downloads the newest version from github.com/ce2004/kova, verifies that it is signed by Kova's developers and that the download matches exactly, then replaces Kova and restarts it. A host keeps hosting and a connected PC reconnects.
-- To update a remote PC, use File, Update the remote PC to this PC's version. Kova tells you when the remote PC is updating and when it is back.
+- To update a remote PC, use File, Update the remote PC. Kova tells you when the remote PC is updating and when it is back.
 - If a connection drops for any reason, Kova tries again every second until it reconnects or you choose Disconnect.
 
 

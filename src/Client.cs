@@ -588,7 +588,7 @@ namespace TailRemote
         {
             var files = _files;
             if (_closed || ListenOnly || files == null) return;
-            ThreadPool.QueueUserWorkItem(_ => { try { files.SendFiles(paths, toClipboard: true); } catch { } });
+            Sending(() => files.SendFiles(paths, toClipboard: true));
         }
 
         /// <summary>Send files: into the host's Downloads\TailRemote. Never waits.</summary>
@@ -596,7 +596,23 @@ namespace TailRemote
         {
             var files = _files;
             if (_closed || ListenOnly || files == null) return;
-            ThreadPool.QueueUserWorkItem(_ => { try { files.SendFiles(paths, toClipboard: false); } catch { } });
+            Sending(() => files.SendFiles(paths, toClipboard: false));
+        }
+
+        /// <summary>
+        /// A send of files on a thread of its own: it holds that thread until it has ended, waiting its turn behind
+        /// the others first (4.7), so a dozen sends queued up must not tie up the shared pool the rest of Kova runs on.
+        /// </summary>
+        private static void Sending(Action send) =>
+            new Thread(() => { try { send(); } catch { } }) { IsBackground = true, Name = "Kova send files" }.Start();
+
+        /// <summary>
+        /// The name this PC is known by here (a saved PC's name), shown with each of its transfers so several PCs' transfers
+        /// can be told apart. Unset, the address it was reached at.
+        /// </summary>
+        public void NameTransfers(string name)
+        {
+            if (_files is FileChannel f && name.Trim().Length > 0) f.PeerName = name.Trim();
         }
 
         /// <summary>Whether the host takes files into a folder chosen here (Get files' Send files here).</summary>
@@ -610,7 +626,7 @@ namespace TailRemote
         {
             var files = _files;
             if (_closed || !CanSendTo || files == null) return false;
-            ThreadPool.QueueUserWorkItem(_ => { try { files.SendFiles(paths, toClipboard: false, into: folder); } catch { } });
+            Sending(() => files.SendFiles(paths, toClipboard: false, into: folder));
             return true;
         }
 
@@ -883,6 +899,7 @@ namespace TailRemote
         /// Kova Helper add-on: without it, NVDA's speech comes only through the sound, so the sound carries on.
         /// </summary>
         private bool SoundPaused => _muted || (_soundOff && _helperThere != false);
+        internal bool SoundPausedForTest => SoundPaused;
 
         private void TellPause(bool was)
         {
@@ -893,6 +910,8 @@ namespace TailRemote
         // Whether the host said the Kova Helper add-on is talking to it (null: not said yet).
         private volatile int _helperState = -1;
         private bool? _helperThere => _helperState < 0 ? null : _helperState == 1;
+        private int _helperPlain = -1; // the last state other than a secure screen (network thread only)
+        private long _secureSaidAt = long.MinValue / 2; // when the secure screen was last said (network thread only)
 
         /// <summary>File, Install the Kova Helper on the remote PC: the host installs it into its NVDA and says how it went (NvdaNote).</summary>
         public bool InstallNvdaHelperThere()
@@ -1126,7 +1145,7 @@ namespace TailRemote
             // if a connection breaks on the way.
             var files = _files;
             if (_closed || ListenOnly || files == null) return;
-            ThreadPool.QueueUserWorkItem(_ => { try { files.SendText(text); } catch { } });
+            Sending(() => files.SendText(text));
         }
 
         private void TcpLoop()
@@ -1171,12 +1190,27 @@ namespace TailRemote
                     }
                     else if (m.Length == 2 && m[0] == Protocol.NvdaAvailable)
                     {
-                        bool there = m[1] == 1;
+                        // 1: the add-on sends NVDA as text. 0: no add-on. NvdaSecureScreen: a sign-in, lock or UAC screen, whose
+                        // NVDA runs without add-ons. Anything but 1 means the sound carries NVDA, even in text-only mode.
+                        int state = m[1] == 1 ? 1 : m[1] == Protocol.NvdaSecureScreen ? Protocol.NvdaSecureScreen : 0;
                         bool paused = SoundPaused;
-                        if (Interlocked.Exchange(ref _helperState, there ? 1 : 0) != (there ? 1 : 0))
+                        int was = Interlocked.Exchange(ref _helperState, state);
+                        if (was != state)
                         {
-                            TellPause(paused); // without the add-on, the sound carries NVDA's speech even in text-only mode
-                            if (_nvdaText) NvdaHelperThere?.Invoke(there);
+                            TellPause(paused);
+                            if (state == Protocol.NvdaSecureScreen)
+                            {
+                                // Said once as the sound comes back by itself; nothing changes for a PC already hearing the sound.
+                                // Never twice within 10 seconds (a UAC prompt right after unlocking is one moment to the person listening).
+                                long nowMs = Environment.TickCount64;
+                                if (was != 0 && _nvdaText && _soundOff && nowMs - _secureSaidAt >= 10_000)
+                                {
+                                    _secureSaidAt = nowMs;
+                                    NvdaNote?.Invoke("The remote PC is showing a secure screen, so you hear its sound.");
+                                }
+                            }
+                            else if (_nvdaText && (_helperPlain < 0 || (state == 1) != (_helperPlain == 1))) NvdaHelperThere?.Invoke(state == 1); // back from a secure screen as before: nothing to say
+                            if (state != Protocol.NvdaSecureScreen) _helperPlain = state;
                         }
                     }
                     else if (m.Length >= 2 && m[0] == Protocol.NvdaNote)

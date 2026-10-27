@@ -703,6 +703,339 @@ namespace TailRemote
                         : "FAIL: " + got.Count + " of 10 got it; the host said " + hostSaid.Count + " results, wrong: " + string.Join(" | ", wrong);
                 });
 
+                // 4.7: Send files and folders wait their turn instead of replacing what is going; one transfer, or one of
+                // the things chosen in one, can be stopped alone (FileChannel.StopOne); a clipboard copy goes alongside a long
+                // file batch; and every PC's transfers go on whichever PC is in front.
+                Scenario("Send files while another is still going: the newer one waits its turn, then both arrive (nothing replaced)", 120, () =>
+                {
+                    string big = Big("queue-first.bin", 64), small = Big("queue-second.bin", 2);
+                    bool sawWaiting = false;
+                    var ends = new System.Collections.Concurrent.ConcurrentQueue<FileChannel.Transfer>();
+                    Action<FileChannel.Transfer> note = t =>
+                    {
+                        if (!t.Outgoing) return;
+                        if (t.What == "queue-second.bin" && t.Queued && !t.Finished) sawWaiting = true;
+                        if (t.Finished && t.What.StartsWith("queue-")) ends.Enqueue(t);
+                    };
+                    ctrl.TransferProgress += note;
+                    var rate = ctrl.Files!.Rate;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 16 << 20; // 4 seconds for the first: surely still going when the second is sent
+                        var first = Task.Run(() => ctrl.Files!.SendFiles(new[] { big }, toClipboard: false));
+                        Thread.Sleep(500);
+                        var second = Task.Run(() => ctrl.Files!.SendFiles(new[] { small }, toClipboard: false));
+                        Task.WaitAll(new[] { first, second }, 90_000);
+                        WaitFor(() => ends.Count >= 2, 5000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.TransferProgress -= note; }
+                    var order = ends.Select(t => t.What + (t.Failed ? " failed: " + t.Result : "")).ToList();
+                    bool both = Same(big, Path.Combine(FileChannel.Downloads, "queue-first.bin")) && Same(small, Path.Combine(FileChannel.Downloads, "queue-second.bin"));
+                    bool inTurn = order.Count == 2 && order[0] == "queue-first.bin" && order[1] == "queue-second.bin";
+                    return both && inTurn && sawWaiting ? "the second waited its turn (said so), then both arrived exactly, in the order sent"
+                        : "FAIL: both arrived " + both + ", ended in order " + string.Join(", ", order) + ", the second said it was waiting " + sawWaiting;
+                });
+
+                // Three folders of two 8 MB files each, sent in one go at 8 MB/s: about 6 seconds, so one can be stopped part-way.
+                string[] ThreeFolders(string tag)
+                {
+                    var made = new List<string>();
+                    foreach (string n in new[] { "Keep A " + tag, "Stop B " + tag, "Keep C " + tag })
+                    {
+                        string d = Path.Combine(Root, "src", "three", n);
+                        Directory.CreateDirectory(d);
+                        for (int i = 1; i <= 2; i++) File.Move(Big(n + "-" + i + ".bin", 8), Path.Combine(d, i + ".bin"), true);
+                        made.Add(d);
+                    }
+                    return made.ToArray();
+                }
+
+                // What arrived of three folders with the middle one stopped: the others whole, and nothing in the stopped
+                // one that looks whole but is not its source. Null if all is well, else what is wrong.
+                string? CheckThree(string[] folders)
+                {
+                    foreach (int k in new[] { 0, 2 })
+                        foreach (string f in Directory.GetFiles(folders[k]))
+                        {
+                            string there = Path.Combine(FileChannel.Downloads, Path.GetFileName(folders[k]), Path.GetFileName(f));
+                            if (!File.Exists(there) || !Same(f, there)) return Path.GetFileName(folders[k]) + " did not arrive whole";
+                        }
+                    string stopped = Path.Combine(FileChannel.Downloads, Path.GetFileName(folders[1]));
+                    if (Directory.Exists(stopped))
+                        foreach (string f in Directory.GetFiles(stopped))
+                        {
+                            if (Path.GetFileName(f).Contains("(incomplete")) continue;
+                            string source = Path.Combine(folders[1], Path.GetFileName(f));
+                            if (!File.Exists(source) || !Same(source, f)) return Path.GetFileName(f) + " in the stopped folder looks whole but is not its source";
+                        }
+                    return null;
+                }
+
+                Scenario("several folders in one send, one of them stopped by the sending PC: the other two arrive whole, both PCs say which was stopped", 120, () =>
+                {
+                    if (!ctrl.Files!.TestPeerCanAll) return "FAIL: the host never said it can take several batches and stop one part (Can)";
+                    string tag = "s" + Guid.NewGuid().ToString("N")[..4];
+                    var folders = ThreeFolders(tag);
+                    FileChannel.Transfer? going = null, sent = null, got = null;
+                    Action<FileChannel.Transfer> onCtrl = t => { if (t.Outgoing && t.What == "3 items") { if (t.Finished) sent = t; else if (t.Done > 0) going = t; } };
+                    Action<FileChannel.Transfer> onHost = t => { if (!t.Outgoing && t.Finished && t.What == "3 items") got = t; };
+                    ctrl.TransferProgress += onCtrl;
+                    host.TransferProgress += onHost;
+                    var rate = ctrl.Files!.Rate;
+                    string said;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 8 << 20;
+                        var send = Task.Run(() => ctrl.Files!.SendFiles(folders, toClipboard: false));
+                        if (!WaitFor(() => going != null || sent != null, 20_000) || going == null) return "FAIL: it never got going (" + sent?.Result + ")";
+                        said = FileChannel.StopOne(going.Serial, 1);
+                        send.Wait(60_000);
+                        WaitFor(() => got != null, 10_000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.TransferProgress -= onCtrl; host.TransferProgress -= onHost; }
+                    string? wrong = CheckThree(folders);
+                    bool told = sent?.Failed == false && sent.Result!.Contains("You stopped Stop B") && got?.Failed == false && got.Result!.Contains("The other PC stopped Stop B");
+                    bool marked = sent?.Items.Count == 3 && sent.Items[1].Stopped && !sent.Items[0].Stopped && !sent.Items[2].Stopped;
+                    return wrong == null && told && marked ? "said \"" + said + "\"; the other two arrived whole; sender: " + sent!.Result + " Receiver: " + got!.Result
+                        : "FAIL: " + (wrong ?? "files fine") + "; marked stopped " + marked + "; sender said " + sent?.Result + "; receiver said " + got?.Result;
+                });
+
+                Scenario("several folders in one send, one of them stopped by the receiving PC: the sender stops sending it, the rest arrives", 120, () =>
+                {
+                    string tag = "r" + Guid.NewGuid().ToString("N")[..4];
+                    var folders = ThreeFolders(tag);
+                    FileChannel.Transfer? going = null, sent = null, got = null;
+                    Action<FileChannel.Transfer> onCtrl = t => { if (t.Outgoing && t.Finished && t.What == "3 items") sent = t; };
+                    Action<FileChannel.Transfer> onHost = t => { if (!t.Outgoing && t.What == "3 items") { if (t.Finished) got = t; else if (t.Done > 0) going = t; } };
+                    ctrl.TransferProgress += onCtrl;
+                    host.TransferProgress += onHost;
+                    var rate = ctrl.Files!.Rate;
+                    string said;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 8 << 20;
+                        var send = Task.Run(() => ctrl.Files!.SendFiles(folders, toClipboard: false));
+                        if (!WaitFor(() => going != null || got != null, 20_000) || going == null) return "FAIL: it never got going (" + got?.Result + ")";
+                        said = FileChannel.StopOne(going.Serial, 1);
+                        send.Wait(60_000);
+                        WaitFor(() => sent != null && got != null, 10_000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.TransferProgress -= onCtrl; host.TransferProgress -= onHost; }
+                    string? wrong = CheckThree(folders);
+                    // The sender stopped sending it too: well under the 48 MB of all three went (each folder is 16 MB).
+                    bool fewer = sent != null && sent.Items.Count == 3 && sent.Items[1].Stopped && sent.Items[1].Done < sent.Items[1].Total;
+                    bool told = got?.Failed == false && got.Result!.Contains("You stopped Stop B") && sent?.Failed == false && sent.Result!.Contains("The other PC stopped Stop B");
+                    return wrong == null && told && fewer ? "said \"" + said + "\"; the other two arrived whole, and the sender stopped sending it (" + FileChannel.Size(sent!.Items[1].Done) + " of it went)"
+                        : "FAIL: " + (wrong ?? "files fine") + "; sender stopped sending it " + fewer + "; sender said " + sent?.Result + "; receiver said " + got?.Result;
+                });
+
+                Scenario("three sends to one PC: the waiting one stopped, then the one going stopped; the third still arrives", 120, () =>
+                {
+                    string x = Big("stop-going.bin", 48), y = Big("stop-waiting.bin", 4), z = Big("still-arrives.bin", 4);
+                    var seen = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                    var ends = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                    Action<FileChannel.Transfer> note = t => { if (t.Outgoing) { seen[t.What] = t; if (t.Finished) ends[t.What] = t; } };
+                    ctrl.TransferProgress += note;
+                    var rate = ctrl.Files!.Rate;
+                    string saidY, saidX;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 8 << 20;
+                        var sends = new[] { x, y, z }.Select(p => { var s = Task.Run(() => ctrl.Files!.SendFiles(new[] { p }, toClipboard: false)); Thread.Sleep(300); return s; }).ToArray();
+                        if (!WaitFor(() => seen.TryGetValue("stop-waiting.bin", out var w) && w.Queued && seen.TryGetValue("stop-going.bin", out var g) && g.Done > 0, 15_000))
+                            return "FAIL: never saw one going and one waiting";
+                        saidY = FileChannel.StopOne(seen["stop-waiting.bin"].Serial);
+                        saidX = FileChannel.StopOne(seen["stop-going.bin"].Serial);
+                        Task.WaitAll(sends, 60_000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.TransferProgress -= note; }
+                    bool yOk = ends.TryGetValue("stop-waiting.bin", out var ye) && ye.Cancelled && !File.Exists(Path.Combine(FileChannel.Downloads, "stop-waiting.bin"));
+                    bool xOk = ends.TryGetValue("stop-going.bin", out var xe) && xe.Cancelled;
+                    bool zOk = ends.TryGetValue("still-arrives.bin", out var ze) && !ze.Failed && Same(z, Path.Combine(FileChannel.Downloads, "still-arrives.bin"));
+                    return yOk && xOk && zOk ? "\"" + saidY + "\", then \"" + saidX + "\"; the third arrived exactly"
+                        : "FAIL: waiting one stopped " + yOk + " (" + ye?.Result + "), going one stopped " + xOk + " (" + xe?.Result + "), third arrived " + zOk + " (" + ze?.Result + ")";
+                });
+
+                Scenario("clipboard text while a long file send goes: it arrives at once, alongside (both PCs 4.7)", 60, () =>
+                {
+                    string big = Big("alongside.bin", 64);
+                    FileChannel.Transfer? going = null, end = null;
+                    Action<FileChannel.Transfer> note = t => { if (t.Outgoing && t.What == "alongside.bin") { if (t.Finished) end = t; else if (t.Done > 0) going = t; } };
+                    string? got = null;
+                    Action<string> took = s => got = s;
+                    ctrl.TransferProgress += note;
+                    host.ClipboardReceived += took;
+                    var rate = ctrl.Files!.Rate;
+                    bool before;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 4 << 20; // 16 seconds of file
+                        var send = Task.Run(() => ctrl.Files!.SendFiles(new[] { big }, toClipboard: false));
+                        if (!WaitFor(() => going != null, 15_000)) return "FAIL: the file never got going";
+                        ctrl.SendClipboard("alongside the file");
+                        WaitFor(() => got != null, 5000);
+                        before = got != null && end == null;
+                        FileChannel.StopOne(going!.Serial); // no need to wait the rest out
+                        send.Wait(20_000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.TransferProgress -= note; host.ClipboardReceived -= took; }
+                    return before && got == "alongside the file" ? "the text arrived while the file was still going" : "FAIL: text " + (got ?? "never came") + ", file ended first " + (end != null);
+                });
+
+                Scenario("two PCs at once, one of them in the background: each gets its file, and stopping one leaves the other going", 120, () =>
+                {
+                    // A second host of its own, as a second remote PC; the first connection is "in the background" as
+                    // MainForm parks it (muted, sound at its lowest), and still sends.
+                    var other = new Host(Port + 9, Password, ListenPassword, _ => { });
+                    var rate = ctrl.Files!.Rate;
+                    int step = ctrl.LockedStep;
+                    try
+                    {
+                        using var c2 = Client.Connect("127.0.0.1", Port + 9, Password, new Player(Player.NoDevice, _ => { }), _ => { });
+                        WaitFor(() => c2.Files?.TestLanes > 0, 10_000);
+                        c2.NameTransfers("Second PC");
+                        ctrl.NameTransfers("First PC");
+                        ctrl.Muted = true;
+                        ctrl.LockedStep = Protocol.OpusSteps.Length - 1;
+                        string toFirst = Big("to-first-pc.bin", 48), toSecond = Big("to-second-pc.bin", 16), toFirstAfter = Big("to-first-pc-after.bin", 2);
+                        var ends = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                        FileChannel.Transfer? firstGoing = null;
+                        ctrl.TransferProgress += t => { if (t.Outgoing && t.What == "to-first-pc.bin" && !t.Finished && t.Done > 0) firstGoing = t; if (t.Finished) ends[t.What] = t; };
+                        c2.TransferProgress += t => { if (t.Finished) ends[t.What] = t; };
+                        ctrl.Files!.Rate = () => 8 << 20;
+                        var s1 = Task.Run(() => ctrl.Files!.SendFiles(new[] { toFirst }, toClipboard: false));
+                        var s2 = Task.Run(() => c2.Files!.SendFiles(new[] { toSecond }, toClipboard: false));
+                        if (!WaitFor(() => firstGoing != null, 15_000)) return "FAIL: the send to the PC in the background never got going";
+                        string peer = firstGoing!.Peer;
+                        FileChannel.StopOne(firstGoing.Serial);
+                        Task.WaitAll(new[] { s1, s2 }, 60_000);
+                        // And the PC in the background still takes a new send after one was stopped.
+                        ctrl.Files!.SendFiles(new[] { toFirstAfter }, toClipboard: false);
+                        bool firstStopped = ends.TryGetValue("to-first-pc.bin", out var f1) && f1.Cancelled;
+                        bool secondOk = ends.TryGetValue("to-second-pc.bin", out var f2) && !f2.Failed && Same(toSecond, Path.Combine(FileChannel.Downloads, "to-second-pc.bin"));
+                        bool afterOk = ends.TryGetValue("to-first-pc-after.bin", out var f3) && !f3.Failed && Same(toFirstAfter, Path.Combine(FileChannel.Downloads, "to-first-pc-after.bin"));
+                        return firstStopped && secondOk && afterOk && peer == "First PC"
+                            ? "the stopped one stopped alone (named " + peer + "), the other PC's arrived whole, and the background PC took the next send"
+                            : "FAIL: first stopped " + firstStopped + " (" + f1?.Result + "), second arrived " + secondOk + " (" + f2?.Result + "), next to the first " + afterOk + " (" + f3?.Result + "), named " + peer;
+                    }
+                    finally
+                    {
+                        ctrl.Files!.Rate = rate;
+                        ctrl.Muted = false;
+                        ctrl.LockedStep = step;
+                        ctrl.NameTransfers("127.0.0.1");
+                        other.Dispose();
+                    }
+                });
+
+                Scenario("Get files: two folders checked, then a third asked for while they come, with only what was asked for taken: all three arrive", 120, () =>
+                {
+                    var dirs = new[] { "Get one", "Get two", "Get three" }.Select(n =>
+                    {
+                        string d = Path.Combine(Root, "src", "get", n);
+                        Directory.CreateDirectory(d);
+                        File.Move(Big(n + ".bin", 8), Path.Combine(d, "data.bin"), true);
+                        return d;
+                    }).ToArray();
+                    var ends = new System.Collections.Concurrent.ConcurrentQueue<FileChannel.Transfer>();
+                    Action<FileChannel.Transfer> note = t => { if (!t.Outgoing && t.Finished) ends.Enqueue(t); };
+                    ctrl.TransferProgress += note;
+                    bool unasked = ctrl.Files!.AcceptUnasked;
+                    try
+                    {
+                        ctrl.Files!.AcceptUnasked = false; // only what was asked for: the third, waiting its turn on the host, must still count as asked
+                        if (!ctrl.Fetch(dirs.Take(2))) return "FAIL: could not ask";
+                        Thread.Sleep(200);
+                        if (!ctrl.Fetch(dirs.Skip(2))) return "FAIL: could not ask for the third";
+                        WaitFor(() => ends.Count >= 2, 60_000);
+                    }
+                    finally { ctrl.Files!.AcceptUnasked = unasked; ctrl.TransferProgress -= note; }
+                    var said = ends.Select(t => t.What + ": " + t.Result).ToList();
+                    bool all = dirs.All(d => Same(Path.Combine(d, "data.bin"), Path.Combine(FileChannel.Downloads, Path.GetFileName(d), "data.bin")));
+                    bool none = ends.All(t => !t.Failed);
+                    return all && none ? "all three arrived exactly (" + string.Join(" | ", said) + ")" : "FAIL: all arrived " + all + "; said " + string.Join(" | ", said);
+                });
+
+                Scenario("Stop the file transfer while a Get files waits its turn on the host: the one coming stops, and the one waiting never comes", 120, () =>
+                {
+                    var dirs = new[] { "Stop get one", "Stop get two" }.Select(n =>
+                    {
+                        string d = Path.Combine(Root, "src", "stopget", n);
+                        Directory.CreateDirectory(d);
+                        File.Move(Big(n + ".bin", 32), Path.Combine(d, "data.bin"), true);
+                        return d;
+                    }).ToArray();
+                    var sending = host.ControllerFiles!;
+                    FileChannel.Transfer? firstGoing = null, secondWaiting = null;
+                    var hostEnds = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                    var ctrlEnds = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                    Action<FileChannel.Transfer> onHost = t =>
+                    {
+                        if (!t.Outgoing) return;
+                        if (t.What == "Stop get one" && !t.Finished && t.Done > 0) firstGoing = t;
+                        if (t.What == "Stop get two" && t.Queued && !t.Finished) secondWaiting = t;
+                        if (t.Finished) hostEnds[t.What] = t;
+                    };
+                    Action<FileChannel.Transfer> onCtrl = t => { if (!t.Outgoing && t.Finished) ctrlEnds[t.What] = t; };
+                    host.TransferProgress += onHost;
+                    ctrl.TransferProgress += onCtrl;
+                    var rate = sending.Rate;
+                    try
+                    {
+                        sending.Rate = () => 4 << 20; // 8 seconds for the first: surely still coming when Stop is pressed
+                        if (!ctrl.Fetch(dirs.Take(1))) return "FAIL: could not ask";
+                        Thread.Sleep(300);
+                        if (!ctrl.Fetch(dirs.Skip(1))) return "FAIL: could not ask for the second";
+                        if (!WaitFor(() => firstGoing != null && secondWaiting != null, 20_000)) return "FAIL: never saw one coming and one waiting on the host";
+                        ctrl.CancelTransfer();
+                        WaitFor(() => hostEnds.ContainsKey("Stop get one") && hostEnds.ContainsKey("Stop get two"), 10_000);
+                        Thread.Sleep(3000); // time for the waiting one to start, if it wrongly could
+                    }
+                    finally { sending.Rate = rate; host.TransferProgress -= onHost; ctrl.TransferProgress -= onCtrl; }
+                    bool firstStopped = hostEnds.TryGetValue("Stop get one", out var h1) && h1.Cancelled;
+                    bool secondDropped = hostEnds.TryGetValue("Stop get two", out var h2) && h2.Cancelled && h2.Done == 0;
+                    bool neverCame = !File.Exists(Path.Combine(FileChannel.Downloads, "Stop get two", "data.bin"));
+                    bool told = ctrlEnds.TryGetValue("Stop get two", out var c2) && c2.Cancelled;
+                    return firstStopped && secondDropped && neverCame && told
+                        ? "the one coming stopped, the waiting one was dropped on the host and never came; the controller heard: " + c2!.Result
+                        : "FAIL: first stopped " + firstStopped + " (" + h1?.Result + "), waiting one dropped " + secondDropped + " (" + h2?.Result + "), never came " + neverCame + ", controller told " + told + " (" + c2?.Result + ")";
+                });
+
+                Scenario("Send the clipboard to a PC that takes one batch at a time (as 4.6): it replaces the file going, at once, and the files waiting still go after", 90, () =>
+                {
+                    string big = Big("replaced-by-clipboard.bin", 64), after = Big("after-clipboard.bin", 2);
+                    var ends = new System.Collections.Concurrent.ConcurrentDictionary<string, FileChannel.Transfer>();
+                    FileChannel.Transfer? going = null;
+                    Action<FileChannel.Transfer> note = t => { if (!t.Outgoing) return; if (t.What == "replaced-by-clipboard.bin" && !t.Finished && t.Done > 0) going = t; if (t.Finished) ends[t.What] = t; };
+                    string? got = null;
+                    Action<string> took = x => got = x;
+                    ctrl.TransferProgress += note;
+                    host.ClipboardReceived += took;
+                    var rate = ctrl.Files!.Rate;
+                    uint can = ctrl.Files!.TestPeerCan;
+                    long ms;
+                    try
+                    {
+                        ctrl.Files!.Rate = () => 4 << 20;
+                        var first = Task.Run(() => ctrl.Files!.SendFiles(new[] { big }, toClipboard: false));
+                        if (!WaitFor(() => going != null, 15_000)) return "FAIL: the file never got going";
+                        var second = Task.Run(() => ctrl.Files!.SendFiles(new[] { after }, toClipboard: false));
+                        Thread.Sleep(300);
+                        ctrl.Files!.TestPeerCan = 0; // from now on, as if the host were 4.6
+                        var clock = Stopwatch.StartNew();
+                        ctrl.SendClipboard("instead of the file");
+                        WaitFor(() => got != null, 10_000);
+                        ms = clock.ElapsedMilliseconds;
+                        Task.WaitAll(new[] { first, second }, 30_000);
+                    }
+                    finally { ctrl.Files!.Rate = rate; ctrl.Files!.TestPeerCan = can; ctrl.TransferProgress -= note; host.ClipboardReceived -= took; }
+                    bool replaced = ends.TryGetValue("replaced-by-clipboard.bin", out var r) && r.Cancelled;
+                    bool afterOk = ends.TryGetValue("after-clipboard.bin", out var a) && !a.Failed && Same(after, Path.Combine(FileChannel.Downloads, "after-clipboard.bin"));
+                    return got == "instead of the file" && ms < 5000 && replaced && afterOk
+                        ? "the text arrived in " + ms + " ms, the file going was stopped (" + r!.Result + "), and the one waiting went after"
+                        : "FAIL: text " + (got ?? "never came") + " after " + ms + " ms, file replaced " + replaced + " (" + r?.Result + "), the waiting one arrived " + afterOk + " (" + a?.Result + ")";
+                });
+
                 Scenario("the connection going silent while a key is held: the host lets it go within 2 seconds (F24 only, recorded, never typed)", 30, () =>
                 {
                     long gen = CurrentGeneration; // so a late finally (this scenario timed out but keeps running) does not clobber a later one

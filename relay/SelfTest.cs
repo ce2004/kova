@@ -356,6 +356,428 @@ namespace KovaRelay
             Check(!newOwner.LineClosed.Wait(300), "the new holder was disconnected when the former key asked for the name");
             newOwner.Dispose();
             done.Add("the former key was refused NameTaken while the new holder was connected");
+
+            Hardening(done);
+            Bench(done);
+            LoadCheck(server, done);
+            HostCap(server, done);
+        }
+
+        /// <summary>
+        /// Registering costs nothing (any password will do), so it must not buy one address a large share of the relay:
+        /// at most MaxHostsPerAddress hosts, and the rate bucket still applies to an address with hosts.
+        /// </summary>
+        private static void HostCap(RelayServer server, List<string> done)
+        {
+            const string From = "127.0.0.240";
+            var keep = new List<Socket>();
+            var keys = Enumerable.Range(0, Limits.MaxHostsPerAddress + 1).Select(_ => ECDsa.Create(ECCurve.NamedCurves.nistP256)).ToArray();
+            try
+            {
+                int ok = 0;
+                for (int i = 0; i < Limits.MaxHostsPerAddress; i++)
+                    if (LoadHost(From, "cap-" + i, keys[i], keep, CancellationToken.None).Wait(10_000)) ok++;
+                Check(ok == Limits.MaxHostsPerAddress, $"only {ok} of {Limits.MaxHostsPerAddress} hosts could register from one address");
+                var extra = LoadHost(From, "cap-extra", keys[^1], keep, CancellationToken.None);
+                Check(extra.Wait(10_000) && !extra.Result, $"host number {Limits.MaxHostsPerAddress + 1} from one address was let in");
+                done.Add($"one address could register {Limits.MaxHostsPerAddress} hosts and no more");
+
+                // Even with hosts registered, a burst of connections from that address runs out of room quickly.
+                // A refused one gets Busy and an immediate close, which may arrive as a reset: either way it is turned away.
+                int kept = 0, refused = 0;
+                for (int i = 0; i < 400; i++)
+                {
+                    try
+                    {
+                        var (sk, ns, _) = Open(From);
+                        lock (keep) keep.Add(sk);
+                        bool turnedAway = false;
+                        if (sk.Poll(100_000, SelectMode.SelectRead))
+                        {
+                            try { var (bt, bb) = Wire.ReadFrame(ns); turnedAway = IsRefused(bt, bb, Wire.Reason.Busy); } catch (Exception) { turnedAway = true; }
+                        }
+                        if (turnedAway) refused++; else kept++;
+                    }
+                    catch (Exception) { refused++; }
+                }
+                Check(refused > 0 && kept <= Limits.PerAddressConnections * Limits.MaxHostRoomFactor,
+                    $"an address with hosts was not limited ({kept} kept open, {refused} turned away)");
+                done.Add($"an address with {Limits.MaxHostsPerAddress} hosts opening 400 connections at once: {kept} let in, {refused} turned away");
+            }
+            finally
+            {
+                lock (keep) foreach (Socket sk in keep) try { sk.Dispose(); } catch (Exception) { }
+                foreach (var k in keys) k.Dispose();
+            }
+            WaitFor(() => server.Snapshot().Hosts == 0, 10_000, "the relay still counts the capped hosts after they left");
+        }
+
+        // ------------------------------------------------------------------ 4.7: staying connected
+
+        /// <summary>
+        /// A host's line coming and going must not cost anyone their connection: probes are answered, a replaced line is
+        /// told why, offers still waiting move to the host's new line, live pairs (TCP and UDP) carry on, and a
+        /// controlling PC asking in the gap waits for the host instead of being told it is not there.
+        /// </summary>
+        private static void Hardening(List<string> done)
+        {
+            using ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var a = new FakeHost("moving-pc", key);
+            var (t, b) = a.Register();
+            Check(t == Wire.Ok, $"the moving host got {Describe(t, b)}");
+            a.StartReading();
+
+            // A probe is answered at once.
+            var sw = Stopwatch.StartNew();
+            a.Send(Wire.KeepAlive, new[] { Wire.ProbeAsk });
+            WaitFor(() => a.ProbeAnswers > 0, 3000, "the relay did not answer a host's probe");
+            done.Add($"a host's probe was answered in {sw.ElapsedMilliseconds} ms");
+
+            // An offer the host has not taken yet moves to its new line when it registers again.
+            var clientTask = Task.Run(() => ClientConnect("moving-pc"));
+            var first = a.TakeIncoming(5000);
+            var a2 = new FakeHost("moving-pc", key);
+            (t, b) = a2.Register();
+            Check(t == Wire.Ok, $"the moving host registering again got {Describe(t, b)}");
+            a2.StartReading();
+            Check(a.LineClosed.Wait(3000), "the moving host's old line was not closed");
+            Check(a.GotReplaced, "the replaced line was not told it was replaced");
+            var again = a2.TakeIncoming(5000);
+            Check(again.Id.AsSpan().SequenceEqual(first.Id) && again.Token.AsSpan().SequenceEqual(first.Token), "the waiting offer was not offered again on the new line");
+            var (s1, ns1, _) = Open();
+            var (at, ab) = Ask(ns1, Wire.Accept, again.Id.Concat(again.Token).ToArray());
+            Check(at == Wire.Ok, $"accepting the moved offer got {Describe(at, ab)}");
+            Check(clientTask.Wait(5000), "the controlling PC never heard back after its host's line moved");
+            var (ct, cb, cs) = clientTask.Result;
+            Check(ct == Wire.Ok, $"the controlling PC whose offer moved got {Describe(ct, cb)}");
+            Exchange(cs, ns1, 64 << 10);
+            // The same offer dialled back a second time (a 4.6 host that heard it on both lines): refused, not counted.
+            var (s2, ns2, _) = Open();
+            (at, ab) = Ask(ns2, Wire.Accept, again.Id.Concat(again.Token).ToArray());
+            Check(IsRefused(at, ab, Wire.Reason.BadRequest), $"a second dial-back for a taken offer got {Describe(at, ab)}");
+            s2.Dispose();
+            done.Add("a host registering again was told its old line was replaced, got the waiting offer again on its new line, and it paired");
+
+            // The live pair (TCP and UDP) carries on while its host's line is replaced again.
+            using (var hostUdp = Udp())
+            using (var clientUdp = Udp())
+            {
+                var relay = new IPEndPoint(IPAddress.Loopback, _port);
+                hostUdp.SendTo(UdpPacket(a2.UdpKey!, 0), relay);
+                Thread.Sleep(200);
+                byte[] up = UdpPacket(again.Id, 300);
+                clientUdp.SendTo(up, relay);
+                Check(UdpReceive(hostUdp, 2000) is byte[] u1 && u1.AsSpan().SequenceEqual(up), "UDP did not reach the moving host");
+                var a3 = new FakeHost("moving-pc", key);
+                (t, b) = a3.Register();
+                Check(t == Wire.Ok, $"the moving host registering a third time got {Describe(t, b)}");
+                a3.StartReading();
+                Check(a2.LineClosed.Wait(3000), "the second line was not closed");
+                Exchange(cs, ns1, 64 << 10);
+                // Before the new line announces its UDP, sound still goes where the old one said.
+                up = UdpPacket(again.Id, 400);
+                clientUdp.SendTo(up, relay);
+                Check(UdpReceive(hostUdp, 2000) is byte[] u2 && u2.AsSpan().SequenceEqual(up), "UDP stopped while the host's line was replaced");
+                byte[] down = UdpPacket(again.Id, 500);
+                hostUdp.SendTo(down, relay);
+                Check(UdpReceive(clientUdp, 2000) is byte[] d1 && d1.AsSpan().SequenceEqual(down), "UDP back to the controlling PC stopped while the host's line was replaced");
+                cs.Dispose(); s1.Dispose();
+
+                // The host's line drops (not replaced): a controlling PC asking in the gap waits, and pairs when it is back.
+                a3.Dispose();
+                Thread.Sleep(300);
+                sw.Restart();
+                var gapTask = Task.Run(() => ClientConnect("moving-pc"));
+                Thread.Sleep(1000);
+                var a4 = new FakeHost("moving-pc", key);
+                (t, b) = a4.Register();
+                Check(t == Wire.Ok, $"the moving host coming back got {Describe(t, b)}");
+                a4.StartReading();
+                var inc = a4.TakeIncoming(5000);
+                var (s4, ns4, _) = Open();
+                (at, ab) = Ask(ns4, Wire.Accept, inc.Id.Concat(inc.Token).ToArray());
+                Check(at == Wire.Ok, $"accepting after coming back got {Describe(at, ab)}");
+                Check(gapTask.Wait(5000), "the controlling PC that asked in the gap never heard back");
+                var (gt, gb, gs) = gapTask.Result;
+                Check(gt == Wire.Ok, $"a controlling PC asking while its host reconnected got {Describe(gt, gb)}");
+                Exchange(gs, ns4, 16 << 10);
+                done.Add($"a live pair kept moving TCP and UDP while its host's line was replaced; a PC asking during a {sw.ElapsedMilliseconds} ms gap waited and paired");
+                gs.Dispose(); s4.Dispose();
+                a4.Dispose();
+            }
+            a.Dispose(); a2.Dispose();
+        }
+
+        // ------------------------------------------------------------------ 4.7: how fast (informational)
+
+        /// <summary>Round trips and throughput through the relay on loopback, against the same done directly. Printed, never failed on.</summary>
+        private static void Bench(List<string> done)
+        {
+            using ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var h = new FakeHost("bench-pc", key);
+            var (t, b) = h.Register();
+            Check(t == Wire.Ok, $"the bench host got {Describe(t, b)}");
+            h.StartReading();
+
+            var (client, hostSide, _) = Pair(h, "bench-pc", "127.0.0.1");
+            Echo(hostSide);
+            var (med, p99) = RoundTrips(client, 3000);
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            using var direct = new TcpClient { NoDelay = true };
+            direct.Connect(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+            using var directFar = listener.AcceptTcpClient();
+            directFar.NoDelay = true;
+            listener.Stop();
+            Echo(directFar.GetStream());
+            var (dmed, dp99) = RoundTrips(direct.GetStream(), 3000);
+            client.Dispose(); hostSide.Dispose();
+
+            // One way, 256 MB, in 1 MB writes.
+            var (c2, h2, c2Id) = Pair(h, "bench-pc", "127.0.0.1");
+            const int Mb = 256;
+            var reader = Task.Run(() => { byte[] buf = new byte[1 << 20]; long got = 0; while (got < (long)Mb << 20) { int n = h2.Read(buf); if (n <= 0) break; got += n; } return got; });
+            byte[] chunk = new byte[1 << 20];
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < Mb; i++) c2.Write(chunk);
+            Check(reader.Wait(60_000) && reader.Result == (long)Mb << 20, "the throughput run did not deliver every byte");
+            double mbps = Mb * 1000.0 / Math.Max(1, sw.ElapsedMilliseconds);
+
+            // UDP round trips: the host echoes every packet back through the relay.
+            double umed, up99;
+            using (var hostUdp = Udp())
+            using (var clientUdp = Udp())
+            {
+                var relay = new IPEndPoint(IPAddress.Loopback, _port);
+                hostUdp.SendTo(UdpPacket(h.UdpKey!, 0), relay);
+                Thread.Sleep(200);
+                var udpEcho = new Thread(() =>
+                {
+                    byte[] buf = new byte[2048];
+                    EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+                    try { while (true) { int n = hostUdp.ReceiveFrom(buf, ref any); hostUdp.SendTo(buf, n, SocketFlags.None, relay); } } catch (Exception) { }
+                }) { IsBackground = true };
+                udpEcho.Start();
+                byte[] pkt = UdpPacket(c2Id, 160);
+                byte[] back = new byte[2048];
+                var times = new List<double>();
+                clientUdp.ReceiveTimeout = 1000;
+                for (int i = 0; i < 1100; i++)
+                {
+                    long t0 = Stopwatch.GetTimestamp();
+                    clientUdp.SendTo(pkt, relay);
+                    try { clientUdp.Receive(back); } catch (SocketException) { continue; }
+                    if (i >= 100) times.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds * 1000);
+                }
+                Check(times.Count > 900, $"only {times.Count} of 1000 UDP packets came back through the relay");
+                times.Sort();
+                umed = times[times.Count / 2]; up99 = times[(int)(times.Count * 0.99)];
+                hostUdp.Close();
+            }
+            c2.Dispose(); h2.Dispose(); h.Dispose();
+            done.Add($"speed on loopback (informational): TCP round trip through the relay median {med:F0} microseconds, 99th percentile {p99:F0} " +
+                     $"(direct: {dmed:F0} and {dp99:F0}); UDP round trip through the relay median {umed:F0}, 99th percentile {up99:F0}; " +
+                     $"one way through the relay {mbps:F0} MB a second");
+        }
+
+        private static void Echo(NetworkStream s) =>
+            new Thread(() => { byte[] buf = new byte[65536]; try { int n; while ((n = s.Read(buf)) > 0) s.Write(buf, 0, n); } catch (Exception) { } }) { IsBackground = true }.Start();
+
+        /// <summary>64-byte messages there and back, one at a time; the first 100 warm up. Returns microseconds.</summary>
+        private static (double Median, double P99) RoundTrips(NetworkStream s, int count)
+        {
+            byte[] msg = new byte[64], back = new byte[64];
+            var times = new List<double>(count);
+            for (int i = 0; i < count + 100; i++)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                s.Write(msg);
+                Wire.ReadExactly(s, back);
+                if (i >= 100) times.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds * 1000);
+            }
+            times.Sort();
+            return (times[times.Count / 2], times[(int)(times.Count * 0.99)]);
+        }
+
+        // ------------------------------------------------------------------ 4.7: many at once
+
+        /// <summary>
+        /// 200 hosts registered from 200 addresses, and 200 controlling PCs (from 200 more) each paired with one and
+        /// echoing 256 KB at once. All peers here are async, so the thread count is the relay's (plus this test's pool).
+        /// </summary>
+        private static void LoadCheck(RelayServer server, List<string> done)
+        {
+            const int N = 200, Bytes = 1 << 20;
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            using var me = Process.GetCurrentProcess();
+            me.Refresh();
+            int threadsBefore = me.Threads.Count;
+            long memBefore = GC.GetTotalMemory(true), wsBefore = me.WorkingSet64;
+            int connsBefore = server.Snapshot().Connections;
+            var cts = new CancellationTokenSource(120_000);
+            var keys = Enumerable.Range(0, N).Select(_ => ECDsa.Create(ECCurve.NamedCurves.nistP256)).ToArray();
+            var hosts = new List<Socket>();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var regs = Enumerable.Range(0, N).Select(i => LoadHost($"127.0.1.{1 + i}", "load-" + i, keys[i], hosts, cts.Token)).ToArray();
+                Check(Task.WaitAll(regs, 60_000) && regs.All(r => r.Result), "not all 200 load hosts registered");
+                long regMs = sw.ElapsedMilliseconds;
+                WaitFor(() => server.Snapshot().Hosts >= N, 5000, "the relay does not count 200 hosts");
+                sw.Restart();
+                int peakThreads = 0; long peakWs = 0, peakMem = 0; int peakConns = 0;
+                var allPaired = new LoadGate(N);
+                var clients = Enumerable.Range(0, N).Select(i => LoadClient($"127.0.2.{1 + i}", "load-" + i, Bytes, allPaired, cts.Token)).ToArray();
+                var sampler = Task.Run(async () =>
+                {
+                    while (!clients.All(c => c.IsCompleted))
+                    {
+                        me.Refresh();
+                        peakThreads = Math.Max(peakThreads, me.Threads.Count);
+                        peakWs = Math.Max(peakWs, me.WorkingSet64);
+                        peakMem = Math.Max(peakMem, GC.GetTotalMemory(false));
+                        peakConns = Math.Max(peakConns, server.Snapshot().Connections);
+                        await Task.Delay(50);
+                    }
+                });
+                bool all = Task.WaitAll(clients, 90_000);
+                sampler.Wait(5000);
+                Check(all && clients.All(c => c.Result), $"not all 200 pairs echoed {Bytes >> 20} MB ({clients.Count(c => c.IsCompletedSuccessfully && c.Result)} did)");
+                long pairMs = sw.ElapsedMilliseconds;
+                WaitFor(() => server.Snapshot().Connections <= connsBefore + N, 10_000, "the relay still counts the load pairs after they closed");
+                done.Add($"load: 200 hosts registered in {regMs} ms; 200 pairs echoed {Bytes >> 20} MB each, all at once, in {pairMs} ms " +
+                         $"(peak {peakConns} connections; process threads {threadsBefore} before, {peakThreads} at most; managed memory {memBefore >> 20} MB before, {peakMem >> 20} MB at most; " +
+                         $"working set {wsBefore >> 20} MB before, {peakWs >> 20} MB at most)");
+            }
+            finally
+            {
+                cts.Cancel();
+                lock (hosts) foreach (Socket s in hosts) try { s.Dispose(); } catch (Exception) { }
+                foreach (var k in keys) k.Dispose();
+            }
+            WaitFor(() => server.Snapshot().Hosts == 0 && server.Snapshot().Connections <= connsBefore, 10_000, "the relay still counts load hosts after they left");
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long grew = GC.GetTotalMemory(true) - memBefore;
+            Check(grew < 32 << 20, $"managed memory stayed {grew >> 20} MB higher after the load left");
+            done.Add($"after the load left, every connection was released and managed memory was within {Math.Max(0, grew) >> 10} KB of before");
+        }
+
+        /// <summary>A pretend host, all async: registers, then for every offer dials back from its own address and echoes.</summary>
+        private static async Task<bool> LoadHost(string from, string name, ECDsa key, List<Socket> keep, CancellationToken ct)
+        {
+            Socket s = await DialAsync(from, ct);
+            lock (keep) keep.Add(s);
+            byte[] hello = new byte[Wire.ServerHelloBytes];
+            await ReadExactlyAsync(s, hello, ct);
+            byte[] spki = key.ExportSubjectPublicKeyInfo();
+            byte[] sig = key.SignData(Wire.RegisterSignedBytes(hello.AsSpan(4), name), HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
+            byte[] nb = Wire.NameBody(name);
+            byte[] body = new byte[nb.Length + 2 + spki.Length + sig.Length];
+            nb.CopyTo(body, 0);
+            body[nb.Length] = (byte)(spki.Length >> 8); body[nb.Length + 1] = (byte)spki.Length;
+            spki.CopyTo(body, nb.Length + 2);
+            sig.CopyTo(body, nb.Length + 2 + spki.Length);
+            await WriteFrameAsync(s, Wire.Register, body, ct);
+            var (t, _) = await ReadFrameAsync(s, ct);
+            if (t != Wire.Ok) return false;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        var (ft, fb) = await ReadFrameAsync(s, ct);
+                        if (ft != Wire.Incoming || fb.Length < 24) continue;
+                        byte[] accept = fb[..24];
+                        _ = Task.Run(async () =>
+                        {
+                            Socket d = await DialAsync(from, ct);
+                            lock (keep) keep.Add(d);
+                            await ReadExactlyAsync(d, new byte[Wire.ServerHelloBytes], ct);
+                            await WriteFrameAsync(d, Wire.Accept, accept, ct);
+                            var (at, _) = await ReadFrameAsync(d, ct);
+                            if (at != Wire.Ok) return;
+                            byte[] buf = new byte[16 << 10];
+                            int n;
+                            while ((n = await d.ReceiveAsync(buf, SocketFlags.None, ct)) > 0)
+                                await SendAllAsync(d, buf.AsMemory(0, n), ct);
+                            d.Dispose();
+                        });
+                    }
+                }
+                catch (Exception) { }
+            });
+            return true;
+        }
+
+        /// <summary>A pretend controlling PC, all async: connects by name, sends bytes and checks every one comes back.</summary>
+        private static async Task<bool> LoadClient(string from, string name, int bytes, LoadGate allPaired, CancellationToken ct)
+        {
+            using Socket s = await DialAsync(from, ct);
+            await ReadExactlyAsync(s, new byte[Wire.ServerHelloBytes], ct);
+            await WriteFrameAsync(s, Wire.Connect, Wire.NameBody(name), ct);
+            var (t, _) = await ReadFrameAsync(s, ct);
+            if (t != Wire.Ok) { allPaired.Arrive(); return false; }
+            // Every pair is set up before any data moves, so all of them are open and busy at the same time.
+            allPaired.Arrive();
+            await allPaired.All.WaitAsync(ct);
+            byte[] data = RandomNumberGenerator.GetBytes(bytes);
+            var send = Task.Run(async () => { for (int at = 0; at < bytes; at += 8192) await SendAllAsync(s, data.AsMemory(at, Math.Min(8192, bytes - at)), ct); });
+            byte[] back = new byte[bytes];
+            await ReadExactlyAsync(s, back, ct);
+            await send;
+            return back.AsSpan().SequenceEqual(data);
+        }
+
+        private sealed class LoadGate
+        {
+            private int _left;
+            private readonly TaskCompletionSource _all = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public LoadGate(int n) => _left = n;
+            public Task All => _all.Task;
+            public void Arrive() { if (Interlocked.Decrement(ref _left) == 0) _all.TrySetResult(); }
+        }
+
+        private static async Task<Socket> DialAsync(string from, CancellationToken ct)
+        {
+            var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            s.Bind(new IPEndPoint(IPAddress.Parse(from), 0));
+            await s.ConnectAsync(new IPEndPoint(IPAddress.Loopback, _port), ct);
+            return s;
+        }
+
+        private static async Task ReadExactlyAsync(Socket s, Memory<byte> buf, CancellationToken ct)
+        {
+            int got = 0;
+            while (got < buf.Length)
+            {
+                int n = await s.ReceiveAsync(buf[got..], SocketFlags.None, ct);
+                if (n <= 0) throw new EndOfStreamException();
+                got += n;
+            }
+        }
+
+        private static async Task SendAllAsync(Socket s, ReadOnlyMemory<byte> data, CancellationToken ct)
+        {
+            while (data.Length > 0) data = data[await s.SendAsync(data, SocketFlags.None, ct)..];
+        }
+
+        private static async Task WriteFrameAsync(Socket s, byte type, byte[] body, CancellationToken ct)
+        {
+            byte[] f = new byte[3 + body.Length];
+            f[0] = type;
+            f[1] = (byte)(body.Length >> 8); f[2] = (byte)body.Length;
+            body.CopyTo(f, 3);
+            await SendAllAsync(s, f, ct);
+        }
+
+        private static async Task<(byte, byte[])> ReadFrameAsync(Socket s, CancellationToken ct)
+        {
+            byte[] head = new byte[3];
+            await ReadExactlyAsync(s, head, ct);
+            byte[] body = new byte[(head[1] << 8) | head[2]];
+            await ReadExactlyAsync(s, body, ct);
+            return (head[0], body);
         }
 
         // ------------------------------------------------------------------ helpers
@@ -493,9 +915,13 @@ namespace KovaRelay
             private NetworkStream? _line;
             public byte[]? UdpKey;
             public readonly ManualResetEventSlim LineClosed = new(false);
+            public int ProbeAnswers;
+            public volatile bool GotReplaced;
             private readonly BlockingCollection<(byte[] Id, byte[] Token, string Addr)> _incoming = new();
 
             public FakeHost(string name, ECDsa key) { _name = name; _key = key; }
+
+            public void Send(byte type, byte[] body) { lock (_incoming) Wire.WriteFrame(_line!, type, body); }
 
             public (byte, byte[]) Register(bool corruptSignature = false)
             {
@@ -526,6 +952,8 @@ namespace KovaRelay
                         while (true)
                         {
                             var (t, b) = Wire.ReadFrame(line);
+                            if (t == Wire.KeepAlive && b.Length >= 1 && b[0] == Wire.ProbeAnswer) Interlocked.Increment(ref ProbeAnswers);
+                            if (t == Wire.Refused && b.Length == 1 && b[0] == (byte)Wire.Reason.Replaced) GotReplaced = true;
                             if (t == Wire.Incoming && b.Length >= 25)
                             {
                                 int n = b[24];

@@ -61,6 +61,15 @@ namespace TailRemote
         /// <summary>Raised when Ctrl+Shift+Enter is pressed with no connection.</summary>
         public event Action? NotConnected;
 
+        /// <summary>
+        /// Control+Shift+Alt+C (4.7): send this PC's clipboard to the PC in front. Kept by Kova even while controlling
+        /// the remote PC, where every other key goes there: Control+B pressed while controlling went to the remote PC as
+        /// an ordinary key, so "Send the clipboard" seemed to do nothing.
+        /// </summary>
+        public event Action? SendClipboardPressed;
+        private const int VK_C = 0x43;
+        private bool _swallowCUp;
+
         public bool Remote => _remote;
 
         public KeyCapture(Func<IntPtr> ourWindow)
@@ -285,6 +294,16 @@ namespace TailRemote
             {
                 _swallowEndUp = false;
                 lock (_held) _held.Remove((VK_END, true));
+                return 1;
+            }
+
+            // Control+Shift+Alt+C: send the clipboard. Its own C never reaches the remote PC (down nor up); the
+            // modifiers already went there and are let go there as usual.
+            if (k.vkCode == VK_C && up && _swallowCUp) { _swallowCUp = false; return 1; }
+            if (k.vkCode == VK_C && !up && ctrl && shift && alt && !win && (_remote || IsOurWindowFocused()))
+            {
+                if (!_swallowCUp) SendClipboardPressed?.Invoke(); // once per press, not on every repeat
+                _swallowCUp = true;
                 return 1;
             }
 

@@ -73,6 +73,7 @@ namespace TailRemote
                 Wire.Reason.NameTaken => "Another PC is already hosting on this relay with the same password. Each PC needs its own password.",
                 Wire.Reason.NewNamesOff or Wire.Reason.TooManyNames => "The relay is not accepting new PCs. Update Kova Relay to the latest version.",
                 Wire.Reason.BadSignature => "The relay could not verify this PC's identity. Try again.",
+                Wire.Reason.Replaced => "Another copy of Kova on this PC is hosting through the relay with the same password.",
                 _ => "The relay refused the connection.",
             };
         }
@@ -138,15 +139,35 @@ namespace TailRemote
             return hash < 0 ? a : a[..hash];
         }
 
-        public static IPEndPoint Resolve(Target t)
+        public static IPEndPoint Resolve(Target t) => new IPEndPoint(ResolveAll(t)[0], t.RelayPort);
+
+        /// <summary>Every address the relay's name has right now, IPv4 first (a relay on a home or cloud PC is reached most reliably there).</summary>
+        public static IPAddress[] ResolveAll(Target t)
         {
             IPAddress[] addrs;
             try { addrs = Dns.GetHostAddresses(t.RelayHost); }
             catch (Exception e) when (e is SocketException or ArgumentException) { addrs = Array.Empty<IPAddress>(); }
             if (addrs.Length == 0) throw new InvalidOperationException("Could not find the relay " + t.RelayHost + ". Check its address.");
-            // IPv4 first when there is one: a relay on a home or cloud PC is reached most reliably there.
-            var a = Array.Find(addrs, x => x.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
-            return new IPEndPoint(a, t.RelayPort);
+            var v4 = Array.FindAll(addrs, x => x.AddressFamily == AddressFamily.InterNetwork);
+            var rest = Array.FindAll(addrs, x => x.AddressFamily != AddressFamily.InterNetwork);
+            return v4.Length == 0 ? rest : rest.Length == 0 ? v4 : [.. v4, .. rest];
+        }
+
+        /// <summary>
+        /// No Nagle delay, and Windows' TCP keep-alive: a relay connection whose other end vanished without a word (a
+        /// router dropping it, sleep) is noticed even while nothing is being sent.
+        /// </summary>
+        internal static void Tune(Socket s, int idleSeconds, int intervalSeconds, int probes)
+        {
+            try { s.NoDelay = true; } catch { }
+            try
+            {
+                s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, idleSeconds);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, intervalSeconds);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, probes);
+            }
+            catch { } // older Windows: the plain keep-alive above still applies
         }
 
         /// <summary>Connects to the relay and reads its hello. The challenge is returned for a registration.</summary>
@@ -154,6 +175,7 @@ namespace TailRemote
         {
             var tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
             tcp.Client.DualMode = true;
+            Tune(tcp.Client, 30, 5, 6);
             try
             {
                 bool done;
@@ -308,6 +330,13 @@ namespace TailRemote
     /// A host's registration on a relay: keeps a control line open (registering again whenever it drops),
     /// dials back for every connection the relay offers, and hands each to the host as if it had come in
     /// directly (Host.Serve with the address it stands for). One per hosting Host.
+    ///
+    /// Staying reachable (4.7): the line asks the relay "are you there?" every few seconds, so a line a router
+    /// silently dropped is noticed in about 15 seconds (a 4.6 relay, which does not answer, within 35). A line
+    /// that was up is registered again at once; only repeated failures back off, from 1 up to 15 seconds, with a
+    /// little randomness so many hosts do not all knock at the same moment after a relay restart. The relay's
+    /// address is looked up afresh on every try, and every address it has is tried. Connections already made
+    /// through the relay are separate from the line: they carry on while it reconnects.
     /// </summary>
     internal sealed class RelayHost : IDisposable
     {
@@ -318,10 +347,30 @@ namespace TailRemote
         private readonly Action<string> _status;
         private volatile bool _stop;
         private volatile TcpClient? _line;
-        private volatile IPEndPoint? _relay;
-        private byte[]? _udpKey;
+        private volatile IPEndPoint? _relay;      // the relay's address the current (or last) line used
+        private volatile IPEndPoint? _relayUdp;   // the same, written the IPv6 way the host's UDP socket sends to it
+        private volatile byte[]? _announce;       // the UDP "here I am" packet for the current registration
         private string? _lastSaid;
         private readonly SemaphoreSlim _accepting = new(64, 64);
+        private readonly ManualResetEventSlim _wake = new(false);
+        // Offers being dialled back or already taken, by pairing id: a relay offers a waiting connection again on a
+        // host's new line, and the host must dial back only once.
+        private readonly ConcurrentDictionary<ulong, long> _offered = new();
+
+        private static readonly ConcurrentDictionary<RelayHost, byte> Live = new();
+        private static readonly byte[] Probe = { Wire.ProbeAsk };
+        [ThreadStatic] private static byte[]? _udpOut;
+
+        /// <summary>Successful registrations by every RelayHost in this process (tests watch it go up after a drop).</summary>
+        internal static int Registrations;
+
+        /// <summary>Test switch: cuts every relay control line in this process, as a router dropping them would.</summary>
+        internal static int TestDropLines()
+        {
+            int n = 0;
+            foreach (var h in Live.Keys) { var l = h._line; if (l != null) { try { l.Dispose(); } catch { } n++; } }
+            return n;
+        }
 
         /// <summary>Whether the host is registered on the relay right now.</summary>
         public bool Registered { get; private set; }
@@ -333,6 +382,7 @@ namespace TailRemote
         public RelayHost(Relay.Target target, Host host, HostIdentity identity, Action<byte[], int, IPEndPoint> sendUdp, Action<string> status)
         {
             _target = target; _host = host; _identity = identity; _sendUdp = sendUdp; _status = status;
+            Live.TryAdd(this, 0);
             new Thread(Run) { IsBackground = true, Name = "Kova relay line" }.Start();
         }
 
@@ -344,20 +394,26 @@ namespace TailRemote
             _status(s);
         }
 
+        private sealed class ReplacedException : Exception { }
+
         private void Run()
         {
-            int wait = 2000;
+            int failures = 0;
+            // How many times in a row another copy of Kova with this identity took the place. Two copies hosting with the
+            // same password would otherwise take turns pushing each other off for ever, and say so every time.
+            int replacedTimes = 0;
             while (!_stop)
             {
-                bool refusedForGood = false;
+                bool refusedForGood = false, replaced = false;
+                long upAt = 0;
+                string? why = null;
                 try
                 {
-                    var relay = Relay.Resolve(_target);
-                    _relay = relay;
-                    var (tcp, s, challenge) = OpenLine(relay);
+                    var (tcp, s, challenge, relay) = Dial();
                     _line = tcp;
                     using (tcp)
                     {
+                        if (_stop) return;
                         byte[] spki = _identity.SubjectPublicKeyInfo();
                         byte[] sig = _identity.Sign(Wire.RegisterSignedBytes(challenge, _target.Name));
                         byte[] name = Wire.NameBody(_target.Name);
@@ -371,45 +427,108 @@ namespace TailRemote
                         var (type, reply) = Wire.ReadFrame(s);
                         if (type == Wire.Refused && reply.Length >= 1)
                         {
-                            var why = (Wire.Reason)reply[0];
-                            refusedForGood = why is Wire.Reason.NameTaken or Wire.Reason.NewNamesOff or Wire.Reason.TooManyNames;
-                            throw new InvalidOperationException(Relay.Explain(why, _target.Name));
+                            var no = (Wire.Reason)reply[0];
+                            refusedForGood = no is Wire.Reason.NameTaken or Wire.Reason.NewNamesOff or Wire.Reason.TooManyNames;
+                            throw new InvalidOperationException(Relay.Explain(no, _target.Name));
                         }
                         if (type != Wire.Ok || reply.Length != Wire.IdBytes) throw new InvalidOperationException("The relay answered with something Kova does not understand. Update Kova Relay.");
-                        _udpKey = reply;
+                        _relay = relay;
+                        _relayUdp = relay.AddressFamily == AddressFamily.InterNetwork ? new IPEndPoint(relay.Address.MapToIPv6(), relay.Port) : relay;
+                        byte[] announce = new byte[Wire.UdpHead];
+                        announce[0] = Wire.Udp0; announce[1] = Wire.Udp1;
+                        reply.CopyTo(announce, 2);
+                        _announce = announce;
                         AnnounceUdp();
                         Registered = true;
-                        wait = 2000;
-                        Say(Relay.IsChannel(_target.Name) ? "Connected to the Kova Relay at " + _target.RelayHost + ". Other computers can now connect through it."
-                            : "Reachable through the relay " + _target.RelayHost + " as " + _target.Name + ".");
+                        Interlocked.Increment(ref Registrations);
+                        upAt = Environment.TickCount64;
+                        string connected = Relay.IsChannel(_target.Name) ? "Connected to the Kova Relay at " + _target.RelayHost + ". Other computers can now connect through it."
+                            : "Reachable through the relay " + _target.RelayHost + " as " + _target.Name + ".";
+                        // While taking turns with another copy, coming back is not news: it was said once already.
+                        if (replacedTimes == 0) Say(connected); else DiagLog.Write("relay: registered again while another copy of Kova shares this place");
                         Serve(tcp, s);
                     }
                 }
+                catch (ReplacedException) { replaced = true; }
                 catch (Exception e)
                 {
                     // Stopping (Dispose closes the line, which ends the read above with an exception): just leave. Any
                     // exception must be caught here: one escaping this thread would end the whole program.
                     if (_stop) return;
-                    string why = e is InvalidOperationException or TimeoutException ? e.Message
+                    why = e is InvalidOperationException or TimeoutException ? e.Message
                         : "Lost the connection to the relay " + _target.RelayHost + "; trying again.";
-                    Say(why);
                 }
                 Registered = false;
                 _line = null;
                 if (_stop) return;
-                // A name another PC holds will not come free by retrying quickly; a relay that is down is tried
-                // every few seconds at first, then once a minute.
-                Thread.Sleep(refusedForGood ? 60_000 : wait);
-                wait = Math.Min(wait * 2, 60_000);
+                int delay;
+                // Holding the place for 10 minutes means whatever pushed it off has stopped: a later push is news again.
+                if (!replaced && upAt != 0 && Environment.TickCount64 - upAt >= 600_000) replacedTimes = 0;
+                if (replaced)
+                {
+                    // Another copy of Kova with this PC's identity took the place (the relay keeps the newest line).
+                    // Coming straight back would only push it off in turn, so each time it waits longer: 30 seconds,
+                    // 2 minutes, then 5 minutes. Said once, not every time.
+                    replacedTimes++;
+                    delay = Jitter(replacedTimes switch { 1 => 30_000, 2 => 120_000, _ => 300_000 });
+                    if (replacedTimes == 1)
+                        Say("Another copy of Kova on this PC is hosting through the relay " + _target.RelayHost + " with the same password, so this one stepped aside. It keeps checking quietly in the background.");
+                    else DiagLog.Write("relay: another copy of Kova took this place again (" + replacedTimes + " times); waiting " + delay / 1000 + " s");
+                }
+                else if (refusedForGood)
+                {
+                    // A name another PC holds will not come free by retrying quickly.
+                    delay = Jitter(30_000);
+                    if (why != null) Say(why);
+                }
+                else if (upAt != 0 && Environment.TickCount64 - upAt >= 10_000)
+                {
+                    // A line that was working dropped (a router or Wi-Fi blip, the relay restarting): register again at
+                    // once, and say nothing unless that fails too, so a blip goes unnoticed.
+                    failures = 0;
+                    delay = Random.Shared.Next(0, 250);
+                }
+                else
+                {
+                    // The relay is down or unreachable, or lines keep dropping straight away: 1, 2, 4, 8, then every 15 seconds.
+                    failures++;
+                    delay = Jitter(Math.Min(15_000, 1000 << Math.Min(failures - 1, 4)));
+                    Say(why ?? "Lost the connection to the relay " + _target.RelayHost + "; trying again.");
+                }
+                _wake.Wait(delay);
             }
         }
 
-        private static (TcpClient, NetworkStream, byte[]) OpenLine(IPEndPoint relay)
+        /// <summary>The delay give or take a quarter, so hosts that lost the relay together do not all come back together.</summary>
+        private static int Jitter(int ms) => ms * 3 / 4 + Random.Shared.Next(0, ms / 2 + 1);
+
+        /// <summary>Looks the relay up afresh (its address may have changed) and connects to the first address that answers.</summary>
+        private (TcpClient, NetworkStream, byte[], IPEndPoint) Dial()
+        {
+            Exception? last = null;
+            foreach (var a in Relay.ResolveAll(_target))
+            {
+                if (_stop) break;
+                var ep = new IPEndPoint(a, _target.RelayPort);
+                try
+                {
+                    var (t, s, c) = OpenLine(ep, controlLine: true);
+                    return (t, s, c, ep);
+                }
+                catch (Exception e) { last = e; }
+            }
+            throw last ?? new InvalidOperationException("Could not find the relay " + _target.RelayHost + ". Check its address.");
+        }
+
+        private static (TcpClient, NetworkStream, byte[]) OpenLine(IPEndPoint relay, bool controlLine)
         {
             var tcp = new TcpClient(AddressFamily.InterNetworkV6) { NoDelay = true };
             tcp.Client.DualMode = true;
             try
             {
+                // A control line carries little but keep-alives, so Windows' own keep-alive can be tight there; a
+                // connection that will carry a session gets a gentler one.
+                if (controlLine) Relay.Tune(tcp.Client, 15, 3, 5); else Relay.Tune(tcp.Client, 30, 5, 6);
                 if (!tcp.ConnectAsync(relay.Address, relay.Port).Wait(8000)) throw new TimeoutException("No answer from the relay at " + relay.Address + ", port " + relay.Port + ".");
                 var s = tcp.GetStream();
                 s.ReadTimeout = 8000;
@@ -423,20 +542,42 @@ namespace TailRemote
             catch { tcp.Dispose(); throw; }
         }
 
-        /// <summary>The control line: keep-alives both ways, and an offer for each controlling PC's connection.</summary>
+        /// <summary>
+        /// The control line: a probe out every ProbeMs (a 4.7 relay answers it at once), the UDP announcement every
+        /// other probe, and an offer for each controlling PC's connection in. A watchdog closes the line when the
+        /// relay has been silent too long, which ends the read below and so this call.
+        /// </summary>
         private void Serve(TcpClient tcp, NetworkStream s)
         {
-            s.ReadTimeout = Wire.DeadAfterMs;
+            // Only a backstop: the watchdog below decides much sooner. (A read that times out leaves the socket unusable,
+            // so short read timeouts cannot be used to check on the line.)
+            s.ReadTimeout = Wire.DeadAfterMs + 10_000;
             var writeGate = new object();
+            long lastHeard = Environment.TickCount64;
+            bool answers = false;
+            int beats = 0;
             using var beat = new Timer(_ =>
             {
-                try { lock (writeGate) Wire.WriteFrame(s, Wire.KeepAlive, ReadOnlySpan<byte>.Empty); } catch { try { tcp.Dispose(); } catch { } }
-                AnnounceUdp(); // also keeps a home router's UDP mapping to the relay open
-            }, null, Wire.KeepAliveMs, Wire.KeepAliveMs);
+                long quiet = Environment.TickCount64 - Volatile.Read(ref lastHeard);
+                if (quiet > (Volatile.Read(ref answers) ? Wire.ProbedDeadAfterMs : Wire.SilentDeadAfterMs))
+                {
+                    DiagLog.Write("relay: no word from the relay for " + quiet / 1000 + " s; connecting again");
+                    try { tcp.Dispose(); } catch { }
+                    return;
+                }
+                try { lock (writeGate) Wire.WriteFrame(s, Wire.KeepAlive, Probe); } catch { try { tcp.Dispose(); } catch { } }
+                if (Interlocked.Increment(ref beats) % 2 == 0) AnnounceUdp(); // also keeps a home router's UDP mapping to the relay open
+            }, null, Wire.ProbeMs, Wire.ProbeMs);
             while (!_stop)
             {
                 var (type, body) = Wire.ReadFrame(s);
-                if (type == Wire.KeepAlive) continue;
+                Volatile.Write(ref lastHeard, Environment.TickCount64);
+                if (type == Wire.KeepAlive)
+                {
+                    if (body.Length >= 1 && body[0] == Wire.ProbeAnswer) Volatile.Write(ref answers, true);
+                    continue;
+                }
+                if (type == Wire.Refused && body.Length >= 1 && (Wire.Reason)body[0] == Wire.Reason.Replaced) throw new ReplacedException();
                 if (type != Wire.Incoming || body.Length < Wire.IdBytes + Wire.TokenBytes + 1) continue; // something newer: ignored
                 byte[] id = body[..Wire.IdBytes];
                 byte[] token = body[Wire.IdBytes..(Wire.IdBytes + Wire.TokenBytes)];
@@ -445,23 +586,28 @@ namespace TailRemote
                 string real = System.Text.Encoding.ASCII.GetString(body, Wire.IdBytes + Wire.TokenBytes + 1, n);
                 var relay = _relay;
                 if (relay == null) continue;
+                ulong key = BitConverter.ToUInt64(id);
+                long now = Environment.TickCount64;
+                if (_offered.Count > 512)
+                    foreach (var kv in _offered) if (now - kv.Value > 60_000) _offered.TryRemove(kv.Key, out _);
+                if (!_offered.TryAdd(key, now)) continue; // already dialling back for it, or done
                 // At most so many dial-backs at once: a hostile relay could otherwise send thousands of offers a second and
                 // use up this PC's threads. Past that, an offer is dropped (the relay tells that PC this host did not answer).
-                if (!_accepting.Wait(0)) continue;
-                try { new Thread(() => { try { Accept(relay, id, token, real); } finally { _accepting.Release(); } }) { IsBackground = true, Name = "Kova relay accept" }.Start(); }
-                catch { _accepting.Release(); }
+                if (!_accepting.Wait(0)) { _offered.TryRemove(key, out _); continue; }
+                try { new Thread(() => { try { Accept(relay, id, token, real, key); } finally { _accepting.Release(); } }) { IsBackground = true, Name = "Kova relay accept" }.Start(); }
+                catch { _accepting.Release(); _offered.TryRemove(key, out _); }
             }
         }
 
-        /// <summary>Dials back for one offered connection and gives it to the host.</summary>
-        private void Accept(IPEndPoint relay, byte[] id, byte[] token, string real)
+        /// <summary>Dials back for one offered connection and gives it to the host. Each runs on its own thread, so a slow one never holds up the line or another.</summary>
+        private void Accept(IPEndPoint relay, byte[] id, byte[] token, string real, ulong key)
         {
             TcpClient? tcp = null;
-            bool remembered = false;
+            bool remembered = false, taken = false;
             var stand = Relay.Stand(real, id);
             try
             {
-                var (t, s, _) = OpenLine(relay);
+                var (t, s, _) = OpenLine(relay, controlLine: false);
                 tcp = t;
                 byte[] body = new byte[Wire.IdBytes + Wire.TokenBytes];
                 id.CopyTo(body, 0);
@@ -469,6 +615,7 @@ namespace TailRemote
                 Wire.WriteFrame(s, Wire.Accept, body);
                 var (type, _) = Wire.ReadFrame(s);
                 if (type != Wire.Ok) { tcp.Dispose(); return; }
+                taken = true;
                 s.ReadTimeout = Timeout.Infinite;
                 s.WriteTimeout = Timeout.Infinite;
                 if (!Relay.Remember(id, stand, real, this)) { tcp.Dispose(); return; }
@@ -477,31 +624,34 @@ namespace TailRemote
                 _host.Serve(tcp, stand); // returns when the connection ends
             }
             catch { try { tcp?.Dispose(); } catch { } }
-            finally { if (remembered) Relay.Forget(id, stand, this); }
+            finally
+            {
+                if (remembered) Relay.Forget(id, stand, this);
+                // A dial-back that never got through may be offered again (on a new line): let it be tried then.
+                if (!taken) _offered.TryRemove(key, out _);
+            }
         }
 
         /// <summary>Tells the relay where this host's UDP is (the same socket the sound goes out of).</summary>
         private void AnnounceUdp()
         {
-            var relay = _relay;
-            var key = _udpKey;
-            if (relay == null || key == null) return;
-            byte[] p = new byte[Wire.UdpHead];
-            p[0] = Wire.Udp0; p[1] = Wire.Udp1;
-            key.CopyTo(p, 2);
-            try { _sendUdp(p, p.Length, relay); } catch { }
+            var to = _relayUdp;
+            var p = _announce;
+            if (to == null || p == null) return;
+            try { _sendUdp(p, p.Length, to); } catch { }
         }
 
-        /// <summary>Sends a UDP packet to a relayed controlling PC: through the relay, with the pairing's header.</summary>
+        /// <summary>Sends a UDP packet to a relayed controlling PC: through the relay, with the pairing's header. No allocation per packet.</summary>
         public void SendUdp(ulong id, byte[] data, int length)
         {
-            var relay = _relay;
-            if (relay == null || length > Wire.MaxUdpPayload) return;
-            byte[] p = new byte[Wire.UdpHead + length];
+            var to = _relayUdp;
+            if (to == null || length > Wire.MaxUdpPayload) return;
+            // The send below is synchronous, so one buffer per sending thread is enough.
+            byte[] p = _udpOut ??= new byte[Wire.UdpHead + Wire.MaxUdpPayload];
             p[0] = Wire.Udp0; p[1] = Wire.Udp1;
             BitConverter.TryWriteBytes(p.AsSpan(2), id);
             Buffer.BlockCopy(data, 0, p, Wire.UdpHead, length);
-            try { _sendUdp(p, p.Length, relay); } catch { }
+            try { _sendUdp(p, Wire.UdpHead + length, to); } catch { }
         }
 
         /// <summary>
@@ -511,8 +661,9 @@ namespace TailRemote
         /// </summary>
         public bool Unwrap(ref byte[] d, ref IPEndPoint from)
         {
-            var relay = _relay;
-            if (relay == null || !Same(from, relay)) return true;
+            var relay = _relayUdp;
+            if (relay == null) return true;
+            if (!(from.Port == relay.Port && from.Address.Equals(relay.Address)) && !Same(from, relay)) return true;
             if (d.Length <= Wire.UdpHead || d[0] != Wire.Udp0 || d[1] != Wire.Udp1) return false;
             ulong id = BitConverter.ToUInt64(d, 2);
             var route = Relay.RouteOfId(id);
@@ -533,6 +684,8 @@ namespace TailRemote
         public void Dispose()
         {
             _stop = true;
+            Live.TryRemove(this, out _);
+            try { _wake.Set(); } catch { }
             try { _line?.Dispose(); } catch { }
         }
     }

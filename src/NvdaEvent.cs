@@ -268,12 +268,25 @@ namespace TailRemote
                     string plain = Speech.Clean(ev.SpokenText, MaxText);
                     if (plain.Length == 0 || string.IsNullOrWhiteSpace(plain)) return;
                     var ssml = RemoteSsml;
-                    if (special && ssml != null) { ssml(Ssml(ev.Parts), plain); return; }
-                    Speech.Remote(Chunks(plain, Speech.RemoteLineMax), interrupt: false);
+                    lock (BatchGate)
+                    {
+                        if (special && ssml != null)
+                        {
+                            FlushLocked(); // plain words that came first are said first
+                            ssml(Ssml(ev.Parts), plain);
+                            return;
+                        }
+                        AddPlainLocked(plain);
+                    }
                     return;
                 }
                 case NvdaEventKind.Cancel:
-                    RemoteCancel?.Invoke();
+                    lock (BatchGate)
+                    {
+                        // Words still gathering were cut off over there before they were said here: they go.
+                        _batch.Clear();
+                        RemoteCancel?.Invoke();
+                    }
                     return;
                 case NvdaEventKind.Braille:
                     Speech.Braille(ev.Text);
@@ -287,23 +300,135 @@ namespace TailRemote
             }
         }
 
+        // ---- Plain words, gathered while they pour in ----
+        // A console printing hundreds of lines a second made the remote NVDA hand over hundreds of tiny Speak events,
+        // each said here with its own call into this PC's NVDA: past Speech's per-second limits the rest was skipped
+        // ("The other PC sent more speech than could be read"), and NVDA fell behind. Now words are said at once when
+        // things were quiet, and while they keep coming they are gathered for at most BatchMs and said as one line.
+
+        internal const int BatchMs = 25;
+        private static readonly object BatchGate = new();
+        private static readonly StringBuilder _batch = new();
+        private static long _lastFlush = long.MinValue / 2;
+        private static System.Threading.Timer? _flushTimer;
+        private static bool _flushArmed;
+
+        /// <summary>Tests: the lines Perform hands on to be said, instead of Speech.Remote.</summary>
+        internal static Action<string[]>? RemoteLinesForTest;
+
+        private static void AddPlainLocked(string plain)
+        {
+            long now = Environment.TickCount64;
+            if (_batch.Length > 0) _batch.Append(' ');
+            _batch.Append(plain);
+            // Quiet until now: said at once, never held back. A full line: said now too.
+            if ((!_flushArmed && now - _lastFlush >= BatchMs) || _batch.Length >= MaxText) { FlushLocked(); return; }
+            if (_flushArmed) return;
+            _flushArmed = true;
+            _flushTimer ??= new System.Threading.Timer(_ => { lock (BatchGate) { _flushArmed = false; FlushLocked(); } });
+            _flushTimer.Change(Math.Clamp(BatchMs - (now - _lastFlush), 1, BatchMs), Timeout.Infinite);
+        }
+
+        private static void FlushLocked()
+        {
+            if (_batch.Length == 0) return;
+            string text = _batch.ToString();
+            _batch.Clear();
+            _lastFlush = Environment.TickCount64;
+            var lines = Chunks(text, Speech.RemoteLineMax);
+            if (RemoteLinesForTest is { } test) test(lines);
+            else Speech.Remote(lines, interrupt: false);
+        }
+
+        /// <summary>Tests: says what is gathering now and forgets when the last words were said.</summary>
+        internal static void FlushForTest() { lock (BatchGate) { FlushLocked(); _lastFlush = long.MinValue / 2; } }
+
         /// <summary>
         /// The parts as SSML that this PC's NVDA understands (NVDA 2024.1 and later): a pitch change becomes prosody pitch
-        /// as a percentage (NVDA's only form), spelled text say-as characters. Text is cleaned and escaped.
+        /// as a percentage (NVDA's only form), spelled text say-as characters. Text is cleaned and put in CDATA sections.
+        ///
+        /// Never escaped with entities: NVDA's SSML reader (Python's expat) hands text over in pieces split at every entity,
+        /// and NVDA speaks each piece as a separate string, symbols processed on their own. "don&amp;apos;t" became "don",
+        /// "'", "t": the lone apostrophe is below the usual symbol level, so it was dropped and "don t" was heard (the
+        /// same for quotes). Inside CDATA the text arrives whole, as NVDA itself would have said it.
         /// </summary>
         internal static string Ssml(IReadOnlyList<NvdaSpeechPart> parts)
         {
             var sb = new StringBuilder("<speak>");
             foreach (var p in parts)
             {
-                string t = System.Security.SecurityElement.Escape(Speech.Clean(p.Text, MaxText)) ?? "";
-                if (t.Length == 0) continue;
+                string clean = Speech.Clean(p.Text, MaxText);
+                if (clean.Length == 0) continue;
+                string t = Cdata(clean);
                 if (p.Spelled) t = "<say-as interpret-as=\"characters\">" + t + "</say-as>";
                 // NVDA's pitch scale runs 0-100 around a usual 50, so +30 is about 60 percent higher.
                 if (p.Pitch != 0) t = "<prosody pitch=\"" + Math.Clamp(100 + p.Pitch * 2, 20, 300) + "%\">" + t + "</prosody>";
-                sb.Append(t).Append(' ');
+                sb.Append(t);
             }
             return sb.Append("</speak>").ToString();
+        }
+
+        /// <summary>Text as an XML CDATA section; the one sequence CDATA cannot hold ("]]&gt;") is split over two sections.</summary>
+        internal static string Cdata(string text) => "<![CDATA[" + text.Replace("]]>", "]]]]><![CDATA[>", StringComparison.Ordinal) + "]]>";
+
+        // ================= The host's side: a burst made into fewer messages =================
+
+        /// <summary>
+        /// Messages waiting for one controlling PC (whole messages: type byte, then body), made into fewer: Speak events
+        /// that follow each other become one (within MaxParts and MaxText), and of several braille events only the newest
+        /// is kept (the display shows one thing at a time). Everything else, cut-offs above all, stays exactly where it
+        /// was, so nothing changes order. The host only has a burst to merge when the line is slower than NVDA, so a
+        /// single line is never held back.
+        /// </summary>
+        internal static List<byte[]> Merge(List<byte[]> messages)
+        {
+            int lastBraille = -1;
+            var decoded = new NvdaEvent?[messages.Count];
+            for (int i = 0; i < messages.Count; i++)
+            {
+                var m = messages[i];
+                if (m.Length >= 2 && m[0] == Protocol.NvdaEventMsg) decoded[i] = Decode(m.AsSpan(1));
+                if (decoded[i]?.Kind == NvdaEventKind.Braille) lastBraille = i;
+            }
+            var output = new List<byte[]>(messages.Count);
+            List<NvdaSpeechPart>? run = null;
+            int runText = 0;
+            byte[]? runOnly = null; // a run of one is sent as it came
+            void EndRun()
+            {
+                if (run == null) return;
+                output.Add(runOnly ?? Message(Speak(run.ToArray())));
+                run = null; runOnly = null; runText = 0;
+            }
+            for (int i = 0; i < messages.Count; i++)
+            {
+                var ev = decoded[i];
+                if (ev?.Kind == NvdaEventKind.Braille && i != lastBraille) continue;
+                if (ev?.Kind == NvdaEventKind.Speak)
+                {
+                    int text = 0;
+                    foreach (var p in ev.Parts) text += p.Text.Length;
+                    if (run != null && (run.Count + ev.Parts.Count > MaxParts || runText + text > MaxText)) EndRun();
+                    if (run == null) { run = new List<NvdaSpeechPart>(ev.Parts); runOnly = messages[i]; }
+                    else { run.AddRange(ev.Parts); runOnly = null; }
+                    runText += text;
+                    continue;
+                }
+                EndRun();
+                output.Add(messages[i]);
+            }
+            EndRun();
+            return output;
+        }
+
+        /// <summary>The event as a whole NvdaEventMsg message.</summary>
+        internal static byte[] Message(NvdaEvent ev)
+        {
+            byte[] body = ev.Encode();
+            byte[] m = new byte[1 + body.Length];
+            m[0] = Protocol.NvdaEventMsg;
+            body.CopyTo(m, 1);
+            return m;
         }
 
         /// <summary>Text cut into lines Speech.Remote takes whole (it cuts anything longer), at spaces where it can.</summary>

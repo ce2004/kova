@@ -10,7 +10,7 @@
     <RootNamespace>KovaRelay</RootNamespace>
     <Product>Kova Relay</Product>
     <AssemblyTitle>Kova Relay</AssemblyTitle>
-    <Version>4.6.2</Version>
+    <Version>4.7.0</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>

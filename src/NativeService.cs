@@ -198,6 +198,46 @@ namespace TailRemote
             return GetUserObjectInformationW(desktop, 2 /* UOI_NAME */, sb, sb.Capacity * 2, out _) ? sb.ToString() : "";
         }
 
+        /// <summary>
+        /// Whether the desktop with the keyboard in this process's session is not the ordinary one: Winlogon (sign-in, the
+        /// lock screen's password box, Control Alt Delete, UAC prompts) or the screen saver's. An ordinary program is
+        /// refused the secure desktop (access denied): that means the same. Null when it cannot be told: any other failure
+        /// (a disconnected Remote Desktop session, a session switched away from, a moment mid-switch) says nothing either way.
+        /// </summary>
+        public static bool? InputDesktopIsSecure()
+        {
+            IntPtr d = OpenInputDesktop(0, false, 0x0001 /* DESKTOP_READOBJECTS */);
+            if (d == IntPtr.Zero) return Marshal.GetLastWin32Error() == 5 /* ERROR_ACCESS_DENIED */ ? true : null;
+            try
+            {
+                string name = DesktopName(d);
+                return name.Length == 0 ? null : !string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase);
+            }
+            finally { CloseDesktop(d); }
+        }
+
+        /// <summary>
+        /// Readings of InputDesktopIsSecure settled: a change counts only after Needed identical readings in a row, and
+        /// readings that cannot tell are passed over, so a flicker while desktops switch never tells the controllers anything.
+        /// </summary>
+        internal sealed class SecureScreenSettle
+        {
+            public const int Needed = 3;
+            private bool? _state, _candidate;
+            private int _count;
+
+            /// <summary>The new settled state when this reading settles a change, else null.</summary>
+            public bool? Next(bool? reading)
+            {
+                if (reading == null) return null;
+                if (reading == _candidate) _count++;
+                else { _candidate = reading; _count = 1; }
+                if (_count < Needed || _state == reading) return null;
+                _state = reading;
+                return reading;
+            }
+        }
+
         // ---- Ctrl+Alt+Del, which only a service may send ----
 
         [DllImport("sas.dll")] public static extern void SendSAS(bool asUser);

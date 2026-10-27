@@ -32,7 +32,7 @@ namespace TailRemote
                 Menus.Action("Open the l&og file", () =>
                 {
                     if (File.Exists(DiagLog.FilePath)) Open(DiagLog.FilePath);
-                    else Speech.Speak("There is no log file yet. Turn on Settings, Enable logging first.");
+                    else Speech.Speak("There is no log file yet. Turn on Settings, Diagnostic logging first.");
                 }),
             });
             return about;
@@ -115,6 +115,7 @@ namespace TailRemote
                 "Open the menus: Alt, then Right and Left Arrow between them, Down Arrow through one, Escape to go back",
                 "Turn a setting on or off: Enter, and the menu stays open",
                 "Control the remote PC, or come back to this one: Control Shift Enter",
+                "Send the clipboard, even while controlling the remote PC: Control Shift Alt C",
                 "Control Alt Delete on the remote PC (when it runs the service): Control Alt End",
                 "Connect to saved PC 1 to 9: Control 1 to Control 9",
                 "Menu items with their own keys",

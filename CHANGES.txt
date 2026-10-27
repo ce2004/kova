@@ -1,3 +1,28 @@
+4.7.0
+Changed: the File and Settings menus only show what you can use right now. While this PC hosts, File has just Stop hosting, Measure this PC's internet speed and Exit. While you are connected, it has the connection's items. Otherwise it has Connect to a PC and Host this PC.
+Changed: Settings shows the settings for controlling another PC, or, while this PC hosts, the settings for hosting, not both at once. Start hosting when Windows starts is gone while the Kova service is installed, because the service already starts with Windows.
+New feature: while connected, File, Connect to another PC connects to one more PC, and the one you were using stays connected in the background, as with Switch to PC.
+New feature: the last page of Host this PC has Copy the relay address and Copy this PC's address buttons. Copy this PC's address is no longer in the File menu.
+Changed: Host this PC explains its choices in plain words: through a Kova Relay, which works from anywhere with nothing to open on this PC; directly, by this PC's own address, for the same network or a VPN; or both ways. Its last page says exactly what other computers enter. Connect to a PC and Edit PC are clearer too.
+Changed: while the Kova service hosts this PC, File has Change how this PC is hosted, and Stop hosting removes the service after asking. Settings, Apply settings to the Kova service gives the service settings you change in the Settings menu.
+Changed: Edit PC and Delete PC only appear in Connect to a PC while a saved PC is chosen. On a listen-only connection, the File items that need control are not shown.
+Changed: Update the remote PC says which version of Kova each PC has, and updates the remote PC to the newest version.
+Bug fixed: if you stopped hosting and then pressed Control 1 to 9, or used Wake a saved PC and connect, Kova said it only works in Control another PC mode, a choice that is no longer anywhere. It connects now.
+Bug fixed: several messages sent you to menu items that no longer exist, such as Save this PC, Apply settings to the service, Put the text the remote PC sent on this clipboard and Enable logging. They now name the right place.
+Changed: Check the relay is gone from the File menu. Connect to a PC and Host this PC check the relay themselves.
+New feature: Control Shift Alt C sends your clipboard to the PC in front, even while you are controlling it. Before, every key went to the remote PC while you controlled it, so Control B there did nothing for Kova.
+New feature: Clipboard, Send folders and their contents (Control T) sends several folders at once. Pick them together in the folder window; each one gets its own progress.
+New feature: Clipboard, Stop just one transfer (Control Shift T) lists every transfer to and from every PC, with each file and folder in it. Delete stops only the one you are on, and the rest carry on.
+Changed: a new send, or Get files, no longer stops the one already going. It waits its turn and starts as soon as the first is done. Only a new clipboard copy replaces an older clipboard copy.
+Changed: transfers name the PC they go to or come from, in the Files line, the history and what Kova says, when more than one PC is connected.
+Bug fixed: text the remote NVDA spoke with an apostrophe, quote or similar mark, like don't, was read as don t over the Kova Helper. Every kind of punctuation now comes through.
+Bug fixed: lots of text from the remote PC, like a Command Prompt printing output, fell behind and some of it was skipped. It now comes through in one go and nothing is dropped. The Kova Helper add-on updates itself on the remote PC.
+Bug fixed: with Remote NVDA speech set to text only, you heard nothing on the remote PC's sign-in, lock or administrator screens, because NVDA there cannot use the Kova Helper. Kova now plays the remote PC's sound on those screens and says so, until the remote PC is back at its desktop.
+Bug fixed: a PC hosting through a Kova Relay could lose its connection to the relay for up to a minute without noticing. It now notices within 15 seconds and reconnects at once, without a word for a short break, and PCs already connected stay connected.
+Changed: someone who connects while their PC is reconnecting to the relay waits a few seconds for it, instead of being told no PC is hosting there.
+Changed: Kova Relay adds less delay and handles thousands of connections at once.
+Important: stopping just one part of a transfer you send, hearing the sound on secure screens in text-only mode, and the faster relay reconnection need Kova 4.7 on both PCs, and the relay changes need Kova Relay 4.7. Everything else still works with Kova 4.6.
+
 4.6.2
 Bug fixed: a PC saved while Kova 4.6.0 was connecting through a relay could be saved with the wrong route, and connecting to it then said "That is not a Kova host, or the connection damaged its first message" every second. Kova now notices when the address is a Kova Relay, connects through it to the PC hosting with that password, and corrects the saved PC.
 Changed: in Connect to a PC, an address typed without a port also finds a PC on a Kova Relay you have used before at that address, even when the relay uses a port of its own.
