@@ -1,3 +1,7 @@
+4.6.2
+Bug fixed: a PC saved while Kova 4.6.0 was connecting through a relay could be saved with the wrong route, and connecting to it then said "That is not a Kova host, or the connection damaged its first message" every second. Kova now notices when the address is a Kova Relay, connects through it to the PC hosting with that password, and corrects the saved PC.
+Changed: in Connect to a PC, an address typed without a port also finds a PC on a Kova Relay you have used before at that address, even when the relay uses a port of its own.
+
 4.6.1
 Bug fixed: after a hosted PC restarted or reconnected to the relay, the PC controlling it could be locked out of the relay for an hour, and Connect to a PC then said the connection was damaged. Reconnecting never counts against you now.
 Bug fixed: Connect to a PC could mistake a Kova Relay for the PC itself when the relay was busy, and say the PC's first message was damaged. It now only connects directly when Kova itself answers.

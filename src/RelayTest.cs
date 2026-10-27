@@ -172,6 +172,11 @@ namespace TailRemote
                         Check(!pwClient.ListenOnly, "a controlling PC reached it with only the relay's address and the password");
                     try { Client.Connect("@127.0.0.1:" + relayPort, Protocol.DefaultPort, "a-password-nobody-uses", new Player(Player.NoDevice, _ => { }), _ => { }).Dispose(); Check(false, "a password no PC hosts with reached nothing"); }
                     catch (InvalidOperationException e) { Check(e.Message.StartsWith("No PC is hosting on this relay with that password"), "a password no PC hosts with reached nothing (" + e.Message + ")"); }
+                    // 4.6.2: a PC saved by 4.6.0 as a direct connection to the relay's own address and port (what its route bug
+                    // saved while the relay was refusing): Kova sees the relay's greeting and goes through the relay instead.
+                    using (var oldSaved = Client.Connect("127.0.0.1", relayPort, "second-pc-password", new Player(Player.NoDevice, _ => { }), _ => { }))
+                        Check(!oldSaved.ListenOnly && oldSaved.MovedTo is string mv && Relay.IsByPassword(mv),
+                            "a PC saved as a direct connection to the relay's port was reached through the relay (" + oldSaved.MovedTo + ")");
                     Thread.Sleep(1500); // the listen-only registration is a second line to the relay
                     using (var listener = Client.Connect("@127.0.0.1:" + relayPort, Protocol.DefaultPort, "second-pc-listen", new Player(Player.NoDevice, _ => { }), _ => { }))
                         Check(listener.ListenOnly, "the listen-only password reaches the same PC through the relay, listening only");

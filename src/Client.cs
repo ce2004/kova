@@ -159,6 +159,28 @@ namespace TailRemote
         /// </summary>
         public static Client Connect(string address, int port, string password, Player player, Action<string> status, int lockedStep = -1, int answerMs = 8000, IHostTrust? trust = null)
         {
+            try { return ConnectOnce(address, port, password, player, status, lockedStep, answerMs, trust); }
+            catch (RelayAtAddressException r)
+            {
+                // A Kova Relay answered where a PC was expected (4.6.2): a PC saved while 4.6.0 picked the wrong route, or
+                // a relay address typed by hand. The PC wanted is the one hosting on that relay with this password.
+                string moved = Relay.Tagged(r.RelayAt, password);
+                var c = ConnectOnce(moved, Protocol.DefaultPort, password, player, status, lockedStep, answerMs, trust);
+                c.MovedTo = moved;
+                return c;
+            }
+        }
+
+        /// <summary>Set when Connect found a Kova Relay at the address given and went through it: the address that worked ("@relay#tag").</summary>
+        public string? MovedTo { get; private set; }
+
+        private sealed class RelayAtAddressException(string relayAt) : Exception("A Kova Relay answered at " + relayAt + ".")
+        {
+            public string RelayAt { get; } = relayAt;
+        }
+
+        private static Client ConnectOnce(string address, int port, string password, Player player, Action<string> status, int lockedStep, int answerMs, IHostTrust? trust)
+        {
             // "@relay": the PC hosting on that relay with this password (4.6), as NVDA Remote finds its peer by key.
             // Messages name the PC as typed: the code made from the password is never shown.
             string shown = Relay.IsByPassword(address) ? "the PC on the relay " + Relay.Shown(address) : address.Trim();
@@ -215,6 +237,11 @@ namespace TailRemote
                 long loginBy = Environment.TickCount64 + Math.Max(answerMs, 8000) + 8000;
                 byte[] hello = new byte[Protocol.HelloBytes];
                 ReadWithin(stream, hello.AsSpan(0, 4), loginBy);
+                if (route == null && hello.AsSpan(0, 4).SequenceEqual(KovaRelayWire.Wire.Magic))
+                {
+                    string h = address.Trim();
+                    throw new RelayAtAddressException((h.Contains(':') ? "[" + h + "]" : h) + (port == KovaRelayWire.Wire.DefaultPort ? "" : ":" + port));
+                }
                 if (!hello.AsSpan(0, 4).SequenceEqual(Protocol.Magic))
                     throw new InvalidOperationException(hello.AsSpan(0, 3).SequenceEqual("TRM"u8)
                         ? "The other PC has a different Kova version, or the connection damaged its first message. Update both to the latest."

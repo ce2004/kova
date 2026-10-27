@@ -2673,6 +2673,19 @@ namespace TailRemote
                     c.Dispose();
                     return;
                 }
+                if (c.MovedTo is string moved)
+                {
+                    // The address was a Kova Relay: the saved PC and the reconnect use the relay route from now on.
+                    string oldAddress = address;
+                    int oldPort = port;
+                    foreach (var pc in _settings.SavedPcs.Where(p => SamePc(p.Address, p.Port, oldAddress, oldPort))) { pc.Address = moved; pc.Port = Protocol.DefaultPort; }
+                    if (SamePc(_address.Text, CurrentPort, oldAddress, oldPort)) { _address.Text = moved; _port.Text = Protocol.DefaultPort.ToString(); }
+                    address = moved;
+                    port = Protocol.DefaultPort;
+                    (_frontAddress, _frontPort) = (moved, Protocol.DefaultPort);
+                    SaveSettings();
+                    FillSaved();
+                }
                 c.Disconnected += why => Later(() => { if (c == _client) Disconnect(why, byUser: false); else BackgroundDropped(c, why); });
                 c.ClipboardReceived += text => Later(() => ClipboardArrived(text));
                 c.UnaskedClipboardReceived += (text, path) => Later(() =>

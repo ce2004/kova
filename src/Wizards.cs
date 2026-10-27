@@ -201,7 +201,20 @@ namespace TailRemote
     {
         internal sealed record Found(string Address, int Port, string? Problem, bool CanCarryOn);
 
-        public static async Task<Found> Find(string typed, string password)
+        /// <summary>
+        /// Relays this PC already knows, as "host:port" (its saved PCs' relays and the one it hosts through): an address
+        /// typed without a port is also tried at the port its relay is known to use (4.6.2: "connererwin.com" found the PC
+        /// on its relay at 6968, rather than the Kova hosting directly on that server).
+        /// </summary>
+        public static List<string> KnownRelays(Settings s)
+        {
+            var list = new List<string>();
+            foreach (var pc in s.SavedPcs) if (Relay.IsByPassword(pc.Address)) list.Add(Relay.Shown(pc.Address));
+            if (s.RelayAddress.Length > 0) list.Add(s.RelayAddress + ":" + s.RelayPort);
+            return list;
+        }
+
+        public static async Task<Found> Find(string typed, string password, IEnumerable<string>? knownRelays = null)
         {
             typed = typed.Trim();
             if (typed.Length == 0) return new("", 0, "Enter the address of the PC or of a Kova Relay.", false);
@@ -218,6 +231,18 @@ namespace TailRemote
             string bare = t.RelayHost.Contains(':') ? "[" + t.RelayHost + "]" : t.RelayHost;
             string relayAt = bare + (t.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + t.RelayPort);
             string channel = await Task.Run(() => Relay.Channel(password));
+            if (!portTyped && knownRelays != null)
+            {
+                // No port typed: a relay this PC knows on that same host, at its own port, is asked first.
+                foreach (string known in knownRelays.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (Relay.Parse("x@" + known, KovaRelayWire.Wire.DefaultPort, out _) is not Relay.Target k) continue;
+                    if (!string.Equals(k.RelayHost, t.RelayHost, StringComparison.OrdinalIgnoreCase) || k.RelayPort == KovaRelayWire.Wire.DefaultPort) continue;
+                    string at = bare + ":" + k.RelayPort;
+                    var there = await Task.Run(() => Relay.Check(at, channel));
+                    if (there.Up && there.HostHere == true) return new(Relay.Tagged(at, password), Protocol.DefaultPort, null, false);
+                }
+            }
             var relay = Task.Run(() => Relay.Check(relayAt, channel));
             var direct = Task.Run(() => Answers(t.RelayHost, directPort));
             // A PC that answers directly while nothing there is a relay needs no further wait.
@@ -321,7 +346,7 @@ namespace TailRemote
                     if (addr.Text.Trim().Length == 0) return ("Enter the address of the PC or of a Kova Relay.", false);
                     if (pwBox.Text.Length == 0) return ("Enter the password.", false);
                     form!.ShowStatus("Looking for the PC.", speak: true);
-                    found = await Route.Find(addr.Text, pwBox.Text);
+                    found = await Route.Find(addr.Text, pwBox.Text, Route.KnownRelays(settings));
                     if (found.Problem != null) return (found.Problem, found.CanCarryOn);
                     return null;
                 },
@@ -332,7 +357,7 @@ namespace TailRemote
             editPc.Click += async (_, _) =>
             {
                 if (Chosen() is not SavedPc pc) return;
-                if (await EditPc.Run(form, pc))
+                if (await EditPc.Run(form, pc, Route.KnownRelays(settings)))
                 {
                     savedChanged();
                     Fill(pc);
@@ -368,7 +393,7 @@ namespace TailRemote
     /// <summary>Edit PC: a saved PC's name, address and password. The address is checked the same way Connect to a PC checks it.</summary>
     internal static class EditPc
     {
-        public static Task<bool> Run(IWin32Window owner, SavedPc pc)
+        public static Task<bool> Run(IWin32Window owner, SavedPc pc, List<string> knownRelays)
         {
             string shownAddress = Relay.IsByPassword(pc.Address) ? Relay.Shown(pc.Address)
                 : pc.Port == Protocol.DefaultPort ? pc.Address
@@ -388,7 +413,7 @@ namespace TailRemote
                     if (addr.Text.Trim().Length == 0) return ("Enter the address of the PC or of a Kova Relay.", false);
                     if (pwBox.Text.Length == 0) return ("Enter the password.", false);
                     form!.ShowStatus("Checking the address.", speak: true);
-                    found = await Route.Find(addr.Text, pwBox.Text);
+                    found = await Route.Find(addr.Text, pwBox.Text, knownRelays);
                     return found.Problem != null ? (found.Problem, found.CanCarryOn) : null;
                 },
             };
