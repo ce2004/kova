@@ -58,8 +58,8 @@ Clipboard
 
 Settings
 - For controlling another PC, shown unless this PC hosts: Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Remote NVDA speech, Microphone to use, Catch up by speeding up audio instead of skipping, and Notification sounds.
-- For hosting, shown while this PC hosts or after it last hosted: Capture audio from, Play the controlling PC's microphone into, Start hosting when Windows starts (not while the Kova service is installed, which already starts with Windows), Run as a Windows service, Apply settings to the Kova service (while it is installed), Port editor, Set up audio device or Remove audio device, and Install the Kova Helper NVDA add-on.
-- Always: Back up settings to a file, Restore settings from a backup (while nothing is connected or hosted in this window), and Diagnostic logging.
+- For hosting, shown while this PC hosts or after it last hosted: Capture audio from, Play the controlling PC's microphone into, Start hosting when Windows starts (not while the Kova service is installed, which already starts with Windows), Run as a Windows service, Apply settings to the Kova service (while it is installed), Port editor, and Set up audio device or Remove audio device.
+- Always: Install the Kova Helper NVDA add-on, Back up settings to a file, Restore settings from a backup (while nothing is connected or hosted in this window), and Diagnostic logging.
 
 About
 - Check for updates (Control U), View the changelog (Shift F1), Read the guide (F1), Keyboard shortcuts, About Kova, Licences and credits, Open the Kova website, Report a problem on GitHub, and Open the log file. Long text opens as a list: the arrow keys move a line at a time, Control Up and Control Down move between sections, and Control C copies a line.
@@ -81,6 +81,12 @@ Remote NVDA speech
 - Settings, Remote NVDA speech chooses how you hear the remote PC's NVDA: through the remote PC's audio, as text and braille spoken by your own NVDA, or both.
 - As text, your NVDA speaks in your own voice and settings, follows the remote NVDA's pitch changes for capitals, and stops when the remote NVDA stops. Braille, beeps and sounds come through too. With text only, no audio is sent at all, which uses much less data.
 - This requires the Kova Helper NVDA add-on on the remote PC. Install it there with Settings, Install the Kova Helper NVDA add-on, or from your PC with File, Install the Kova Helper on the remote PC. The add-on only communicates with Kova on the same PC and sends nothing over the internet by itself. NVDA restarts once to complete the installation, and Kova keeps the add-on up to date.
+
+NVDA keys
+- The Kova Helper also gives NVDA commands for Kova, so you can use Kova from any program without going to its window: connect to saved PC 1 to 9, start controlling the PC in front, send the clipboard, get the remote PC's clipboard, disconnect, say Kova's status (the PC in front, whether you are controlling it, the delay, and the PCs in the background), say the saved PCs and their numbers, and show the Kova window.
+- They have no keys until you give them some. In NVDA's menu, choose Preferences, Input gestures, open the Kova category, choose a command, then Add, and press the keys you want.
+- They need the Kova Helper on this PC, whether it hosts or controls other PCs. Install it with Settings, Install the Kova Helper NVDA add-on. Kova must be running; if it is not, NVDA says so.
+- Once you are controlling the remote PC, every key goes there, NVDA's own included, so Control Shift Enter is still how you come back.
 
 Clipboard and files
 - Send the clipboard (Control B, or Control Shift Alt C) sends your clipboard to the other PC: text replaces the other PC's clipboard, and copied files go to its received files folder. Control Shift Alt C works even while you are controlling the remote PC, when every other key goes there. Get the remote PC's clipboard (Control Shift B) puts the remote clipboard on yours.

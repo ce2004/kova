@@ -238,13 +238,14 @@ namespace TailRemote
             {
                 _transferStatus.Item, _history, _sendClipboard, _sendFiles, _sendFolder, _getFiles, _getClipboard, _transferStop, _transfersWindow, new ToolStripSeparator(), _pickReceiveFolder, _acceptUnasked,
             });
-            // Settings for controlling another PC first, then those for hosting this one; only one group shows at a time.
+            // Settings for controlling another PC first, then those for hosting this one (only one of those two groups shows at a
+            // time), then those for any PC: the Kova Helper add-on (its NVDA keys are for any PC), backups and logging.
             var set = _setMenu = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
                 _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds, new ToolStripSeparator(),
-                _captureFrom.Menu, _micOutput.Menu, _startup, _service, _applyService, _portEditor, _audioSetup, _audioRemove, _helperHere, new ToolStripSeparator(),
-                _backup, _restore, _logging,
+                _captureFrom.Menu, _micOutput.Menu, _startup, _service, _applyService, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
+                _helperHere, _backup, _restore, _logging,
             });
             // Flow, not the usual single row: a row hides whatever does not fit, with no word to a
             // screen reader, and with Windows' text scaling About did not fit.
@@ -517,7 +518,7 @@ namespace TailRemote
             bool hostSide = !connected && (hosting || HostMode || _service.Checked);
             foreach (var item in new ToolStripItem[] { _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds })
                 item.Available = !hostSide;
-            foreach (var item in new ToolStripItem[] { _captureFrom.Menu, _micOutput.Menu, _service, _portEditor, _helperHere })
+            foreach (var item in new ToolStripItem[] { _captureFrom.Menu, _micOutput.Menu, _service, _portEditor })
                 item.Available = hostSide;
             _startup.Available = hostSide && !_service.Checked; // the service already starts with Windows, before anyone signs in
             _applyService.Available = hostSide && _service.Checked;
@@ -550,7 +551,7 @@ namespace TailRemote
         {
             ShowWhatApplies();
             bool canUse = _client != null && !_client.ListenOnly;
-            string why = _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
+            string why = ControlWhyNot;
             foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere })
             {
                 item.Enabled = canUse;
@@ -560,6 +561,9 @@ namespace TailRemote
             EnsureServiceLink();
             SaveResumeState();
         }
+
+        /// <summary>Why the items that control the PC in front cannot be used now (the menus and the NVDA keys say the same).</summary>
+        private string ControlWhyNot => _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
 
         private ServiceLink.Client? _serviceLink;
 
@@ -985,6 +989,133 @@ namespace TailRemote
             catch (Exception e) { Say("The Kova Helper could not be changed: " + e.Message); }
             finally { _helperBusy = false; }
         }
+
+        // ---- NVDA keys: Kova's commands, from keys the person gave them in NVDA (the Kova Helper's NvdaHelper.CommandServer) ----
+
+        private NvdaHelper.CommandServer? _nvdaKeys;
+
+        /// <summary>Tests: every line Kova says (Say and Speak) is handed here too.</summary>
+        internal static Action<string>? SaidForTest;
+
+        /// <summary>Each command that comes in whole runs on the window's thread, through the same code as its menu item or key.</summary>
+        internal void ListenForNvdaKeys(NvdaHelper.CommandServer server)
+        {
+            _nvdaKeys?.Dispose();
+            _nvdaKeys = server;
+            server.Command += key => Later(() => NvdaKeyPressed(key));
+        }
+
+        private void NvdaKeyPressed(NvdaKey key)
+        {
+            Doing("an NVDA key: " + key.Command);
+            // A box Kova is asking something in has the window to itself, as it would for the keys in the window. Saying
+            // things and coming to the front are fine (Show takes you to the box).
+            if (key.Command is not (NvdaKeyCommand.Status or NvdaKeyCommand.ListSaved or NvdaKeyCommand.Show) && IsHandleCreated && !IsWindowEnabled(Handle))
+            {
+                Say("Kova has a window open. Finish with it first.");
+                return;
+            }
+            switch (key.Command)
+            {
+                case NvdaKeyCommand.ConnectSaved: QuickConnect(key.Number); break;
+                case NvdaKeyCommand.Control: ControlFromNvda(); break;
+                case NvdaKeyCommand.SendClipboard: SendClipboard(); break;
+                case NvdaKeyCommand.GetClipboard:
+                    if (_client == null || _client.ListenOnly) Say(ControlWhyNot); // what the menu item says while it is greyed
+                    else GetClipboard();
+                    break;
+                case NvdaKeyCommand.Disconnect: DisconnectFromNvda(); break;
+                case NvdaKeyCommand.Status: Say(StatusSaid()); break;
+                case NvdaKeyCommand.ListSaved: Say(SavedPcsSaid()); break;
+                case NvdaKeyCommand.Show: ComeForward(); break;
+            }
+        }
+
+        private bool _controlWaiting;
+
+        /// <summary>
+        /// Start controlling the PC in front, as Control Shift Enter does in the window. The NVDA key's own keys are still held
+        /// when this comes, so Kova waits until they are all let go (up to a second): taken over while held, the remote PC
+        /// would never see them pressed, only let go. Stopping is Control Shift Enter as always, since every key then goes
+        /// to the remote PC, NVDA's own included.
+        /// </summary>
+        private async void ControlFromNvda()
+        {
+            if (_client is not Client c || c.ListenOnly) { Say(ControlWhyNot); return; }
+            if (_keys == null) return;
+            if (_keys.Remote) { Say("Already controlling the remote PC. Control Shift Enter comes back to this PC."); return; }
+            if (_controlWaiting) return;
+            _controlWaiting = true;
+            try
+            {
+                var waited = System.Diagnostics.Stopwatch.StartNew();
+                while (waited.ElapsedMilliseconds < 1000 && AnyKeyDown()) await System.Threading.Tasks.Task.Delay(15);
+            }
+            finally { _controlWaiting = false; }
+            // The connection may have gone, or control started, while the keys were let go.
+            if (_client != c || _keys == null || _keys.Remote || IsDisposed) return;
+            _keys.Toggle();
+        }
+
+        private static bool AnyKeyDown()
+        {
+            for (int vk = 1; vk < 255; vk++) if (Native.GetAsyncKeyState(vk) < 0) return true;
+            return false;
+        }
+
+        /// <summary>File, Disconnect, as if chosen from the menu; only while it is there (connected, or trying to reconnect).</summary>
+        private void DisconnectFromNvda()
+        {
+            if (_client != null || _reconnecting) { Go(); return; }
+            if (_connecting) { Say("Still connecting. Try again in a moment."); return; }
+            Say(_parked.Count > 0 ? "No PC is in front. File, Switch to PC can disconnect the PCs in the background." : "Not connected.");
+        }
+
+        /// <summary>What the window title tells, as a sentence: the PC in front, controlled or not, the delay, and the PCs in the background.</summary>
+        private string StatusSaid()
+        {
+            string background = _parked.Count == 0 ? ""
+                : " Also connected in the background: " + string.Join(", ", _parked.Select(p => p.Name)) + ".";
+            if (_client is Client c)
+            {
+                string name = NameFor(FrontAddress, FrontPort);
+                string s = c.ListenOnly ? "Listening to " + name + "."
+                    : _keys?.Remote == true ? "Controlling " + name + "."
+                    : "Connected to " + name + ", not controlling it.";
+                string audio = c.AudioDelayMs >= 0 ? "audio " + (c.AudioDelayMs + c.PingForAudio / 2) + " ms" : "";
+                if (c.LastPingMs >= 0) s += " Ping " + c.LastPingMs + " ms" + (audio.Length > 0 ? ", " + audio : "") + ".";
+                else if (audio.Length > 0) s += " A" + audio[1..] + ".";
+                if (c.Muted) s += " Its sound is muted while you are not controlling it.";
+                else if (c.ReducedSound is string reduced) s += " Sound at " + reduced + ".";
+                return s + background;
+            }
+            if (_reconnecting) return "Not connected. Trying to reconnect to " + NameFor(FrontAddress, FrontPort) + " every second." + background;
+            if (_connecting) return "Connecting to " + NameFor(FrontAddress, FrontPort) + "." + background;
+            if (_parked.Count > 0) return "No PC is in front." + background;
+            if ((_host?.Connected ?? (ServiceHosting && _serviceLink?.Connected == true ? _serviceLink.Counts : null)) is (int controlling, int listening))
+            {
+                string s = _host != null ? "This PC is hosting." : "The Kova service is hosting this PC.";
+                if (controlling + listening == 0) return s + " Nobody is connected to it.";
+                string control = controlling == 0 ? "" : controlling == 1 ? "One PC is controlling it" : controlling + " PCs are controlling it";
+                string listen = listening == 0 ? "" : control.Length > 0 ? (listening == 1 ? "one is listening" : listening + " are listening")
+                    : listening == 1 ? "One PC is listening" : listening + " PCs are listening";
+                return s + " " + control + (control.Length > 0 && listen.Length > 0 ? " and " : "") + listen + ".";
+            }
+            if (ServiceHosting) return "The Kova service is hosting this PC.";
+            return "Not connected.";
+        }
+
+        /// <summary>The saved PCs with their numbers, the numbers Control 1 to 9 and the NVDA keys use.</summary>
+        private string SavedPcsSaid()
+        {
+            var pcs = _settings.SavedPcs;
+            if (pcs.Count == 0) return NoSavedPcs;
+            var sb = new System.Text.StringBuilder(pcs.Count == 1 ? "One saved PC: " : pcs.Count + " saved PCs: ");
+            for (int i = 0; i < pcs.Count; i++) sb.Append(i + 1).Append(", ").Append(pcs[i]).Append(i == pcs.Count - 1 ? "." : ". ");
+            return sb.ToString();
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hwnd);
 
         // Read from the network thread (NvdaEvent.Perform): the menu's choice, kept where any thread may read it.
         private volatile int _remoteNvdaMode;
@@ -2024,6 +2155,7 @@ namespace TailRemote
             _keys.ModeChanged += remote => Later(() => ModeChanged(remote));
             _keys.NotConnected += () => Later(() => Say("Not connected."));
             _keys.SendClipboardPressed += () => Later(() => SendClipboard());
+            ListenForNvdaKeys(new NvdaHelper.CommandServer(DiagLog.Write));
             _titleTimer.Start();
             if (!_autoHost)
             {
@@ -2075,7 +2207,8 @@ namespace TailRemote
             // 4.4: by focus, not by whether the keys go to the remote PC: while no Kova window is in front (you are
             // in another program on this PC), the remote PC's sound and its NVDA speech and braille stay silent, and
             // the host sends no sound at all. Back the moment a Kova window comes to the front (ForegroundChanged).
-            bool mute = _muteLocal.Checked && !KovaInFront();
+            // Never while controlling it: an NVDA key can start controlling from another program, with no Kova window in front.
+            bool mute = _muteLocal.Checked && !KovaInFront() && _keys?.Remote != true;
             if (mute == c.Muted) return;
             c.Muted = mute;
             if (mute) c.LockedStep = Protocol.OpusSteps.Length - 1;
@@ -3272,6 +3405,7 @@ namespace TailRemote
         /// </summary>
         private void Speak(string line)
         {
+            SaidForTest?.Invoke(line);
             Log(line);
             Speech.Speak(line, interrupt: false);
         }
@@ -3280,6 +3414,7 @@ namespace TailRemote
         private void Say(string line)
         {
             if (_sayFirst != null) { line = _sayFirst + " " + line; _sayFirst = null; }
+            SaidForTest?.Invoke(line);
             Log(line);
             Speech.Speak(line);
         }
@@ -3323,6 +3458,12 @@ namespace TailRemote
         private bool ShowRequested() => RunNow(() =>
         {
             Doing("coming forward for a second copy");
+            ComeForward();
+        });
+
+        /// <summary>The window to the front, out of the notification area if it is there, said as when it opens.</summary>
+        private void ComeForward()
+        {
             RestoreFromTray();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             // A box open over the window (a question, Get files): that is where the keys belong.
@@ -3332,7 +3473,8 @@ namespace TailRemote
             Activate();
             // As when it opens: the window is blank, so NVDA has nothing of its own to say.
             Speech.Speak(Text + ". Alt opens the menus.", interrupt: false);
-        });
+            SaidForTest?.Invoke(Text + ". Alt opens the menus.");
+        }
 
         /// <summary>
         /// The sign-in task started Kova with --host while this window runs (Program.HostRequested, on a
@@ -3384,6 +3526,7 @@ namespace TailRemote
             _host?.Leave(e.CloseReason == CloseReason.WindowsShutDown ? Protocol.LeavingShutdown : Protocol.LeavingStopped);
             _host?.Dispose();
             _keys?.Dispose();
+            _nvdaKeys?.Dispose();
             _serviceLink?.Dispose();
             base.OnFormClosing(e);
         }

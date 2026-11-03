@@ -12,7 +12,8 @@ namespace TailRemote
     internal sealed class NvdaHelperForm : Form
     {
         internal const string InstallText =
-            "The Kova Helper is a small NVDA add-on. It lets the PC controlling this one get this PC's NVDA speech, braille, beeps and sounds straight away, as text and in its own voice.\r\n\r\n" +
+            "The Kova Helper is a small NVDA add-on. When this PC is controlled through Kova, it lets the controlling PC get this PC's NVDA speech, braille, beeps and sounds straight away, as text and in its own voice.\r\n\r\n" +
+            "It also adds commands for Kova to NVDA, such as connecting to a saved PC or sending the clipboard, so you can use Kova without going to its window. They have no keys until you give them some in NVDA's menu, Preferences, Input gestures, under Kova.\r\n\r\n" +
             "It only talks to Kova on this PC, and it sends nothing over the internet by itself.\r\n\r\n" +
             "NVDA will restart to finish installing, so it goes quiet for a few seconds.\r\n\r\n" +
             "You can remove it any time, from NVDA's add-on store or with the same menu item in Kova.";
@@ -24,7 +25,7 @@ namespace TailRemote
 
         internal const string RemoveText =
             "This removes the Kova Helper NVDA add-on from this PC.\r\n\r\n" +
-            "A PC controlling this one then hears this PC's NVDA only through its sound.\r\n\r\n" +
+            "A PC controlling this one then hears this PC's NVDA only through its sound, and NVDA's commands for Kova go away.\r\n\r\n" +
             "NVDA will restart to finish removing it, so it goes quiet for a few seconds.";
 
         internal const string RemoteText =
@@ -47,7 +48,7 @@ namespace TailRemote
             var panel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Padding = new Padding(12) };
             var box = new TextBox
             {
-                Multiline = true, ReadOnly = true, Text = text, Width = 520, Height = 190, ScrollBars = ScrollBars.Vertical,
+                Multiline = true, ReadOnly = true, Text = text, Width = 520, Height = 230, ScrollBars = ScrollBars.Vertical,
                 AccessibleName = title, TabIndex = 0, BackColor = SystemColors.Window,
             };
             panel.Controls.Add(box);

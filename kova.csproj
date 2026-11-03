@@ -93,7 +93,7 @@
     <PackageReference Include="Concentus" Version="2.2.2" />
   </ItemGroup>
 
-  <!-- The Kova Helper NVDA add-on (nvda-addon\): zipped into a .nvda-addon at every build where it changed, and carried inside Kova.exe (NvdaHelper installs it into a host's NVDA). -->
+  <!-- The Kova Helper NVDA add-on (nvda-addon\): zipped into a .nvda-addon at every build where it changed, and carried inside Kova.exe (NvdaHelper installs it into this PC's NVDA, on a host or a controlling PC). -->
   <ItemGroup>
     <KovaHelperAddonFile Include="nvda-addon\**\*" Exclude="nvda-addon\**\__pycache__\**;nvda-addon\**\*.pyc" />
   </ItemGroup>

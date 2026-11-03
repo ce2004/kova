@@ -1633,6 +1633,72 @@ namespace TailRemote
                 if (!AboutMenu.Resource("CHANGES.txt").Split('\n').Any(l => l.Trim() == Updater.Current.ToString()) || AboutMenu.Resource("README.txt").Length == 0)
                     return Fail("the changelog inside Kova has no section for " + Updater.Current + ", or the guide is missing");
             }
+
+            // NVDA keys (the Kova Helper's commands): each comes in on the keys pipe and runs on the window's thread through
+            // the menus' own code, saying what the menus say. A test pipe, with this process standing in for NVDA. Nothing
+            // that would connect, send the clipboard or show the window: this PC's real service and NVDA are left alone.
+            {
+                string keysDir = Path.Combine(Path.GetTempPath(), "kova-selftest-keys-" + Guid.NewGuid().ToString("N")[..8]);
+                NvdaHelper.CommandServer? keysPipe = null;
+                try
+                {
+                    Directory.CreateDirectory(keysDir);
+                    Settings.TestDir = keysDir;
+                    var pre = new Settings();
+                    pre.SavedPcs.Add(new SavedPc { Address = "office.example", Name = "Office", PasswordEnc = Settings.Protect("x") });
+                    pre.SavedPcs.Add(new SavedPc { Address = "laptop.example", Port = 47555, PasswordEnc = Settings.Protect("y") });
+                    if (!pre.Save()) return Fail("the settings for the NVDA keys test could not be saved");
+                    var said = new System.Collections.Generic.List<string>();
+                    MainForm.SaidForTest = said.Add;
+                    using var form = new MainForm(false, false, false);
+                    form.CreateControl();
+                    string pipe = "KovaKeysSelfTest" + Guid.NewGuid().ToString("N")[..8];
+                    keysPipe = new NvdaHelper.CommandServer(null, pipe, pid => pid == Environment.ProcessId);
+                    form.ListenForNvdaKeys(keysPipe);
+                    _ = form.Handle; // never shown: the commands are handed to the window through its handle, made here
+                    for (int i = 0; i < 150 && !keysPipe.Listening; i++) System.Threading.Thread.Sleep(20);
+                    if (!keysPipe.Listening) return Fail("the NVDA keys pipe did not come up");
+                    string Press(NvdaKey key)
+                    {
+                        said.Clear();
+                        System.Threading.Thread.Sleep(1000 / NvdaHelper.CommandServer.PerSecond + 20);
+                        using (var c = new System.IO.Pipes.NamedPipeClientStream(".", pipe, System.IO.Pipes.PipeDirection.Out))
+                        {
+                            c.Connect(3000);
+                            c.Write(key.Frame());
+                            c.WaitForPipeDrain(); // as the add-on does: Kova has read it before the pipe closes
+                        }
+                        // The window's thread is this one: its messages are let through until the answer is said.
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        while (said.Count == 0 && sw.ElapsedMilliseconds < 3000) { Application.DoEvents(); System.Threading.Thread.Sleep(10); }
+                        return string.Join(" / ", said);
+                    }
+                    var checks = new (NvdaKey Key, Func<string, bool> Ok)[]
+                    {
+                        (new NvdaKey(NvdaKeyCommand.ListSaved), s => s == "2 saved PCs: 1, Office. 2, laptop.example, port 47555."),
+                        (new NvdaKey(NvdaKeyCommand.ConnectSaved, 5), s => s == "There is no saved PC 5. There are 2."),
+                        (new NvdaKey(NvdaKeyCommand.Control), s => s == "Connect to a PC first."),
+                        (new NvdaKey(NvdaKeyCommand.GetClipboard), s => s == "Connect to a PC first."),
+                        (new NvdaKey(NvdaKeyCommand.Disconnect), s => s == "Not connected."),
+                        // This PC may have the real Kova service hosting it (this server does).
+                        (new NvdaKey(NvdaKeyCommand.Status), s => s == "Not connected." || s.StartsWith("The Kova service is hosting this PC.")),
+                    };
+                    foreach (var (key, ok) in checks)
+                    {
+                        string heard = Press(key);
+                        if (!ok(heard)) return Fail("the NVDA key " + key + " said: " + (heard.Length > 0 ? heard : "nothing"));
+                    }
+                    if (keysPipe.Taken != checks.Length || keysPipe.Dropped != 0) return Fail("the NVDA keys pipe took " + keysPipe.Taken + " of " + checks.Length + " keys, dropped " + keysPipe.Dropped);
+                    lossless += " | NVDA keys";
+                }
+                finally
+                {
+                    keysPipe?.Dispose();
+                    MainForm.SaidForTest = null;
+                    Settings.TestDir = null;
+                    try { Directory.Delete(keysDir, true); } catch { }
+                }
+            }
             Directory.Delete(dir, true);
             File.WriteAllText(Path.Combine(Path.GetTempPath(), "tailremote-selftest.txt"), "ok, ping " + c.LastPingMs + " ms. " + Dump() + lossless + CableReport());
             return 0;

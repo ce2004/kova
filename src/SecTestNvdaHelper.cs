@@ -25,7 +25,123 @@ namespace TailRemote
             return Tests();
         }
 
-        private static string? Tests() => Codec() ?? Perform() ?? Package() ?? Installer() ?? Pipe() ?? Squat() ?? SecureScreen() ?? HostBurst() ?? AddonEndToEnd();
+        private static string? Tests() => Codec() ?? Perform() ?? Package() ?? Installer() ?? Pipe() ?? Squat() ?? KeysPipe() ?? SecureScreen() ?? HostBurst() ?? AddonEndToEnd();
+
+        // ---- The NVDA keys pipe (NvdaHelper.CommandServer) ----
+
+        /// <summary>Writes bytes to a pipe the way the add-on does (then waits for Kova to have read them) and closes; IOExceptions are expected for junk.</summary>
+        private static bool SendKeyBytes(string name, byte[] bytes, int holdMs = 0)
+        {
+            using var c = Open(name);
+            if (c == null) return false;
+            try
+            {
+                c.Write(bytes);
+                c.Flush();
+                if (holdMs > 0) Thread.Sleep(holdMs);
+                c.WaitForPipeDrain();
+            }
+            catch (IOException) { }
+            return true;
+        }
+
+        /// <summary>
+        /// The NVDA keys pipe: a program that is not NVDA is refused; each command Kova knows comes through once, in order;
+        /// junk (wrong lengths, unknown commands or numbers, a byte more, too slow, huge) runs nothing and ends only that
+        /// connection; a flood is cut to 5 a second; and the name cannot be taken first.
+        /// </summary>
+        private static string? KeysPipe()
+        {
+            // The wire format, in one place.
+            var good = Enumerable.Range(1, 9).Select(n => new NvdaKey(NvdaKeyCommand.ConnectSaved, n))
+                .Concat(Enumerable.Range(2, 7).Select(c => new NvdaKey((NvdaKeyCommand)c))).ToArray();
+            foreach (var k in good)
+            {
+                byte[] f = k.Frame();
+                if (f.Length != 6 || BitConverter.ToInt32(f, 0) != 2 || NvdaKey.Parse(f.AsSpan(4)) != k) return "the NVDA key " + k + " did not come back the same";
+            }
+            foreach (var b in new[] { new byte[] { 0, 0 }, new byte[] { 1, 0 }, new byte[] { 1, 10 }, new byte[] { 1, 255 }, new byte[] { 2, 1 }, new byte[] { 8, 9 }, new byte[] { 9, 0 }, new byte[] { 255, 0 }, new byte[] { 6 }, new byte[] { 6, 0, 0 }, Array.Empty<byte>() })
+                if (NvdaKey.Parse(b) != null) return "an NVDA key body of " + string.Join(",", b) + " was taken";
+
+            // The real rule: this test process is not NVDA, so nothing it sends is read.
+            string n1 = TestPipe();
+            using (var real = new NvdaHelper.CommandServer(Log, n1))
+            {
+                int heard = 0;
+                real.Command += _ => Interlocked.Increment(ref heard);
+                if (!Until(() => real.Listening)) return "the NVDA keys pipe did not come up: " + string.Join(" / ", _log);
+                if (!SendKeyBytes(n1, new NvdaKey(NvdaKeyCommand.Disconnect).Frame())) return "could not connect to the NVDA keys pipe";
+                if (!Until(() => real.Refused >= 1)) return "a program that is not NVDA was not refused on the NVDA keys pipe";
+                Thread.Sleep(200);
+                if (heard != 0 || real.Taken != 0) return "a program that is not NVDA got a command through";
+            }
+
+            string n2 = TestPipe();
+            var keys = new ConcurrentQueue<NvdaKey>();
+            using var server = new NvdaHelper.CommandServer(null, n2, pid => pid == Environment.ProcessId);
+            server.Command += keys.Enqueue;
+            if (!Until(() => server.Listening)) return "the test NVDA keys pipe did not come up";
+            foreach (var k in good)
+            {
+                int before = keys.Count;
+                if (!SendKeyBytes(n2, k.Frame())) return "could not connect to the test NVDA keys pipe";
+                if (!Until(() => keys.Count > before)) return "the NVDA key " + k + " did not come through";
+                Thread.Sleep(1000 / NvdaHelper.CommandServer.PerSecond + 20); // within the 5 a second
+            }
+            if (!keys.SequenceEqual(good)) return "NVDA keys came through wrong: " + string.Join(" | ", keys);
+
+            byte[] Len(int n, params byte[] body) => BitConverter.GetBytes(n).Concat(body).ToArray();
+            var junk = new (string What, byte[] Bytes, int HoldMs)[]
+            {
+                ("a zero length", Len(0), 0),
+                ("a length of 1", Len(1, 6), 0),
+                ("a length of 3", Len(3, 6, 0, 0), 0),
+                ("a negative length", Len(-2, 6, 0), 0),
+                ("a huge length", Len(1 << 30, 6, 0), 0),
+                ("an unknown command", Len(2, 9, 0), 0),
+                ("command 0", Len(2, 0, 0), 0),
+                ("saved PC 0", Len(2, 1, 0), 0),
+                ("saved PC 10", Len(2, 1, 10), 0),
+                ("a number on Status", Len(2, 6, 1), 0),
+                ("two commands in one", new NvdaKey(NvdaKeyCommand.Status).Frame().Concat(new NvdaKey(NvdaKeyCommand.Show).Frame()).ToArray(), 0),
+                ("a byte after the command", new NvdaKey(NvdaKeyCommand.Status).Frame().Concat(new byte[] { 0 }).ToArray(), 0),
+                ("half a command, then nothing", Len(2, 6), NvdaHelper.CommandServer.MaxWaitMs + 500),
+                ("a command held open", new NvdaKey(NvdaKeyCommand.Status).Frame(), NvdaHelper.CommandServer.MaxWaitMs + 500),
+                ("64 KB", Len(65536).Concat(new byte[65536]).ToArray(), 0),
+            };
+            foreach (var (what, bytes, hold) in junk)
+            {
+                int dropped = server.Dropped, taken = server.Taken;
+                if (!SendKeyBytes(n2, bytes, hold)) return "the NVDA keys pipe stopped taking connections before " + what;
+                if (!Until(() => server.Dropped > dropped, NvdaHelper.CommandServer.MaxWaitMs + 2000)) return "the NVDA keys pipe did not end a connection that sent " + what;
+                Thread.Sleep(50);
+                if (server.Taken != taken) return "the NVDA keys pipe ran a command from a connection that sent " + what;
+            }
+
+            // A flood: at most 5 a second run, the rest are left out, and the pipe carries on.
+            Thread.Sleep(1100);
+            int takenBefore = server.Taken;
+            var flood = Stopwatch.StartNew();
+            for (int i = 0; i < 15; i++) SendKeyBytes(n2, new NvdaKey(NvdaKeyCommand.Status).Frame());
+            if (!Until(() => server.Taken + server.TooFast >= takenBefore + 15)) return "a flood of NVDA keys was not all read";
+            int ran = server.Taken - takenBefore;
+            int allowed = NvdaHelper.CommandServer.PerSecond * (1 + (int)(flood.ElapsedMilliseconds / 1000));
+            if (server.TooFast == 0 || ran > allowed) return "a flood of 15 NVDA keys in " + flood.ElapsedMilliseconds + " ms ran " + ran;
+            Thread.Sleep(1100);
+            int last = keys.Count;
+            SendKeyBytes(n2, new NvdaKey(NvdaKeyCommand.Show).Frame());
+            if (!Until(() => keys.Count > last)) return "the NVDA keys pipe stopped working after junk and a flood";
+            Measure("NVDA keys: a flood of 15 in " + flood.ElapsedMilliseconds + " ms ran " + ran + ", left out " + server.TooFast);
+
+            // A program that makes the pipe first gets it, and Kova then refuses to share the name.
+            string n3 = TestPipe();
+            using var squatter = new NamedPipeServerStream(n3, PipeDirection.InOut, 4, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using var late = new NvdaHelper.CommandServer(null, n3, _ => true);
+            Thread.Sleep(1000);
+            if (late.Listening) return "Kova made its NVDA keys pipe under a name another program already had";
+            if (!NvdaHelper.CommandPipeName(7).StartsWith(NvdaHelper.CommandPipePrefix + "7") || NvdaHelper.CommandPipeName(7) == NvdaHelper.PipeName(7)) return "the NVDA keys pipe's name is wrong";
+            return null;
+        }
 
         /// <summary>A console's worth of lines from the host's NVDA reaches a controller whole and in order, in fewer messages, a cut-off in its place.</summary>
         private static string? HostBurst()
@@ -559,6 +675,11 @@ namespace TailRemote
                 string pipe = "KovaNvdaPyTest" + Guid.NewGuid().ToString("N")[..6];
                 var got = new ConcurrentQueue<string>();
                 using var server = new NvdaHelper.Server(null, pipe + session, _ => true);
+                // The NVDA keys go to a pipe of their own, served whether or not this PC hosts.
+                string keysPipe = "KovaKeysPyTest" + Guid.NewGuid().ToString("N")[..6];
+                var keys = new ConcurrentQueue<NvdaKey>();
+                using var keysServer = new NvdaHelper.CommandServer(null, keysPipe + session, _ => true);
+                keysServer.Command += keys.Enqueue;
                 long firstBurst = 0, lastBurst = 0;
                 server.Event += e =>
                 {
@@ -567,9 +688,9 @@ namespace TailRemote
                     if (firstBurst == 0) firstBurst = Stopwatch.GetTimestamp();
                     lastBurst = Stopwatch.GetTimestamp();
                 };
-                if (!Until(() => server.Listening)) return "the pipe for the Python test did not come up";
+                if (!Until(() => server.Listening && keysServer.Listening)) return "the pipes for the Python test did not come up";
                 var psi = new ProcessStartInfo(python) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-                foreach (var a in new[] { "-I", "-B", driver, Path.Combine(addon, "globalPlugins", "kovaHelper", "__init__.py"), "\\\\.\\pipe\\" + pipe, app }) psi.ArgumentList.Add(a);
+                foreach (var a in new[] { "-I", "-B", driver, Path.Combine(addon, "globalPlugins", "kovaHelper", "__init__.py"), "\\\\.\\pipe\\" + pipe, app, "\\\\.\\pipe\\" + keysPipe }) psi.ArgumentList.Add(a);
                 using var p = Process.Start(psi)!;
                 var outTask = p.StandardOutput.ReadToEndAsync();
                 var errTask = p.StandardError.ReadToEndAsync();
@@ -599,6 +720,11 @@ namespace TailRemote
                 for (int i = 0; i < burst; i++)
                     if (i >= lines.Length || lines[i] != "speak: burst " + i + ": C:\\Users\\Admin> dir /s don't/0") return "a burst of lines came through wrong at " + i + ": " + (i < lines.Length ? lines[i] : "missing");
                 if (all.Length != want.Length + burst) return "the add-on handed over more than it should have (a sound from outside NVDA's waves folder, or a cut-off with nothing said?): " + Short(string.Join(" || ", all.Skip(want.Length + burst)));
+                // Every NVDA key the add-on has, once each, in the order pressed (the driver presses them all).
+                var wantKeys = Enumerable.Range(1, 9).Select(n => new NvdaKey(NvdaKeyCommand.ConnectSaved, n))
+                    .Concat(new[] { NvdaKeyCommand.Control, NvdaKeyCommand.SendClipboard, NvdaKeyCommand.GetClipboard, NvdaKeyCommand.Disconnect, NvdaKeyCommand.Status, NvdaKeyCommand.ListSaved, NvdaKeyCommand.Show }.Select(c => new NvdaKey(c))).ToArray();
+                if (!keys.SequenceEqual(wantKeys)) return "the add-on's NVDA keys reached Kova as: " + string.Join(" | ", keys) + " " + Short(said);
+                if (keysServer.Dropped != 0 || keysServer.Refused != 0) return "the add-on's NVDA keys were dropped or refused by Kova (" + keysServer.Dropped + " dropped, " + keysServer.Refused + " refused)";
                 foreach (var line in said.Split('\n')) if (line.StartsWith("measure: ")) Measure(line[9..].Trim());
                 Measure("host: the 3000 burst lines reached Kova over " + ((lastBurst - firstBurst) * 1000.0 / Stopwatch.Frequency).ToString("0.0") + " ms, first to last");
                 return null;
@@ -626,7 +752,7 @@ namespace TailRemote
         // Stand-ins for the parts of NVDA the add-on uses, then everything it hooks, in order.
         private const string Driver = @"
 import sys, types, time, importlib.util, os
-plugin_path, pipe_base, app_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+plugin_path, pipe_base, app_dir, keys_base = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 class Point:
     def __init__(self): self.handlers = []
@@ -653,6 +779,19 @@ class Log:
 mod('globalPluginHandler', GlobalPlugin=GP)
 mod('logHandler', log=Log())
 mod('globalVars', appDir=app_dir, appArgs=types.SimpleNamespace(secure=False))
+said_ui = []
+import threading
+def ui_message(text):
+    said_ui.append((text, threading.current_thread() is threading.main_thread()))
+mod('ui', message=ui_message)
+mod('queueHandler', eventQueue=object(), queueFunction=lambda queue, f, *a, **kw: f(*a, **kw))
+def script(description=None, category=None, gesture=None, gestures=None, **kw):
+    def deco(f):
+        f.__doc__ = description
+        f.category, f.gesture, f.gestures = category, gesture, gestures
+        return f
+    return deco
+mod('scriptHandler', script=script)
 class PitchCommand:
     def __init__(self, offset=0, multiplier=1): self.offset, self.multiplier = offset, multiplier
 class CharacterModeCommand:
@@ -671,6 +810,7 @@ spec = importlib.util.spec_from_file_location('kovaHelper', plugin_path)
 k = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(k)
 k.PIPE_BASE = pipe_base
+k.COMMAND_PIPE_BASE = keys_base
 k.RETRY_SECONDS = 0.2
 p = k.GlobalPlugin()
 end = time.time() + 10
@@ -743,7 +883,41 @@ hook = spent / n * 1e6
 rate = n / (time.perf_counter() - start)
 time.sleep(1.5)
 print('measure: add-on hook %.1f microseconds a line on NVDA\'s thread; %d lines at %d a second went in %d writes to the pipe (before: one write a line)' % (hook, n, rate, writes[0]))
+# NVDA keys: every command is a script under Kova, with a description, and none has a key of its own.
+names = sorted(n for n in dir(k.GlobalPlugin) if n.startswith('script_'))
+want = sorted(['script_kovaConnect%d' % i for i in range(1, 10)] + ['script_kova' + x for x in ('Control', 'SendClipboard', 'GetClipboard', 'Disconnect', 'Status', 'ListPcs', 'Show')])
+if names != want: print('the scripts are', names); sys.exit(5)
+for n in names:
+    f = getattr(k.GlobalPlugin, n)
+    if not f.__doc__ or f.category != 'Kova' or f.gesture or f.gestures: print('the script', n, 'has no description, is not under Kova, or has a key'); sys.exit(5)
+if k.GlobalPlugin.scriptCategory != 'Kova' or any('gesture' in a.lower() for a in vars(k.GlobalPlugin)): print('the plugin has keys of its own'); sys.exit(5)
+# Each pressed once, in order; Kova takes 5 a second, so they are spaced out like a person pressing them.
+order = ['script_kovaConnect%d' % i for i in range(1, 10)] + ['script_kova' + x for x in ('Control', 'SendClipboard', 'GetClipboard', 'Disconnect', 'Status', 'ListPcs', 'Show')]
+worst = 0.0
+for n in order:
+    t0 = time.perf_counter()
+    getattr(p, n)(None)
+    worst = max(worst, time.perf_counter() - t0)
+    time.sleep(0.25)
+time.sleep(0.5)
+if said_ui: print('a key Kova took said something:', said_ui); sys.exit(6)
+print('measure: an NVDA key took at most %.0f microseconds on NVDA\'s thread' % (worst * 1e6))
+# No Kova window: said, once, on NVDA's main thread (queueHandler), however many keys were pressed.
+k.COMMAND_PIPE_BASE = '\\\\.\\pipe\\KovaKeysNobodyHere-'
+for i in range(3):
+    p.script_kovaStatus(None)
+end = time.time() + 5
+while not said_ui and time.time() < end: time.sleep(0.05)
+time.sleep(0.5)
+if [t for t, _ in said_ui] != [k.NOT_RUNNING]: print('with no Kova the add-on said', said_ui); sys.exit(6)
+said_ui.clear()
+# The sign-in screen's NVDA (no keys thread): said at once.
+keys_thread, p._keys = p._keys, None
+p.script_kovaShow(None)
+p._keys = keys_thread
+if [t for t, _ in said_ui] != [k.NOT_HERE]: print('on a secure screen the add-on said', said_ui); sys.exit(6)
 p.terminate()
+if p._keys is not None or keys_thread.is_alive(): print('the keys thread was left running'); sys.exit(4)
 if speech.extensions.pre_speech.handlers or tones.decide_beep.handlers or braille.pre_writeCells.handlers: print('hooks left behind'); sys.exit(4)
 print('done')
 ";
