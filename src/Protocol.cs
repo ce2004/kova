@@ -68,6 +68,45 @@ namespace TailRemote
         public static string VideoPurpose(ReadOnlySpan<byte> hostValue, ReadOnlySpan<byte> clientValue) =>
             "video " + Convert.ToHexString(hostValue) + Convert.ToHexString(clientValue) + " ";
 
+        /// <summary>
+        /// A tunnel lane (Reach a port on the remote PC, Tunnels.cs): laid out like a file lane ("KTN1", session token, 16 bytes
+        /// that carry the remote PC's port as a u16 and then zeros, the lane's fresh random value, LaneProof), so the port is
+        /// covered by the proof and cannot be changed on the way. On keys of its own (TunnelPurpose). It carries one TCP
+        /// connection to that port on the host PC itself (loopback only, never another address). Messages either way:
+        /// TunnelData (bytes), TunnelEnd (this side sends no more: a half-close); first from the host, TunnelOpened.
+        /// </summary>
+        public static readonly byte[] TunnelMagic = "KTN1"u8.ToArray();
+        public const byte TunnelData = 1;     // either way: the next bytes of the connection (up to TunnelChunk)
+        public const byte TunnelEnd = 2;      // either way: no more bytes from this side (the other may still send)
+        public const byte TunnelOpened = 0x81; // host, first: u8 0 = connected to the port; anything else = not, then UTF-8 why, and the lane closes
+        public const byte TunnelOk = 0, TunnelNothingThere = 1, TunnelTooMany = 2, TunnelLocked = 3;
+        /// <summary>
+        /// A tunnel lane's proof is made under its own label: the magic travels in the clear, and with one label for all
+        /// lanes a relay could relabel a tunnel lane as a file lane (which would replace the PC's file channel).
+        /// </summary>
+        public const char TunnelProofLabel = 'T';
+        public const int TunnelChunk = 32 * 1024;
+        /// <summary>Connections through tunnels at once: per controlling PC, and in all on one host.</summary>
+        public const int MaxTunnelsPerSession = 48, MaxTunnels = 256;
+
+        public static string TunnelPurpose(ReadOnlySpan<byte> hostValue, ReadOnlySpan<byte> clientValue) =>
+            "tunnel " + Convert.ToHexString(hostValue) + Convert.ToHexString(clientValue) + " ";
+
+        /// <summary>The 16 bytes a tunnel lane carries where a file lane has its channel: the port, then zeros.</summary>
+        public static byte[] TunnelField(int port)
+        {
+            byte[] f = new byte[16];
+            BitConverter.TryWriteBytes(f.AsSpan(0, 2), (ushort)port);
+            return f;
+        }
+
+        /// <summary>The port in a tunnel lane's field, or 0 when the field is not one (port 0, or anything after it not zero).</summary>
+        public static int TunnelPort(ReadOnlySpan<byte> field)
+        {
+            if (field.Length != 16 || field[2..].IndexOfAnyExcept((byte)0) >= 0) return 0;
+            return BitConverter.ToUInt16(field[..2]);
+        }
+
         // Client to host
         public const byte Key = 1;      // vk u16, scan u16, flags u8 (1 = up, 2 = extended)
         public const byte Ping = 2;     // stamp i64
@@ -155,6 +194,7 @@ namespace TailRemote
         public const uint FeatureMic = 4096;   // takes the controller's microphone (UdpMic, MicState)
         public const uint FeatureNvda = 8192;  // sends its NVDA's speech and braille as text (NvdaWant)
         public const uint FeatureNvdaSecureScreen = 16384; // a controller that understands NvdaAvailable = NvdaSecureScreen (older ones are never sent it)
+        public const uint FeatureTunnel = 32768; // takes tunnel lanes (TunnelMagic): Reach a port on the remote PC
 
         /// <summary>
         /// The bitrate steps, best first. 5 ms packets down to 128 kbit/s (Opus's
@@ -176,7 +216,7 @@ namespace TailRemote
         public static int WireKbps(int step) => OpusSteps[step].Kbps + 1000 / OpusSteps[step].Ms * PacketOverheadBytes * 8 / 1000;
 
         /// <summary>What this version supports, sent to the other side after login.</summary>
-        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda | FeatureNvdaSecureScreen;
+        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda | FeatureNvdaSecureScreen | FeatureTunnel;
 
 
         // ---- The login, damage-proof ----
@@ -360,10 +400,10 @@ namespace TailRemote
         /// the clear (in every UDP hello), and a lane opened on it alone could stop that PC's transfers.
         /// Over this lane's own hello nonce, so a recorded one is no use on another lane.
         /// </summary>
-        public static byte[] LaneProof(byte[] sessionKey, ReadOnlySpan<byte> laneHelloNonce, ReadOnlySpan<byte> channel, ReadOnlySpan<byte> laneValue)
+        public static byte[] LaneProof(byte[] sessionKey, ReadOnlySpan<byte> laneHelloNonce, ReadOnlySpan<byte> channel, ReadOnlySpan<byte> laneValue, char label = 'L')
         {
             byte[] msg = new byte[1 + laneHelloNonce.Length + channel.Length + laneValue.Length];
-            msg[0] = (byte)'L';
+            msg[0] = (byte)label; // 'L' file and screen lanes (as ever), TunnelProofLabel tunnel lanes
             laneHelloNonce.CopyTo(msg.AsSpan(1));
             channel.CopyTo(msg.AsSpan(1 + laneHelloNonce.Length));
             laneValue.CopyTo(msg.AsSpan(1 + laneHelloNonce.Length + channel.Length));

@@ -141,6 +141,12 @@ namespace TailRemote
                 for (int i = 0; i < 100 && heard == null; i++) Thread.Sleep(20);
                 Check(heard == "NVDA through the relay", "the host's NVDA text through the relay");
 
+                // Reach a port on the remote PC through the relay: each connection is a lane of its own, paired by the relay
+                // like a file lane, so nothing in the relay knows about tunnels.
+                sw.Restart();
+                string? tunnel = TunnelTest.Full(c, () => host.TestTunnels, 8);
+                Check(tunnel == null, "a port on the host reached through the relay: 8 MB there and back by hash, six at once, half-closes, closing it (" + sw.ElapsedMilliseconds + " ms)" + (tunnel != null ? ": " + tunnel : ""));
+
                 // A wrong password through the relay is refused like any other.
                 try { Client.Connect(address, relayPort, "not-the-password", new Player(Player.NoDevice, _ => { }), _ => { }).Dispose(); Check(false, "a wrong password through the relay was refused"); }
                 catch (InvalidOperationException e) { Check(e.Message.StartsWith("Wrong password"), "a wrong password through the relay was refused (" + e.Message + ")"); }

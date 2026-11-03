@@ -506,6 +506,91 @@ namespace TailRemote
             catch { tcp.Dispose(); return null; }
         }
 
+        // ---- Reach a port on the remote PC (Tunnels.cs) ----
+
+        /// <summary>The host carries connections to its own ports: it is new enough, and this PC controls it (never listen-only).</summary>
+        public bool CanTunnel => !ListenOnly && (_peerFeatures & Protocol.FeatureTunnel) != 0;
+
+        /// <summary>This connection has ended (dropped or let go): nothing more goes over it.</summary>
+        public bool Closed => _closed;
+
+        /// <summary>One tunnel lane to this port on the host PC itself, or null if it could not be opened.</summary>
+        internal (TcpClient Tcp, SecureLink Link)? OpenTunnelLane(int port) =>
+            _closed || !CanTunnel ? null : OpenTunnelLane(_laneHost, _token, _laneKey, _hostNonce, _myNonce, port, null);
+
+        /// <summary>Test only (--securitytest): a tunnel lane whose login is changed by alter before its check is added, even after this connection closed.</summary>
+        internal (TcpClient Tcp, SecureLink Link)? TestTunnelLane(int port, Action<byte[], byte[]>? alter) =>
+            OpenTunnelLane(_laneHost, _token, _laneKey, _hostNonce, _myNonce, port, alter);
+
+        /// <summary>Test only (--securitytest): this login's session key, to make a lane proof over a field the host must refuse anyway.</summary>
+        internal byte[] TestLaneKey => _laneKey;
+
+        /// <summary>
+        /// A tunnel lane: proven with this login's key like a file lane, the port in the proven part, on keys of its own (both
+        /// PCs' fresh values, TunnelPurpose), so no two lanes ever share a key and counter. Null if it could not be opened.
+        /// </summary>
+        private static (TcpClient, SecureLink)? OpenTunnelLane(LaneRoute host, byte[] token, byte[] key, byte[] hostNonce, byte[] myNonce, int port, Action<byte[], byte[]>? alter)
+        {
+            if (port < 1 || port > 65535) return null;
+            TcpClient tcp;
+            try { tcp = LaneDial(host); } catch { return null; }
+            try
+            {
+                var s = tcp.GetStream();
+                s.ReadTimeout = 5000;
+                byte[] hello = new byte[Protocol.HelloBytes];
+                Protocol.ReadExactly(s, hello);
+                CheckLaneHello(hello, host);
+                byte[] laneValue = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+                byte[] field = Protocol.TunnelField(port);
+                byte[] answer = new byte[Protocol.AnswerBytes];
+                Protocol.TunnelMagic.CopyTo(answer, 0);
+                token.CopyTo(answer, 4);
+                field.CopyTo(answer, 12);
+                laneValue.CopyTo(answer, 28);
+                Protocol.LaneProof(key, hello.AsSpan(4, 16), field, laneValue, Protocol.TunnelProofLabel).CopyTo(answer, Protocol.LaneProofAt);
+                alter?.Invoke(answer, hello[4..20]); // tests only: the answer, and this lane's hello nonce
+                Protocol.AddCheck(answer);
+                s.Write(answer);
+                return (tcp, new SecureLink(key, hostNonce, myNonce, isHost: false, Protocol.TunnelPurpose(hello.AsSpan(4, 16), answer.AsSpan(28, 16)), maxReceive: 1 + Protocol.TunnelChunk));
+            }
+            catch { tcp.Dispose(); return null; }
+        }
+
+        /// <summary>
+        /// Whether something on the host answers at this port right now: a tunnel lane opened and closed again at once.
+        /// Null when it does; otherwise why not, in words. Never throws.
+        /// </summary>
+        public Task<string?> ProbeTunnelAsync(int port) => Task.Run<string?>(() =>
+        {
+            if (!CanTunnel) return "The remote PC's Kova is too old to reach its ports. Update it with File, Update the remote PC.";
+            var lane = OpenTunnelLane(port);
+            if (lane == null) return "The remote PC did not answer just now. Try again in a moment.";
+            var (tcp, link) = lane.Value;
+            using (tcp)
+            using (link)
+            {
+                try
+                {
+                    var s = tcp.GetStream();
+                    s.ReadTimeout = 8000;
+                    byte[] m = link.Receive(s);
+                    if (m.Length < 2 || m[0] != Protocol.TunnelOpened) return "The remote PC did not answer just now. Try again in a moment.";
+                    if (m[1] != Protocol.TunnelOk) return Theirs(System.Text.Encoding.UTF8.GetString(m, 2, m.Length - 2), port);
+                    try { link.Send(s, new[] { Protocol.TunnelEnd }); } catch { }
+                    return null;
+                }
+                catch { return "The remote PC did not answer just now. Try again in a moment."; }
+            }
+        });
+
+        /// <summary>The host's reason for not carrying a tunnel, kept short and plain (it is said aloud here).</summary>
+        internal static string Theirs(string why, int port)
+        {
+            why = new string(why.Where(ch => !char.IsControl(ch) && char.GetUnicodeCategory(ch) != System.Globalization.UnicodeCategory.Format).Take(200).ToArray()).Trim();
+            return why.Length == 0 ? "The remote PC would not open port " + port + "." : why;
+        }
+
         // File channels whose main connection dropped, each kept for the next connection to its own
         // host, oldest first. One per PC: with several PCs connected at once, one slot for all meant
         // connecting to (or letting go of) any other PC ended a waiting transfer to this one.

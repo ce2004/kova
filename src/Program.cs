@@ -225,7 +225,7 @@ namespace TailRemote
                 // --securitytest Files (or Media, Nvda, Lead) runs one part.
                 var lines = new System.Collections.Generic.List<string>();
                 bool all = true;
-                foreach (var (name, run) in new (string, Func<string?>)[] { ("Files", SecTestFiles.Run), ("Media", SecTestMedia.Run), ("Nvda", SecTestNvda.Run), ("NvdaHelper", SecTestNvdaHelper.Run), ("Lead", SecTestLead.Run) })
+                foreach (var (name, run) in new (string, Func<string?>)[] { ("Files", SecTestFiles.Run), ("Media", SecTestMedia.Run), ("Nvda", SecTestNvda.Run), ("NvdaHelper", SecTestNvdaHelper.Run), ("Lead", SecTestLead.Run), ("Tunnels", SecTestTunnels.Run) })
                 {
                     if (args.Length > 1 && !name.Equals(args[1], StringComparison.OrdinalIgnoreCase)) continue;
                     string? why;
@@ -1446,7 +1446,12 @@ namespace TailRemote
                 {
                     for (int i = 0; i < 100 && onlyListening.HostVersion == null; i++) System.Threading.Thread.Sleep(20);
                     if (onlyListening.CanWatch || onlyListening.WatchScreen() != null) return Fail("a listener could watch the screen");
+                    if (onlyListening.CanTunnel || onlyListening.OpenTunnelLane(1) != null) return Fail("a listener could reach the host's ports");
                 }
+                // Reach a port on the remote PC: an echo server on the host, a tunnel from the controller, 4 MB there and
+                // back by hash, half-closes both ways, six at once, closing it.
+                if (TunnelTest.Full(c, () => host.TestTunnels, 4) is string tunnelBad) return Fail("tunnels: " + tunnelBad);
+                lossless += " | tunnel";
                 // H.264, where this PC has an encoder: things moving go as video, many a second, and once
                 // still, an exact picture again. (Some Windows have none that works: still pictures then.)
                 bool hasH264;
