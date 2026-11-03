@@ -32,21 +32,23 @@ namespace TailRemote
     }
 
     /// <summary>
-    /// The Kova Helper: a small NVDA add-on (nvda-addon\ in the source, carried inside Kova.exe as KovaHelper.nvda-addon)
-    /// installed on a HOST only. It hands everything NVDA speaks, its cut-offs, beeps, sounds and braille straight to
-    /// Kova on the same PC, so no Speech Viewer is needed and pitch and sounds come through too. The controlling PC needs
-    /// nothing.
+    /// The Kova Helper: a small NVDA add-on (nvda-addon\ in the source, carried inside Kova.exe as KovaHelper.nvda-addon).
+    /// On a HOST it hands everything NVDA speaks, its cut-offs, beeps, sounds and braille straight to Kova on the same PC,
+    /// so no Speech Viewer is needed and pitch and sounds come through too. On ANY PC it also gives NVDA commands
+    /// for Kova (NVDA keys: connect to a saved PC, control, send the clipboard...), which have no keys until the person
+    /// assigns some in NVDA's Input gestures.
     ///
     /// Two halves here:
-    ///  - Server: a named pipe in Kova that the add-on connects to. No network listener at all: the pipe refuses network
-    ///    clients, only the person at the screen (and SYSTEM) may open it, nothing else can take its name first while Kova
-    ///    runs, and every connection must come from a real NVDA (Program Files, or signed by NV Access) in that session.
-    ///    The add-on, for its part, only sends to a pipe owned by its own user, SYSTEM or Administrators, served by a
-    ///    program called Kova. It never does anything Kova says: nothing comes back on the pipe.
+    ///  - The pipes in Kova that the add-on connects to (PipeServer): Server for speech (hosting only) and CommandServer
+    ///    for NVDA keys (every Kova window). No network listener at all: the pipes refuse network clients, only the person
+    ///    at the screen (and SYSTEM) may open them, nothing else can take their names first while Kova runs, and every
+    ///    connection must come from a real NVDA (Program Files, or signed by NV Access) in that session. The add-on, for
+    ///    its part, only sends to a pipe owned by its own user, SYSTEM or Administrators, served by a program called Kova.
+    ///    Nothing ever comes back on either pipe, and the add-on never does anything Kova says.
     ///  - Install, update and removal into NVDA's own add-ons folder, done the way NVDA would on a restart (so NVDA never
     ///    asks), then NVDA restarted as the person who runs it.
     /// </summary>
-    internal static class NvdaHelper
+    internal static partial class NvdaHelper
     {
         public const string AddonName = "kovaHelper";
         public const string ResourceName = "KovaHelper.nvda-addon";
@@ -603,67 +605,76 @@ namespace TailRemote
             });
         }
 
-        // ================= The pipe the add-on talks to =================
+        // ================= The pipes the add-on talks to =================
 
         /// <summary>
-        /// Kova's end of the Kova Helper's pipe. Raises Event for each thing NVDA did (on the pipe's reading thread, in order)
-        /// and ConnectedChanged when the add-on comes or goes, so a controlling PC can be told when it is not there (it then hears NVDA through the sound).
+        /// What both of Kova's pipes for the Kova Helper share: the name, who may open it and who may connect. Kova's NVDA
+        /// speech pipe (Server) and its NVDA keys pipe (CommandServer) differ only in what they read once a connection is
+        /// let in (Talk), so the security rules live here once.
         ///
-        /// Frames: u32 length (1-16384), then a body. The first body is a hello (0, u8 length, version in digits and dots);
-        /// every later one an NvdaEvent, or a keepalive (the single byte 0). Anything else ends that connection (the add-on reconnects); the pipe itself carries on.
+        ///  - No network listener at all: the pipe refuses network clients, only the person at the screen (and SYSTEM when
+        ///    the service serves them) may open it, and nothing else can take its name first while Kova runs.
+        ///  - Every connection must come from a real NVDA (Program Files, or signed by NV Access) in that session, checked
+        ///    before a single byte is read.
         /// </summary>
-        internal sealed class Server : IDisposable
+        internal abstract class PipeServer : IDisposable
         {
-            public const int MaxFrame = 16384;
-            private const int MaxConnections = 2;
-
             private readonly Action<string>? _log;
-            private readonly string? _fixedName;
+            private readonly string _logName;
+            private readonly Func<uint, string> _nameFor;
             private readonly Func<int, bool> _trust;
-            private readonly Thread _thread;
+            private readonly int _instances, _inBuffer;
+            private readonly string _threadName;
             private readonly CancellationTokenSource _stop = new();
-            private readonly List<NamedPipeServerStream> _active = new();
-            private int _helloed;
 
-            public event Action<NvdaEvent>? Event;
-            public event Action<bool>? ConnectedChanged;
-            /// <summary>The add-on's version, as it said when it connected (null when none is connected).</summary>
-            public volatile string? AddonVersion;
+            /// <summary>Tests only: a fixed pipe name instead of the one for the session at the screen.</summary>
+            protected readonly string? FixedName;
+
             /// <summary>Tests and diagnostics: connections refused (not NVDA), connections ended for bad data, and whether the pipe is up.</summary>
             public int Refused, Dropped;
             public volatile bool Listening;
             public volatile string? ListeningName;
 
-            /// <summary>Whether the add-on is talking to Kova right now.</summary>
-            public bool Connected => Volatile.Read(ref _helloed) > 0;
-
-            /// <summary>
-            /// pipeName and trustClient are for tests only (a fixed name, and who counts as NVDA); normally the name follows
-            /// the session at the screen and only a real NVDA may connect.
-            /// </summary>
-            public Server(Action<string>? log = null, string? pipeName = null, Func<int, bool>? trustClient = null)
+            protected PipeServer(string threadName, string logName, Func<uint, string> nameFor, int instances, int inBuffer,
+                Action<string>? log, string? fixedName, Func<int, bool> trust)
             {
+                _threadName = threadName;
+                _logName = logName;
+                _nameFor = nameFor;
+                _instances = instances;
+                _inBuffer = inBuffer;
                 _log = log;
-                _fixedName = pipeName;
-                _trust = trustClient ?? IsTrustedNvdaProcess;
-                _thread = new Thread(Run) { IsBackground = true, Name = "Kova NVDA helper pipe" };
-                _thread.Start();
+                FixedName = fixedName;
+                _trust = trust;
             }
 
-            public void Dispose()
-            {
-                _stop.Cancel();
-                lock (_active) { foreach (var c in _active) try { c.Dispose(); } catch { } _active.Clear(); }
-            }
+            /// <summary>Called last by each kind's constructor, so its own fields are set before the first connection.</summary>
+            protected void Start() => new Thread(Run) { IsBackground = true, Name = _threadName }.Start();
 
-            private static bool IsTrustedNvdaProcess(int pid) => ImagePath(pid) is string exe && NvdaTrust.IsTrustedNvda(exe);
+            protected CancellationToken Stopping => _stop.Token;
+
+            public virtual void Dispose() => _stop.Cancel();
+
+            protected void Log(string message) => _log?.Invoke(_logName + message);
+
+            /// <summary>The log as given, for code that names itself in what it writes (the add-on updater).</summary>
+            protected Action<string>? RawLog => _log;
 
             private readonly HashSet<string> _said = new();
-            private void LogOnce(string key, string message)
+            protected void LogOnce(string key, string message)
             {
                 lock (_said) { if (_said.Count > 100 || !_said.Add(key)) return; }
-                _log?.Invoke("NVDA helper: " + message);
+                Log(message);
             }
+
+            protected void Bad(string what)
+            {
+                Interlocked.Increment(ref Dropped);
+                LogOnce("bad " + what, "ended a connection that sent " + what);
+            }
+
+            /// <summary>One connection that NVDA made, read until it ends or misbehaves. Kova disposes it afterwards.</summary>
+            protected abstract void Talk(NamedPipeServerStream conn);
 
             private void Run()
             {
@@ -680,7 +691,7 @@ namespace TailRemote
                         // Kova's own user. Looked at again every few seconds, as the person at the screen can change.
                         session = TargetSession();
                         string? wantSid = PipeUser(session);
-                        string? wantName = session == 0xFFFFFFFF ? null : _fixedName ?? PipeName(session);
+                        string? wantName = session == 0xFFFFFFFF ? null : FixedName ?? _nameFor(session);
                         if (wantName != name || wantSid != sid)
                         {
                             Close(ref listener); waiting = null; Listening = false; ListeningName = null;
@@ -755,8 +766,8 @@ namespace TailRemote
                 else ps.AddAccessRule(new PipeAccessRule(user, PipeAccessRights.FullControl, AccessControlType.Allow)); // Kova is that user: it makes the next pipe with this right
                 try
                 {
-                    return NamedPipeServerStreamAcl.Create(name, PipeDirection.In, MaxConnections + 2, PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous | (first ? PipeOptions.FirstPipeInstance : 0), MaxFrame * 4, 0, ps);
+                    return NamedPipeServerStreamAcl.Create(name, PipeDirection.In, _instances, PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous | (first ? PipeOptions.FirstPipeInstance : 0), _inBuffer, 0, ps);
                 }
                 catch (Exception e)
                 {
@@ -765,21 +776,86 @@ namespace TailRemote
                 }
             }
 
-            /// <summary>One connection: checked to be NVDA before a single byte is read, then read until it ends or misbehaves.</summary>
+            /// <summary>One connection: checked to be NVDA before a single byte is read, then handed to Talk.</summary>
             private void Serve(NamedPipeServerStream conn, uint session)
             {
-                bool counted = false, added = false;
                 try
                 {
                     var h = conn.SafePipeHandle;
                     if (!GetNamedPipeClientProcessId(h, out uint pid) || !GetNamedPipeClientSessionId(h, out uint clientSession))
                     { Interlocked.Increment(ref Refused); return; }
-                    if ((_fixedName == null && clientSession != session) || !_trust((int)pid))
+                    if ((FixedName == null && clientSession != session) || !_trust((int)pid))
                     {
                         Interlocked.Increment(ref Refused);
                         LogOnce("refused " + (ImagePath((int)pid) ?? pid.ToString()), "refused a connection from " + (ImagePath((int)pid) ?? "process " + pid) + ", which is not NVDA");
                         return;
                     }
+                    Talk(conn);
+                }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException) { }
+                catch (Exception e) { LogOnce("serve " + e.GetType().Name, "a connection failed: " + e.Message); }
+                finally { try { conn.Dispose(); } catch { } }
+            }
+
+            protected static bool ReadAll(Stream s, byte[] buf, int n)
+            {
+                int got = 0;
+                while (got < n)
+                {
+                    int r = s.Read(buf, got, n - got);
+                    if (r <= 0) return false;
+                    got += r;
+                }
+                return true;
+            }
+        }
+
+        private static bool IsTrustedNvdaProcess(int pid) => ImagePath(pid) is string exe && NvdaTrust.IsTrustedNvda(exe);
+
+        /// <summary>
+        /// Kova's end of the Kova Helper's speech pipe (hosts only). Raises Event for each thing NVDA did (on the pipe's reading
+        /// thread, in order) and ConnectedChanged when the add-on comes or goes, so a controlling PC can be told when it is not
+        /// there (it then hears NVDA through the sound). The add-on, for its part, only sends to a pipe owned by its own user,
+        /// SYSTEM or Administrators, served by a program called Kova. Nothing comes back on the pipe.
+        ///
+        /// Frames: u32 length (1-16384), then a body. The first body is a hello (0, u8 length, version in digits and dots);
+        /// every later one an NvdaEvent, or a keepalive (the single byte 0). Anything else ends that connection (the add-on reconnects); the pipe itself carries on.
+        /// </summary>
+        internal sealed class Server : PipeServer
+        {
+            public const int MaxFrame = 16384;
+            private const int MaxConnections = 2;
+
+            private readonly List<NamedPipeServerStream> _active = new();
+            private int _helloed;
+
+            public event Action<NvdaEvent>? Event;
+            public event Action<bool>? ConnectedChanged;
+            /// <summary>The add-on's version, as it said when it connected (null when none is connected).</summary>
+            public volatile string? AddonVersion;
+
+            /// <summary>Whether the add-on is talking to Kova right now.</summary>
+            public bool Connected => Volatile.Read(ref _helloed) > 0;
+
+            /// <summary>
+            /// pipeName and trustClient are for tests only (a fixed name, and who counts as NVDA); normally the name follows
+            /// the session at the screen and only a real NVDA may connect.
+            /// </summary>
+            public Server(Action<string>? log = null, string? pipeName = null, Func<int, bool>? trustClient = null)
+                : base("Kova NVDA helper pipe", "NVDA helper: ", PipeName, MaxConnections + 2, MaxFrame * 4, log, pipeName, trustClient ?? IsTrustedNvdaProcess)
+                => Start();
+
+            public override void Dispose()
+            {
+                base.Dispose();
+                lock (_active) { foreach (var c in _active) try { c.Dispose(); } catch { } _active.Clear(); }
+            }
+
+            protected override void Talk(NamedPipeServerStream conn)
+            {
+                bool counted = false, added = false;
+                try
+                {
                     lock (_active)
                     {
                         // NVDA itself only ever has one: an older one (NVDA restarting) makes way for the newest.
@@ -804,9 +880,9 @@ namespace TailRemote
                             AddonVersion = v;
                             counted = true;
                             if (Interlocked.Increment(ref _helloed) == 1) Raise(true);
-                            _log?.Invoke("NVDA helper: the Kova Helper " + v + " is connected");
+                            Log("the Kova Helper " + v + " is connected");
                             // An older add-on: updated (only from the real pipe; a test pipe must never touch the real NVDA).
-                            if (_fixedName == null && CarriedVersion is string carried && CompareVersions(carried, v) > 0) UpdateIfNeeded(null, _log);
+                            if (FixedName == null && CarriedVersion is string carried && CompareVersions(carried, v) > 0) UpdateIfNeeded(null, RawLog);
                             continue;
                         }
                         if (len == 1 && body[0] == 0) continue; // the add-on's keepalive (sent every 2 seconds while NVDA is quiet)
@@ -815,35 +891,14 @@ namespace TailRemote
                         try { Event?.Invoke(ev); } catch (Exception e) { LogOnce("handler", "an event handler failed: " + e.Message); }
                     }
                 }
-                catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException) { }
-                catch (Exception e) { LogOnce("serve " + e.GetType().Name, "a connection failed: " + e.Message); }
                 finally
                 {
                     if (added) lock (_active) _active.Remove(conn);
-                    try { conn.Dispose(); } catch { }
                     if (counted && Interlocked.Decrement(ref _helloed) == 0) { AddonVersion = null; Raise(false); }
                 }
             }
 
-            private void Bad(string what)
-            {
-                Interlocked.Increment(ref Dropped);
-                LogOnce("bad " + what, "ended a connection that sent " + what);
-            }
-
             private void Raise(bool on) { try { ConnectedChanged?.Invoke(on); } catch { } }
-
-            private bool ReadAll(Stream s, byte[] buf, int n)
-            {
-                int got = 0;
-                while (got < n)
-                {
-                    int r = s.Read(buf, got, n - got);
-                    if (r <= 0) return false;
-                    got += r;
-                }
-                return true;
-            }
 
             /// <summary>The version in a hello (0, u8 length, 1-20 digits and dots), or null.</summary>
             internal static string? Hello(ReadOnlySpan<byte> b)

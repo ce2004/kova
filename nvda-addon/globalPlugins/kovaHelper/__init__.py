@@ -1,11 +1,15 @@
 # Kova Helper: hands what NVDA speaks, its cut-offs, beeps, sounds and braille straight to Kova on this PC,
-# so a PC controlling this one through Kova gets them at once.
+# so a PC controlling this one through Kova gets them at once. It also gives NVDA commands for Kova (category Kova in
+# NVDA's Input gestures: connect to a saved PC, control it, send the clipboard and so on). They have no keys until the
+# person gives them some: nothing here takes a key by itself.
 #
 # What it does and does not do:
 # - It only sends. Nothing ever comes back from Kova, and it never runs or opens anything.
-# - It only talks to a local named pipe (\\.\pipe\KovaNvda-<session>), never the network. Before sending anything it
-#   checks the pipe is owned by this user, SYSTEM or Administrators (no other signed-in person can make one that
-#   passes) and served by a program called Kova.
+# - It only talks to local named pipes, never the network: \\.\pipe\KovaNvda-<session> for speech (there only while this
+#   PC hosts) and \\.\pipe\KovaCommand-<session> for the commands (there whenever a Kova window runs). Before sending
+#   anything it checks the pipe is owned by this user, SYSTEM or Administrators (no other signed-in person can make one
+#   that passes) and served by a program called Kova.
+# - A command is two numbers and nothing else (which command, and which saved PC): never text, never a password.
 # - It never slows NVDA down: NVDA's threads only copy what NVDA said onto a bounded queue (the oldest go if Kova is
 #   stuck), and one background thread does all the reading, encoding and writing. Everything waiting is written in
 #   one go, and speech that a later cut-off would silence anyway is dropped before it is sent, so a console pouring
@@ -25,6 +29,7 @@ from ctypes import wintypes
 
 import globalPluginHandler
 from logHandler import log
+from scriptHandler import script
 
 try:
 	import addonHandler
@@ -33,6 +38,8 @@ except Exception:
 	_VERSION = "1.0.0"
 
 PIPE_BASE = "\\\\.\\pipe\\KovaNvda-"
+COMMAND_PIPE_BASE = "\\\\.\\pipe\\KovaCommand-"
+COMMANDS_WAITING_MAX = 4  # key presses waiting to go to Kova; more are left out (Kova takes 5 a second at most)
 RETRY_SECONDS = 3.0
 REFUSED_RETRY_SECONDS = 15.0
 KEEPALIVE_SECONDS = 2.0
@@ -66,6 +73,13 @@ _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
 _k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
 _k32.LocalFree.argtypes = [ctypes.c_void_p]
 _k32.LocalFree.restype = ctypes.c_void_p
+_k32.FlushFileBuffers.argtypes = [ctypes.c_void_p]
+_k32.FlushFileBuffers.restype = wintypes.BOOL
+_k32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+_k32.WaitNamedPipeW.restype = wintypes.BOOL
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_u32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+_u32.AllowSetForegroundWindow.restype = wintypes.BOOL
 _adv.GetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 _adv.GetSecurityInfo.restype = wintypes.DWORD
 _adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -152,15 +166,20 @@ def _pipeOwner(h):
 		_k32.LocalFree(sd)
 
 
-def _serverIsKova(h, me):
-	"""The pipe is Kova's: owned by this user, SYSTEM or Administrators, and served by a program called Kova."""
+def _kovaServer(h, me):
+	"""Kova's process number when the pipe is Kova's (owned by this user, SYSTEM or Administrators, and served by a
+	program called Kova), else 0."""
 	pid = wintypes.ULONG()
 	if not _k32.GetNamedPipeServerProcessId(h, ctypes.byref(pid)):
-		return False
+		return 0
 	name = _processName(pid.value)
 	if not name or not _KOVA_NAME.match(name):
-		return False
-	return _pipeOwner(h) in (me, "S-1-5-18", "S-1-5-32-544")
+		return 0
+	return pid.value if _pipeOwner(h) in (me, "S-1-5-18", "S-1-5-32-544") else 0
+
+
+def _serverIsKova(h, me):
+	return _kovaServer(h, me) != 0
 
 
 def _units(s):
@@ -307,9 +326,7 @@ class _Link(threading.Thread):
 		self._wake.set()
 
 	def _pipeName(self):
-		session = wintypes.DWORD()
-		_k32.ProcessIdToSessionId(_k32.GetCurrentProcessId(), ctypes.byref(session))
-		return PIPE_BASE + str(session.value)
+		return PIPE_BASE + str(_session())
 
 	def _connect(self):
 		h = _k32.CreateFileW(self._pipeName(), FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE, 0, None, OPEN_EXISTING, 0, None)
@@ -403,6 +420,120 @@ class _Link(threading.Thread):
 			_k32.CloseHandle(h)
 
 
+# ---- NVDA keys: Kova's commands, sent to the Kova window on this PC ----
+
+# The command numbers Kova knows (Kova's NvdaKeyCommand): the frame is u32 length 2, then the command and its number.
+CMD_CONNECT = 1  # the number is the saved PC, 1 to 9
+CMD_CONTROL = 2
+CMD_SEND_CLIPBOARD = 3
+CMD_GET_CLIPBOARD = 4
+CMD_DISCONNECT = 5
+CMD_STATUS = 6
+CMD_LIST = 7
+CMD_SHOW = 8
+
+GENERIC_WRITE = 0x40000000
+ERROR_PIPE_BUSY = 231
+
+NOT_RUNNING = "Kova isn't running."
+NOT_TAKEN = "Kova didn't get that. Try again."
+NOT_HERE = "Kova's keys don't work on this screen."
+
+
+def _session():
+	session = wintypes.DWORD()
+	_k32.ProcessIdToSessionId(_k32.GetCurrentProcessId(), ctypes.byref(session))
+	return session.value
+
+
+def _say(text):
+	"""Said by NVDA on its own main thread (the keys are sent from a thread of their own)."""
+	try:
+		import queueHandler
+		import ui
+		queueHandler.queueFunction(queueHandler.eventQueue, ui.message, text)
+	except Exception:
+		log.debugWarning("Kova Helper: could not say %r" % text, exc_info=True)
+
+
+class _Keys(threading.Thread):
+	"""Sends the commands NVDA keys ask for, one at a time. NVDA's main thread only calls put(), which never waits."""
+
+	def __init__(self):
+		super().__init__(name="Kova Helper keys", daemon=True)
+		self._waiting = collections.deque()
+		self._lock = threading.Lock()
+		self._wake = threading.Event()
+		self._stopping = False
+		self._me = _mySid()
+		self._warned = False
+
+	def put(self, command, number=0):
+		with self._lock:
+			if len(self._waiting) >= COMMANDS_WAITING_MAX:
+				return  # a key held down or pressed in a hurry: Kova would leave these out anyway
+			self._waiting.append((command, number))
+		self._wake.set()
+
+	def stop(self):
+		self._stopping = True
+		self._wake.set()
+
+	def send(self, command, number):
+		"""None once Kova has the command (Kova then says what happened), else what to say instead."""
+		name = COMMAND_PIPE_BASE + str(_session())
+		h = None
+		for _ in range(3):
+			h = _k32.CreateFileW(name, GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL, 0, None, OPEN_EXISTING, 0, None)
+			if h and h != _INVALID:
+				break
+			h = None
+			if ctypes.get_last_error() != ERROR_PIPE_BUSY:
+				return NOT_RUNNING  # no Kova window on this PC (the pipe is only there while one runs)
+			_k32.WaitNamedPipeW(name, 500)
+		if h is None:
+			return NOT_TAKEN
+		try:
+			pid = _kovaServer(h, self._me)
+			if not pid:
+				if not self._warned:
+					self._warned = True
+					log.warning("Kova Helper: the Kova keys pipe is served by something that is not Kova, so nothing is sent to it")
+				return NOT_RUNNING
+			# Show the Kova window brings it to the front: NVDA, which has the key press, lets Kova do that.
+			_u32.AllowSetForegroundWindow(pid)
+			frame = struct.pack("<IBB", 2, command, number)
+			done = wintypes.DWORD()
+			if not _k32.WriteFile(h, frame, len(frame), ctypes.byref(done), None) or done.value != len(frame):
+				return NOT_TAKEN
+			# Returns once Kova has read it: Kova only acts on a command whose connection then ends cleanly, so closing
+			# straight after writing could otherwise lose it.
+			_k32.FlushFileBuffers(h)
+			return None
+		finally:
+			_k32.CloseHandle(h)
+
+	def run(self):
+		while not self._stopping:
+			self._wake.wait()
+			self._wake.clear()
+			while not self._stopping:
+				with self._lock:
+					if not self._waiting:
+						break
+					command, number = self._waiting.popleft()
+				try:
+					said = self.send(command, number)
+				except Exception:
+					log.debugWarning("Kova Helper: a key could not be sent", exc_info=True)
+					said = NOT_TAKEN
+				if said:
+					if said == NOT_RUNNING:
+						with self._lock:
+							self._waiting.clear()  # said once, not once for every key still waiting
+					_say(said)
+
+
 _commands = None
 
 
@@ -441,9 +572,13 @@ def _speechParts(sequence):
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
+	# Kova's commands are listed under Kova in NVDA's Input gestures. None of them has a key: the person chooses their own.
+	scriptCategory = "Kova"
+
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		self._link = None
+		self._keys = None
 		self._undo = []
 		self._spoke = False
 		self._braille = None
@@ -451,10 +586,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		try:
 			import globalVars
 			if getattr(getattr(globalVars, "appArgs", None), "secure", False):
-				return  # the sign-in screen's NVDA: nothing to hand over
+				return  # the sign-in screen's NVDA: nothing to hand over, and no Kova window to command
 			self._waves = os.path.normcase(os.path.normpath(os.path.join(globalVars.appDir, "waves")))
 		except Exception:
 			self._waves = None
+		self._keys = _Keys()
+		self._keys.start()
+		# Speech is only ever sent to a hosting Kova: on a PC that only controls others there is no speech pipe, and this
+		# link just looks for one quietly every few seconds, sending nothing.
 		self._link = _Link()
 		self._link.start()
 		self._hookSpeech()
@@ -611,6 +750,44 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		except Exception:
 			pass
 
+	# ---- NVDA keys: each only queues the command (NVDA's main thread never waits on Kova) ----
+
+	def _kova(self, command, number=0):
+		keys = self._keys
+		if keys is None:
+			import ui
+			ui.message(NOT_HERE)
+			return
+		keys.put(command, number)
+
+	@script(description="Start controlling the PC in front (Control Shift Enter comes back)", category="Kova", speakOnDemand=True)
+	def script_kovaControl(self, gesture):
+		self._kova(CMD_CONTROL)
+
+	@script(description="Send the clipboard to the PC in front", category="Kova", speakOnDemand=True)
+	def script_kovaSendClipboard(self, gesture):
+		self._kova(CMD_SEND_CLIPBOARD)
+
+	@script(description="Get the remote PC's clipboard", category="Kova", speakOnDemand=True)
+	def script_kovaGetClipboard(self, gesture):
+		self._kova(CMD_GET_CLIPBOARD)
+
+	@script(description="Disconnect from the PC in front", category="Kova", speakOnDemand=True)
+	def script_kovaDisconnect(self, gesture):
+		self._kova(CMD_DISCONNECT)
+
+	@script(description="Say Kova's status: the PC in front, the delay, and the PCs in the background", category="Kova", speakOnDemand=True)
+	def script_kovaStatus(self, gesture):
+		self._kova(CMD_STATUS)
+
+	@script(description="Say the saved PCs and their numbers", category="Kova", speakOnDemand=True)
+	def script_kovaListPcs(self, gesture):
+		self._kova(CMD_LIST)
+
+	@script(description="Show the Kova window", category="Kova", speakOnDemand=True)
+	def script_kovaShow(self, gesture):
+		self._kova(CMD_SHOW)
+
 	def terminate(self):
 		for undo in reversed(self._undo):
 			try:
@@ -622,4 +799,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._link.stop()
 			self._link.join(1.0)
 			self._link = None
+		if self._keys is not None:
+			self._keys.stop()
+			self._keys.join(1.0)
+			self._keys = None
 		super().terminate()
+
+
+def _connectScript(n):
+	def script_kovaConnect(self, gesture):
+		self._kova(CMD_CONNECT, n)
+	script_kovaConnect.__name__ = "script_kovaConnect%d" % n
+	return script(description="Connect to saved PC %d" % n, category="Kova", speakOnDemand=True)(script_kovaConnect)
+
+
+# Saved PCs 1 to 9 (Control 1 to 9 in the Kova window): nine commands, each its own line in Input gestures.
+for _n in range(1, 10):
+	setattr(GlobalPlugin, "script_kovaConnect%d" % _n, _connectScript(_n))
+del _n
