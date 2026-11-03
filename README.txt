@@ -51,7 +51,7 @@ The File and Settings menus only show what you can use right now, so they change
 File
 - When this PC is neither hosting nor connected: Connect to a PC, Host this PC, Wake a saved PC and connect (once you have saved PCs), and Exit.
 - While this PC hosts: Stop hosting, Measure this PC's internet speed, and Exit. While the Kova service hosts it, there is also Change how this PC is hosted, and Stop hosting removes the service.
-- While connected: Disconnect, Connect to another PC, Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC, Install the Kova Helper on the remote PC, the streaming status, Measure this PC's internet speed, Measure the remote PC's internet speed, and Exit. On a listen-only connection, the items that need control are not shown.
+- While connected: Disconnect, Connect to another PC, Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC, Install the Kova Helper on the remote PC, Reach a port on the remote PC, Remote ports open on this PC (while any are open), the streaming status, Measure this PC's internet speed, Measure the remote PC's internet speed, and Exit. On a listen-only connection, the items that need control are not shown.
 
 Clipboard
 - The current file transfer, the history of transfers, Send the clipboard (Control B), Send files (Control I), Send a folder and its contents (Control T), Get files from the remote PC (Control G), Get the remote PC's clipboard (Control Shift B), Stop the file transfer, the received files folder, and Accept text and files sent by the remote PC without asking.
@@ -96,6 +96,15 @@ Remote PC tools
 - Update the remote PC updates Kova on the remote PC to the newest version, including the Kova service. The menu item says which version each PC has.
 - The internet speed tests report download and upload speed, latency and jitter after about 20 seconds. The audio may break up while a test runs.
 - Announce remote PC health alerts reports when the remote PC switches to or from battery power, when its battery is low, when its system drive is nearly full, when its processor has been busy for a full minute, and when it is nearly out of memory.
+
+Reaching a port on the remote PC
+- Some programs have a web page or service that only works on their own PC, such as Resilio Sync's page at localhost 8888. File, Reach a port on the remote PC (Control Shift P) brings it to your PC through Kova's encrypted connection, through a Kova Relay too.
+- Type the remote PC's port, then the port on this PC. It is the same number when that is free here, otherwise the next free one. Kova checks that something answers on the remote PC first, and says if nothing does.
+- When it is open, Kova puts the address, such as http://localhost:8888, on your clipboard. Paste it into your browser.
+- For a saved PC, Open it again each time I connect makes it open by itself whenever you connect to that PC.
+- It keeps working while that PC waits in the background and when the connection drops and comes back. It closes when you disconnect from that PC.
+- File, Remote ports open on this PC lists them. Delete closes the one you are on, and it no longer opens by itself. Copy its address puts it on the clipboard again. Escape closes the list.
+- Both PCs need Kova 4.8 or newer. An older remote PC can be updated with File, Update the remote PC.
 
 Listening only
 - A host can have a listen-only password. Anyone who connects with it hears the PC but cannot control it, send files or use the clipboard. Up to 100 listeners can connect at once, each using about 0.7 megabits per second of the host's upload while audio plays.
@@ -162,6 +171,7 @@ Security
 - An address that keeps guessing is blocked for a while. PCs that have never connected before get 30 wrong passwords per minute, 200 per hour and 1,000 per day in total. PCs that have connected before are always let in.
 - A listen-only connection receives audio only: no keys, mouse, files, clipboard, microphone or NVDA text.
 - While the remote PC is locked, Get files and Get the remote PC's clipboard wait until someone signs in.
+- Reach a port on the remote PC only works with the full password, never listen-only. It only reaches ports on the remote PC itself, never other computers on its network. Its end on your PC only listens on your PC itself, so nobody else on your network can use it, though other people signed in to your PC could. While the remote PC is locked, or nobody has signed in there yet, its ports stay closed until someone signs in.
 - Received files are marked as coming from the internet, and file names that disguise a file's type are made safe.
 - Updates are signed and verified before they are installed.
 - Use a long password for any PC that can be reached from the internet or through a relay.

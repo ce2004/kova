@@ -171,6 +171,10 @@ namespace TailRemote
             // whether it was told another PC's microphone is already on.
             public uint MicHigh;
             public bool MicAny, MicBusyTold;
+            // Its connections to this PC's own ports (Reach a port on the remote PC), all closed when it ends; and how many
+            // places it holds, counted from before the local connection is made. Both under _gate.
+            public readonly List<TunnelPipe> Tunnels = new();
+            public int TunnelSlots;
         }
 
         private string? _captureDevice;
@@ -987,6 +991,7 @@ namespace TailRemote
                 // first line after logging was turned on said nonsense.
                 int packets = Interlocked.Exchange(ref _txPackets, 0), bytes = Interlocked.Exchange(ref _txBytes, 0);
                 try { MicTick(); } catch { }
+                try { SweepTunnels(); } catch { }
                 if (!DiagLog.Enabled) continue;
                 int fills = Interlocked.Exchange(ref LoopbackCapture.TestGapFills, 0);
                 int fillMs = Interlocked.Exchange(ref LoopbackCapture.TestGapFillMs, 0);
@@ -1102,6 +1107,25 @@ namespace TailRemote
                     using var link = new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true,
                         Protocol.VideoPurpose(nonce, answer.AsSpan(28, 16)), maxReceive: 64 << 10, maxSend: SecureLink.MaxSend);
                     VideoLane(owner, tcp, link);
+                    return;
+                }
+                if (answer.AsSpan(0, 4).SequenceEqual(Protocol.TunnelMagic))
+                {
+                    // A controller reaching one of this PC's own ports: proven like a file lane (the port is in the
+                    // proven part, so it cannot be changed on the way), then this thread carries it until it ends.
+                    Session? owner = null;
+                    for (int i = 0; i < 40 && owner == null; i++)
+                    {
+                        owner = LaneOwner(answer.AsSpan(4, 8), remote);
+                        if (owner == null) Thread.Sleep(50);
+                    }
+                    if (owner == null) { tcp.Dispose(); return; }
+                    if (!CryptographicOperations.FixedTimeEquals(answer.AsSpan(Protocol.LaneProofAt, 32),
+                            Protocol.LaneProof(owner.Key, nonce, answer.AsSpan(12, 16), answer.AsSpan(28, 16), Protocol.TunnelProofLabel)))
+                    { tcp.Dispose(); return; }
+                    EndHandshake(remote, tcp); counted = false; // a tunnel must not hold a login's place
+                    handedOff = true; // TunnelLane closes it
+                    TunnelLane(owner, tcp, nonce, answer[28..44], Protocol.TunnelPort(answer.AsSpan(12, 16)));
                     return;
                 }
                 if (answer.AsSpan(0, 4).SequenceEqual(Protocol.FileMagic))
@@ -1350,6 +1374,99 @@ namespace TailRemote
         }
 
         private bool IsController(Session s) { lock (_gate) return _controllers.Contains(s); }
+
+        // ---- Reach a port on the remote PC: a controller's connections to this PC's own ports (Tunnels.cs) ----
+
+        private int _tunnelSlots; // under _gate: places taken by every controller's tunnel connections
+
+        /// <summary>Test only: tunnel connections open (or being opened) on this host right now.</summary>
+        internal int TestTunnels { get { lock (_gate) return _tunnelSlots; } }
+
+        /// <summary>
+        /// One tunnel lane, on the thread that read its login, until it ends. Only for a PC controlling this one (the full
+        /// password, never listen-only), still connected; only to this PC itself (127.0.0.1, then ::1), never any other
+        /// address, so it reaches what only listens here (a program's own web page) and nothing on the network around it.
+        /// At most MaxTunnelsPerSession for each controller and MaxTunnels in all; all closed when the controller's session ends.
+        /// </summary>
+        private void TunnelLane(Session owner, TcpClient tcp, byte[] laneNonce, byte[] laneValue, int port)
+        {
+            SecureLink? link = null;
+            bool placed = false;
+            Socket? local = null;
+            TunnelPipe? pipe = null;
+            try
+            {
+                if (port == 0 || owner.Role != Protocol.RoleControl) return;
+                link = new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true, Protocol.TunnelPurpose(laneNonce, laneValue), maxReceive: 1 + Protocol.TunnelChunk);
+                // Like Get files and the clipboard: the Kova password is never a way round the Windows one. A locked PC (or one
+                // nobody has signed in to, under the service) keeps its ports to itself until someone signs in there.
+                if (ScreenLocked()) { TunnelRefuse(tcp, link, Protocol.TunnelLocked, "The remote PC is locked. Sign in there first, then try again."); return; }
+                var stream = tcp.GetStream();
+                stream.ReadTimeout = Timeout.Infinite;
+                bool full;
+                lock (_gate)
+                {
+                    if (_stop || !_controllers.Contains(owner)) return; // its session ended a moment ago
+                    full = owner.TunnelSlots >= Protocol.MaxTunnelsPerSession || _tunnelSlots >= Protocol.MaxTunnels;
+                    if (!full) { owner.TunnelSlots++; _tunnelSlots++; placed = true; }
+                }
+                if (full) { TunnelRefuse(tcp, link, Protocol.TunnelTooMany, "Too many connections to the remote PC's ports are open at once. Close some and try again."); return; }
+                local = TunnelPipe.ConnectHere(port);
+                if (local == null) { TunnelRefuse(tcp, link, Protocol.TunnelNothingThere, "Nothing on the remote PC answers at port " + port + "."); return; }
+                pipe = new TunnelPipe(local, tcp, link);
+                lock (_gate)
+                {
+                    if (_stop || !_controllers.Contains(owner)) return;
+                    owner.Tunnels.Add(pipe);
+                }
+                link.Send(stream, new[] { Protocol.TunnelOpened, Protocol.TunnelOk });
+                DiagLog.Write("host: " + Who(owner.Address) + " reached port " + port + " on this PC");
+                pipe.Run(null);
+            }
+            catch { }
+            finally
+            {
+                lock (_gate)
+                {
+                    if (placed) { owner.TunnelSlots--; _tunnelSlots--; }
+                    if (pipe != null) owner.Tunnels.Remove(pipe);
+                }
+                pipe?.Close();
+                try { local?.Dispose(); } catch { }
+                try { tcp.Dispose(); } catch { }
+                link?.Dispose();
+            }
+        }
+
+        /// <summary>Says why a tunnel lane is not carried, then closes it gently, so the words are read before the line goes.</summary>
+        private static void TunnelRefuse(TcpClient tcp, SecureLink link, byte code, string why)
+        {
+            try
+            {
+                byte[] words = System.Text.Encoding.UTF8.GetBytes(why);
+                byte[] m = new byte[2 + words.Length];
+                m[0] = Protocol.TunnelOpened;
+                m[1] = code;
+                words.CopyTo(m, 2);
+                link.Send(tcp.GetStream(), m);
+                tcp.Client.Shutdown(SocketShutdown.Send);
+                tcp.Client.ReceiveTimeout = 1000;
+                byte[] junk = new byte[4096];
+                long until = Environment.TickCount64 + 1000;
+                while (Environment.TickCount64 < until && tcp.Client.Receive(junk) > 0) { }
+            }
+            catch { }
+        }
+
+        /// <summary>Once a second: a tunnel connection one side has finished with, quiet for two minutes, is closed.</summary>
+        private void SweepTunnels()
+        {
+            long now = Environment.TickCount64;
+            lock (_gate)
+                foreach (var s in _controllers)
+                    foreach (var t in s.Tunnels)
+                        if (t.Stale(now)) t.Close();
+        }
 
         // ---- The remote screen ----
 
@@ -2170,6 +2287,8 @@ namespace TailRemote
             MicOff(s);
             // Worked out again once it has left the list of sessions (End is called under _gate, before Rebuild).
             s.NvdaWant = 0;
+            // Its connections to this PC's ports end with it: only closed here (quick), each one's own thread tidies up.
+            foreach (var t in s.Tunnels) t.Close();
             if (s.Files is FileChannel f)
             {
                 // Kept for the controller's next connection (a dropped one comes straight back),

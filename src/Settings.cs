@@ -17,9 +17,18 @@ namespace TailRemote
         public string Wake { get; set; } = "";
         /// <summary>The name the owner gave it (4.6, Edit PC); empty: it is shown by its address.</summary>
         public string Name { get; set; } = "";
+        /// <summary>Its ports reached from here that open again each time it connects (Reach a port on the remote PC).</summary>
+        public System.Collections.Generic.List<SavedTunnel> Tunnels { get; set; } = new();
         public override string ToString() => Name.Trim().Length > 0 ? Name.Trim()
             : Relay.IsByPassword(Address) ? Relay.Shown(Address) + ", through the relay"
             : Port == Protocol.DefaultPort ? Address : Address + ", port " + Port;
+    }
+
+    /// <summary>One of a saved PC's ports, opened here each time it connects: its port there, and the one on this PC.</summary>
+    internal sealed class SavedTunnel
+    {
+        public int RemotePort { get; set; }
+        public int LocalPort { get; set; }
     }
 
     /// <summary>Saved in %APPDATA%\TailRemote\settings.json; the passwords are DPAPI-encrypted.</summary>
@@ -352,7 +361,12 @@ namespace TailRemote
             KnownHosts ??= new();
             HostIdentityEnc ??= ""; RelayAddress ??= ""; RelayName ??= "";
             SavedPcs.RemoveAll(pc => pc == null);
-            foreach (var pc in SavedPcs) { pc.Address ??= ""; pc.PasswordEnc ??= ""; pc.Name ??= ""; }
+            foreach (var pc in SavedPcs)
+            {
+                pc.Address ??= ""; pc.PasswordEnc ??= ""; pc.Name ??= "";
+                pc.Tunnels ??= new();
+                pc.Tunnels.RemoveAll(t => t == null || t.RemotePort is < 1 or > 65535 || t.LocalPort is < 1 or > 65535);
+            }
             return this;
         }
 

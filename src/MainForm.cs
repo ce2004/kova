@@ -80,6 +80,11 @@ namespace TailRemote
         // and on the remote PC from here.
         private readonly MenuItem _helperHere = new(NvdaHelper.MenuText(new NvdaHelperState(null, null, NvdaHelper.CarriedVersion, false, false, null))) { WhyNot = "Already working on the Kova Helper." };
         private readonly MenuItem _helperThere = new(NvdaHelper.RemoteMenuText) { WhyNot = "Connect to a PC first, with its control password." };
+        // Reach a port on the remote PC: a program that only listens there (a web page at localhost 8888) opens here, through
+        // the encrypted connection. Its tunnels belong to that PC (TunnelBook); the list of them closes one.
+        private readonly MenuItem _reachPort = new("Re&ach a port on the remote PC...") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.P };
+        private readonly MenuItem _portsOpen = new("Re&mote ports open on this PC...");
+        private readonly TunnelBook _tunnels = new();
         private readonly MenuItem _getFiles = new("&Get files from the remote PC...") { ShortcutKeys = Keys.Control | Keys.G };
         private readonly MenuItem _getClipboard = new("Get the &remote PC's clipboard") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.B };
         // Whether text and files the other PC sends without being asked are taken at all.
@@ -228,7 +233,7 @@ namespace TailRemote
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
                 _go, _connectWizard, _hostWizard, _switchTo, _wake, new ToolStripSeparator(),
-                _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _streaming.Item, new ToolStripSeparator(),
+                _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _reachPort, _portsOpen, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
@@ -375,6 +380,9 @@ namespace TailRemote
             _remoteInfo.Click += (_, _) => Menus.AfterMenu(() => RemoteInfo());
             _watch.Click += (_, _) => Menus.AfterMenu(() => ShowScreen());
             _getFiles.Click += (_, _) => Menus.AfterMenu(() => GetFiles());
+            _reachPort.Click += (_, _) => Menus.AfterMenu(() => ReachPort());
+            _portsOpen.Click += (_, _) => Menus.AfterMenu(() => ShowTunnels());
+            _tunnels.Said += words => Later(() => Speak(words));
             _getClipboard.Click += (_, _) => Menus.AfterMenu(() => GetClipboard());
             _acceptUnasked.CheckedChanged += (_, _) =>
             {
@@ -508,6 +516,8 @@ namespace TailRemote
             _switchTo.Available = connected && (saved || _parked.Count > 0);
             _wake.Available = (idle || connected) && saved;
             _toggle.Available = _watch.Available = _restart.Available = _remoteInfo.Available = _updateRemote.Available = _helperThere.Available = _speedRemote.Available = control;
+            _reachPort.Available = control;
+            _portsOpen.Available = _tunnels.Count > 0; // a PC in the background (or reconnecting) keeps its ports open
             _micItem.Available = connected && _client?.ListenOnly != true; // it can be turned on before the connection is made
             _streaming.Item.Available = connected;
             _speedHere.Available = !idle;
@@ -548,10 +558,11 @@ namespace TailRemote
 
         private void UpdateButtons()
         {
+            PruneTunnels();
             ShowWhatApplies();
             bool canUse = _client != null && !_client.ListenOnly;
             string why = _client == null ? "Connect to a PC first." : "Not on a listen-only connection: it needs the control password.";
-            foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere })
+            foreach (var item in new[] { _toggle, _restart, _updateRemote, _remoteInfo, _getFiles, _getClipboard, _speedRemote, _helperThere, _reachPort })
             {
                 item.Enabled = canUse;
                 item.WhyNot = why;
@@ -1129,6 +1140,111 @@ namespace TailRemote
             Doing("getting files from the remote PC");
             using var f = new RemoteFilesForm(() => _client, Say, Speak);
             f.ShowDialog(this);
+        }
+
+        // ---- Reach a port on the remote PC (TunnelBook, TunnelWizard, TunnelsForm) ----
+
+        /// <summary>File, Reach a port on the remote PC: the PC in front's port opens at localhost here, and its address goes on the clipboard.</summary>
+        private void ReachPort()
+        {
+            Doing("reaching a port on the remote PC");
+            if (_client is not Client c || c.ListenOnly)
+            {
+                Say(_client == null ? "Connect to a PC first." : "A listen-only connection cannot reach the remote PC's ports. That needs its full password.");
+                return;
+            }
+            if (!c.CanTunnel) { Say("The remote PC's Kova is too old to reach its ports. Update it with File, Update the remote PC."); return; }
+            var (address, port) = (FrontAddress, FrontPort);
+            string pc = PcKey(address, port), name = NameFor(address, port);
+            bool saved = _settings.SavedPcs.Any(p => SamePc(p.Address, p.Port, address, port));
+            var answer = TunnelWizard.Run(this, name, saved,
+                remote => FrontClient(address, port) is Client now ? now.ProbeTunnelAsync(remote) : System.Threading.Tasks.Task.FromResult<string?>("The connection to " + name + " has closed."),
+                remote => _tunnels.Find(pc, remote)?.LocalPort);
+            if (answer == null) return;
+            // The connection may have dropped or another PC come to the front while the window was open.
+            if (FrontClient(address, port) is not Client front) { Say(NotAnymore("Not opened", address, port)); return; }
+            TunnelBook.Tunnel t;
+            try { t = _tunnels.Open(pc, name, answer.RemotePort, answer.LocalPort); }
+            catch (InvalidOperationException e) { Say(e.Message); return; }
+            _tunnels.Attach(pc, front);
+            if (answer.Keep && _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port)) is SavedPc keep)
+            {
+                keep.Tunnels.RemoveAll(x => x.RemotePort == answer.RemotePort);
+                keep.Tunnels.Add(new SavedTunnel { RemotePort = answer.RemotePort, LocalPort = answer.LocalPort });
+                SaveNow();
+            }
+            string url = t.Address;
+            ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(url)));
+            UpdateButtons();
+            Say("Port " + answer.RemotePort + " on " + name + " is now at localhost " + answer.LocalPort + " on this PC. The address is on the clipboard." +
+                (answer.Keep ? " It opens again each time you connect." : ""));
+        }
+
+        /// <summary>File, Remote ports open on this PC: each one, and Delete closes the one you are on.</summary>
+        private void ShowTunnels()
+        {
+            Doing("looking at the remote ports open here");
+            SavedPc? SavedFor(TunnelBook.Tunnel t) => _settings.SavedPcs.Find(p => string.Equals(PcKey(p.Address, p.Port), t.Pc, StringComparison.OrdinalIgnoreCase));
+            using var f = new TunnelsForm(_tunnels,
+                t => SavedFor(t)?.Tunnels.Any(x => x.RemotePort == t.RemotePort) == true,
+                t =>
+                {
+                    bool forgot = SavedFor(t) is SavedPc pc && pc.Tunnels.RemoveAll(x => x.RemotePort == t.RemotePort) > 0;
+                    if (forgot) SaveNow();
+                    _tunnels.Close(t);
+                    return "Closed localhost " + t.LocalPort + "." + (forgot ? " It won't open by itself any more." : "");
+                },
+                text => ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(text))),
+                Say);
+            f.ShowDialog(this);
+            UpdateButtons();
+        }
+
+        /// <summary>A saved PC just connected: its kept ports open again here, said once, briefly. Ones still open (a reconnect) stay as they are.</summary>
+        private void ReopenTunnels(Client c, string address, int port)
+        {
+            var saved = _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, address, port));
+            if (saved == null || saved.Tunnels.Count == 0 || c.ListenOnly || c.Closed) return;
+            string pc = PcKey(address, port), name = saved.ToString();
+            var wanted = saved.Tunnels.Where(t => _tunnels.Find(pc, t.RemotePort) == null).ToList();
+            if (wanted.Count == 0) return;
+            if (!c.CanTunnel) { Speak(name + "'s Kova is too old to reach its ports, so the ones you saved stay closed. Update it with File, Update the remote PC."); return; }
+            var opened = new System.Collections.Generic.List<(int Remote, int Local)>();
+            var notes = new System.Collections.Generic.List<string>();
+            foreach (var w in wanted)
+            {
+                // Taken here by something else since: the next free one this time, said; the saved one is tried again next time.
+                int local = TunnelBook.LocalFree(w.LocalPort) ? w.LocalPort : TunnelBook.FreeNear(w.LocalPort);
+                try
+                {
+                    _tunnels.Open(pc, name, w.RemotePort, local);
+                    opened.Add((w.RemotePort, local));
+                    if (local != w.LocalPort) notes.Add("Localhost " + w.LocalPort + " is used by something else, so it is at " + local + " this time.");
+                }
+                catch (InvalidOperationException e) { notes.Add("Port " + w.RemotePort + " could not open: " + e.Message); }
+            }
+            if (opened.Count > 0) _tunnels.Attach(pc, c);
+            static string And(System.Collections.Generic.IEnumerable<int> n)
+            {
+                var l = n.Select(x => x.ToString()).ToList();
+                return l.Count == 1 ? l[0] : string.Join(", ", l.Take(l.Count - 1)) + " and " + l[^1];
+            }
+            string said = opened.Count == 0 ? ""
+                : opened.Count == 1 ? "Port " + opened[0].Remote + " on " + name + " is open here again, at localhost " + opened[0].Local + "."
+                : "Ports " + And(opened.Select(o => o.Remote)) + " on " + name + " are open here again, at localhost " + And(opened.Select(o => o.Local)) + ".";
+            if (notes.Count > 0) said = (said + " " + string.Join(" ", notes)).Trim();
+            UpdateButtons();
+            if (said.Length > 0) Speak(said);
+        }
+
+        /// <summary>Tunnels of a PC this window no longer connects to (disconnected, dropped from the background, given up on) close.</summary>
+        private void PruneTunnels()
+        {
+            bool front = _client != null || _reconnecting || _connecting;
+            string frontKey = PcKey(FrontAddress, FrontPort);
+            _tunnels.CloseWhere(pc =>
+                !(front && string.Equals(pc, frontKey, StringComparison.OrdinalIgnoreCase))
+                && !_parked.Any(p => string.Equals(PcKey(p.Address, p.Port), pc, StringComparison.OrdinalIgnoreCase)));
         }
 
         /// <summary>
@@ -2776,6 +2892,15 @@ namespace TailRemote
                 });
                 c.MicNote += note => Later(() => { if (c == _client) Speak(note); });
                 c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoMic(c); SayIfNoNvda(c); } });
+                // Its ports reached from here carry on over this connection (a reconnect), and a saved PC's kept ones open
+                // again, once it has said it can (its features can come before this line: then at once).
+                _tunnels.Attach(PcKey(address, port), c);
+                string tunnelAddress = address;
+                int tunnelPort = port;
+                bool reopened = false;
+                void ReopenOnce() { if (!reopened) { reopened = true; ReopenTunnels(c, tunnelAddress, tunnelPort); } }
+                c.FeaturesKnown += () => Later(ReopenOnce);
+                if (c.HostVersion != null) Later(ReopenOnce);
                 _client = c;
                 ApplyNvda(c);
                 ApplyMic();
@@ -3380,6 +3505,7 @@ namespace TailRemote
             _keys?.SetClient(null);
             _client?.Dispose();
             DropBackground();
+            _tunnels.Dispose();
             _player?.Dispose();
             _host?.Leave(e.CloseReason == CloseReason.WindowsShutDown ? Protocol.LeavingShutdown : Protocol.LeavingStopped);
             _host?.Dispose();
