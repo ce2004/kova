@@ -1,3 +1,11 @@
+4.8.0
+New feature: NVDA keys for Kova. The Kova Helper add-on now has commands you can use from any program: connect to saved PC 1 to 9, start controlling the PC in front, send your clipboard, get the remote PC's clipboard, disconnect, hear Kova's status, hear your saved PCs, and show the Kova window. They have no keys until you give them some in NVDA's menu, Preferences, Input gestures, under Kova.
+Changed: Settings, Install the Kova Helper NVDA add-on is always there, so you can put it on the PC you control from too. The NVDA keys need it on that PC.
+New feature: File, Reach a port on the remote PC (Control Shift P) brings a program's web page or service that only works on the remote PC, like Resilio Sync's page at localhost 8888, to your PC through Kova, through a Kova Relay too. Kova puts its address on your clipboard, and for a saved PC it can open again each time you connect.
+New feature: File, Remote ports open on this PC lists the ports you have brought over. Delete closes one.
+Bug fixed: with Mute Kova when it is not the active window on, starting to control a PC from another program left its sound muted. It is never muted while you control it.
+Important: Reach a port on the remote PC needs Kova 4.8 on both PCs. Update the remote PC with File, Update the remote PC. Everything else still works with Kova 4.7 and 4.6.
+
 4.7.0
 Changed: the File and Settings menus only show what you can use right now. While this PC hosts, File has just Stop hosting, Measure this PC's internet speed and Exit. While you are connected, it has the connection's items. Otherwise it has Connect to a PC and Host this PC.
 Changed: Settings shows the settings for controlling another PC, or, while this PC hosts, the settings for hosting, not both at once. Start hosting when Windows starts is gone while the Kova service is installed, because the service already starts with Windows.

@@ -165,7 +165,8 @@ namespace TailRemote
         /// The lines as they are now. Rebuilt only when a tunnel opens or closes, staying on the same one; otherwise only
         /// lines whose words changed, so NVDA does not read the line you are on again every second.
         /// </summary>
-        private void Fill()
+        /// <summary>landAt: after a close, the place in the list to land on, so focus moves once and NVDA says one line.</summary>
+        private void Fill(int? landAt = null)
         {
             var all = _book.All.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase).ThenBy(t => t.LocalPort).ToList();
             if (all.Count == 0)
@@ -191,7 +192,8 @@ namespace TailRemote
                     foreach (var t in all) _list.Items.Add(new ListViewItem(Line(t)) { Tag = t });
                 }
                 finally { _list.EndUpdate(); }
-                var land = _list.Items.Cast<ListViewItem>().FirstOrDefault(i => i.Tag == focused) ?? _list.Items[0];
+                var land = landAt is int at ? _list.Items[Math.Min(at, _list.Items.Count - 1)]
+                    : _list.Items.Cast<ListViewItem>().FirstOrDefault(i => i.Tag == focused) ?? _list.Items[0];
                 land.Selected = land.Focused = true;
                 land.EnsureVisible();
                 return;
@@ -207,13 +209,9 @@ namespace TailRemote
         {
             if (Selected is not TunnelBook.Tunnel t) { _say("No ports are open here."); return; }
             int at = _list.SelectedIndices.Count > 0 ? _list.SelectedIndices[0] : _list.FocusedItem?.Index ?? 0;
-            _say(_close(t));
-            Fill();
-            if (_list.Items.Count > 0)
-            {
-                var land = _list.Items[Math.Min(at, _list.Items.Count - 1)];
-                land.Selected = land.Focused = true;
-            }
+            string said = _close(t);
+            Fill(at);
+            _say(said); // after focus has moved, so the move does not cut it off
         }
     }
 }

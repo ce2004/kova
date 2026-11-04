@@ -38,10 +38,11 @@ namespace TailRemote
             {
                 local.NoDelay = true;
                 lane.NoDelay = true;
-                // A side that stops taking bytes for a minute is gone: never waited on for ever. No limit on reading:
-                // a connection may rightly sit quiet for hours (a page waiting for news), and the session's end closes it.
-                local.SendTimeout = 60_000;
-                lane.SendTimeout = 60_000;
+                // No time limit on sending or reading: a paused download stops taking bytes for as long as it likes, and
+                // a page can sit quiet for hours. A dead line is found by TCP itself (keepalive below, and retries for
+                // unanswered data), and the session's end closes everything.
+                local.SendTimeout = 0;
+                lane.SendTimeout = 0;
                 lane.GetStream().ReadTimeout = Timeout.Infinite;
                 // A lane a router quietly forgot (NATs drop idle connections) is found within about two minutes this way:
                 // otherwise a page's idle connection could hold one of the host's places until the whole session ended.

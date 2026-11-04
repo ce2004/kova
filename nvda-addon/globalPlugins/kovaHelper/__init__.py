@@ -508,7 +508,9 @@ class _Keys(threading.Thread):
 				return NOT_TAKEN
 			# Returns once Kova has read it: Kova only acts on a command whose connection then ends cleanly, so closing
 			# straight after writing could otherwise lose it.
-			_k32.FlushFileBuffers(h)
+			# A failed flush means Kova closed the pipe without taking the key (it refused this NVDA, or was too busy).
+			if not _k32.FlushFileBuffers(h):
+				return NOT_TAKEN
 			return None
 		finally:
 			_k32.CloseHandle(h)

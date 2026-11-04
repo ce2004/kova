@@ -594,13 +594,17 @@ namespace TailRemote
                 // At most so many dial-backs at once: a hostile relay could otherwise send thousands of offers a second and
                 // use up this PC's threads. Past that, an offer is dropped (the relay tells that PC this host did not answer).
                 if (!_accepting.Wait(0)) { _offered.TryRemove(key, out _); continue; }
-                try { new Thread(() => { try { Accept(relay, id, token, real, key); } finally { _accepting.Release(); } }) { IsBackground = true, Name = "Kova relay accept" }.Start(); }
+                // The place is given back once the connection has proven itself (or when it ends, whichever is first),
+                // so it only counts dial-backs still under way, not tunnels and lanes that stay open for hours.
+                int released = 0;
+                void Release() { if (Interlocked.Exchange(ref released, 1) == 0) _accepting.Release(); }
+                try { new Thread(() => { try { Accept(relay, id, token, real, key, Release); } finally { Release(); } }) { IsBackground = true, Name = "Kova relay accept" }.Start(); }
                 catch { _accepting.Release(); _offered.TryRemove(key, out _); }
             }
         }
 
         /// <summary>Dials back for one offered connection and gives it to the host. Each runs on its own thread, so a slow one never holds up the line or another.</summary>
-        private void Accept(IPEndPoint relay, byte[] id, byte[] token, string real, ulong key)
+        private void Accept(IPEndPoint relay, byte[] id, byte[] token, string real, ulong key, Action proven)
         {
             TcpClient? tcp = null;
             bool remembered = false, taken = false;
@@ -621,7 +625,7 @@ namespace TailRemote
                 if (!Relay.Remember(id, stand, real, this)) { tcp.Dispose(); return; }
                 remembered = true;
                 AnnounceUdp(); // so the sound can start at once
-                _host.Serve(tcp, stand); // returns when the connection ends
+                _host.Serve(tcp, stand, proven); // returns when the connection ends
             }
             catch { try { tcp?.Dispose(); } catch { } }
             finally

@@ -1059,8 +1059,11 @@ namespace TailRemote
         /// a Kova Relay (RelayHost), with the address it stands for (RelayHost.Stand): every limit and
         /// match by address then works on the controlling PC's own address, not the relay's.
         /// </summary>
-        internal void Serve(TcpClient tcp, IPAddress? relayedAs = null)
+        internal void Serve(TcpClient tcp, IPAddress? relayedAs = null, Action? proven = null)
         {
+            // proven: called once the connection has proven it belongs to a session (or logged in), so the relay's
+            // limit on dial-backs under way is not held by connections that stay open for hours, such as tunnels.
+            void Proven() { var p = Interlocked.Exchange(ref proven, null); p?.Invoke(); }
             var remote = relayedAs ?? ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
             if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
             Session? s = null;
@@ -1104,6 +1107,7 @@ namespace TailRemote
                             Protocol.LaneProof(owner.Key, nonce, answer.AsSpan(12, 16), answer.AsSpan(28, 16))))
                     { tcp.Dispose(); return; }
                     EndHandshake(remote, tcp); counted = false; // a viewer must not hold a login's place
+                    Proven();
                     using var link = new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true,
                         Protocol.VideoPurpose(nonce, answer.AsSpan(28, 16)), maxReceive: 64 << 10, maxSend: SecureLink.MaxSend);
                     VideoLane(owner, tcp, link);
@@ -1124,6 +1128,7 @@ namespace TailRemote
                             Protocol.LaneProof(owner.Key, nonce, answer.AsSpan(12, 16), answer.AsSpan(28, 16), Protocol.TunnelProofLabel)))
                     { tcp.Dispose(); return; }
                     EndHandshake(remote, tcp); counted = false; // a tunnel must not hold a login's place
+                    Proven();
                     handedOff = true; // TunnelLane closes it
                     TunnelLane(owner, tcp, nonce, answer[28..44], Protocol.TunnelPort(answer.AsSpan(12, 16)));
                     return;
@@ -1184,6 +1189,7 @@ namespace TailRemote
                     }
                     files.AddLane(tcp, new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true, FileChannel.LanePurpose(nonce, answer.AsSpan(28, 16))));
                     handedOff = true;
+                    Proven();
                     return;
                 }
                 byte[] clientNonce = answer[4..20];
@@ -1289,6 +1295,7 @@ namespace TailRemote
                 EndHandshake(remote, tcp);
                 MarkKnown(remote); // the proof verified: this block keeps reserved slots in future floods
                 counted = false;
+                Proven();
                 lock (_gate)
                 {
                     if (_stop) { End(s, null); return; }

@@ -1096,7 +1096,7 @@ namespace TailRemote
                 string audio = c.AudioDelayMs >= 0 ? "audio " + (c.AudioDelayMs + c.PingForAudio / 2) + " ms" : "";
                 if (c.LastPingMs >= 0) s += " Ping " + c.LastPingMs + " ms" + (audio.Length > 0 ? ", " + audio : "") + ".";
                 else if (audio.Length > 0) s += " A" + audio[1..] + ".";
-                if (c.Muted) s += " Its sound is muted while you are not controlling it.";
+                if (c.Muted) s += " Its sound is muted while Kova is not the active window.";
                 else if (c.ReducedSound is string reduced) s += " Sound at " + reduced + ".";
                 return s + background;
             }
@@ -3027,7 +3027,7 @@ namespace TailRemote
                 c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoMic(c); SayIfNoNvda(c); } });
                 // Its ports reached from here carry on over this connection (a reconnect), and a saved PC's kept ones open
                 // again, once it has said it can (its features can come before this line: then at once).
-                _tunnels.Attach(PcKey(address, port), c);
+                if (!c.ListenOnly) _tunnels.Attach(PcKey(address, port), c); // a listen-only connection can never carry them
                 string tunnelAddress = address;
                 int tunnelPort = port;
                 bool reopened = false;
@@ -3068,6 +3068,11 @@ namespace TailRemote
                 // one would get the login's proof to guess the password from. Asked once, No by default.
                 if (_reconnecting) StopReconnecting("Stopped trying to reconnect.", news: quiet);
                 Tone(Sounds.Tone.Error);
+                // The connection may have been started by an NVDA key from another program, with this window in the
+                // notification area: a box owned by a hidden window might never get the keys.
+                RestoreFromTray();
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Activate();
                 var answer = MessageBox.Show(this, changed.Message + Environment.NewLine + Environment.NewLine +
                     "If you know Kova was set up again on that PC, press Yes to trust it from now on and connect. If not, press No and check with whoever looks after that PC.",
                     "Kova: that PC has a new identity", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
