@@ -1398,9 +1398,8 @@ namespace TailRemote
             {
                 if (port == 0 || owner.Role != Protocol.RoleControl) return;
                 link = new SecureLink(owner.Key, owner.HostNonce, owner.ClientNonce, isHost: true, Protocol.TunnelPurpose(laneNonce, laneValue), maxReceive: 1 + Protocol.TunnelChunk);
-                // Like Get files and the clipboard: the Kova password is never a way round the Windows one. A locked PC (or one
-                // nobody has signed in to, under the service) keeps its ports to itself until someone signs in there.
-                if (ScreenLocked()) { TunnelRefuse(tcp, link, Protocol.TunnelLocked, "The remote PC is locked. Sign in there first, then try again."); return; }
+                // Unlike Get files and the clipboard, ports stay reachable while the PC is locked (the owner's choice):
+                // programs such as Resilio's web page run on PCs that are usually locked.
                 var stream = tcp.GetStream();
                 stream.ReadTimeout = Timeout.Infinite;
                 bool full;

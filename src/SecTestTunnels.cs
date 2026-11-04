@@ -102,11 +102,12 @@ namespace TailRemote
                 Thread.Sleep(2500); // past the host's wait for a lane's session
                 if (relabelled is { } r) { r.Tcp.Dispose(); r.Link.Dispose(); }
                 if (filesBefore != null && host.ControllerFiles != filesBefore) return "a tunnel lane relabelled as a file lane replaced the PC's file channel";
-                // 4d. A locked PC keeps its ports to itself, like Get files.
-                Host.TestLocked = true;
-                try { if (Answer(ctrl.TestTunnelLane(echo.Port, null)) != Protocol.TunnelLocked) return "a tunnel lane was carried while the remote PC was locked"; }
-                finally { Host.TestLocked = false; }
                 if (Volatile.Read(ref echo.Accepted) != before) return "a refused tunnel lane still reached the port (" + (echo.Accepted - before) + ")";
+                // 4d. A locked PC still carries ports (the owner's choice), unlike Get files.
+                Host.TestLocked = true;
+                try { if (Answer(ctrl.TestTunnelLane(echo.Port, null)) != Protocol.TunnelOk) return "a tunnel lane was refused while the remote PC was locked"; }
+                finally { Host.TestLocked = false; }
+                before = Volatile.Read(ref echo.Accepted);
                 // 5. Port 0 is no port.
                 if (ctrl.TestTunnelLane(0, null) != null) return "a tunnel lane to port 0 was even tried";
                 if (Answer(ctrl.TestTunnelLane(echo.Port, (a, nonce) => { a[12] = a[13] = 0; Protocol.LaneProof(key, nonce, a.AsSpan(12, 16), a.AsSpan(28, 16), Protocol.TunnelProofLabel).CopyTo(a, Protocol.LaneProofAt); })) != -1)

@@ -177,7 +177,7 @@ Security
 - An address that keeps guessing is blocked for a while. PCs that have never connected before get 30 wrong passwords per minute, 200 per hour and 1,000 per day in total. PCs that have connected before are always let in.
 - A listen-only connection receives audio only: no keys, mouse, files, clipboard, microphone or NVDA text.
 - While the remote PC is locked, Get files and Get the remote PC's clipboard wait until someone signs in.
-- Reach a port on the remote PC only works with the full password, never listen-only. It only reaches ports on the remote PC itself, never other computers on its network. Its end on your PC only listens on your PC itself, so nobody else on your network can use it, though other people signed in to your PC could. While the remote PC is locked, or nobody has signed in there yet, its ports stay closed until someone signs in.
+- Reach a port on the remote PC only works with the full password, never listen-only. It only reaches ports on the remote PC itself, never other computers on its network. Its end on your PC only listens on your PC itself, so nobody else on your network can use it, though other people signed in to your PC could. Ports work even while the remote PC is locked, so anyone with the full Kova password can reach programs like a web settings page there without the Windows password.
 - Received files are marked as coming from the internet, and file names that disguise a file's type are made safe.
 - Updates are signed and verified before they are installed.
 - Use a long password for any PC that can be reached from the internet or through a relay.

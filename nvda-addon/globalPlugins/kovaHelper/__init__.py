@@ -665,7 +665,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _hookBraille(self):
 		try:
 			import braille
-			self._register(braille.pre_writeCells, self._onCells)
+			# Newer NVDA moved it under braille.extensions; the old name still works there but logs a warning.
+			ext = getattr(braille, "extensions", None)
+			point = getattr(ext, "pre_writeCells", None) if ext is not None else None
+			self._register(point if point is not None else braille.pre_writeCells, self._onCells)
 		except Exception:
 			log.debugWarning("Kova Helper: braille is not handed over", exc_info=True)
 
