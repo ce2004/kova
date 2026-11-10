@@ -1,3 +1,7 @@
+4.10.0
+New feature: when you make a copy of Kova that connects or hosts by itself, you can now choose how its window shows when the copy is opened: the normal window, hidden to the notification area (it keeps hosting or stays connected out of the way, and Windows B finds it), or minimised in the taskbar.
+Changed: the notification sounds are tidied up. The Android sounds are gone, and in their place are new tones and beeps made by Kova itself: a beep, a double and triple beep, a low beep, a high blip, a chirp up and down, a swoop up and down, a laser, a pop, a click, a ding, a warble, pip pip, and a buzz. If you had chosen an Android sound for an event, that event goes back to its default piano sound.
+
 4.9.0
 New feature: Settings, Make a copy of Kova that connects or hosts by itself saves a copy of Kova as one file that does one thing as soon as it is opened. It can connect to a PC, or host the PC it is opened on, through a Kova Relay, directly, or both. Its settings are stored inside the file, so the file is all the other PC needs.
 New feature: a copy like that keeps what it does when it updates itself, and when you rename or move it. To change what a copy does, make a new copy from it or from any Kova.

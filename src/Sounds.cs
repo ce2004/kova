@@ -17,9 +17,11 @@ namespace TailRemote
     /// domain), and a classic phone buzzer made here. Each note uses the nearest
     /// real recording of it, then a little stereo room.
     ///
-    /// Fixed sounds: Android's notification and effect sounds (Android Open Source
-    /// Project, Apache License 2.0), Nepalese bells (VSCO 2), and classic phone
-    /// tunes written here in the style of the old monophonic phones.
+    /// Effects: short tones and beeps made here in code (a beep, a chirp, a
+    /// swoop, a pop, a ding...), each the same whatever the key.
+    ///
+    /// Fixed sounds: Nepalese bells (VSCO 2), and classic phone tunes written
+    /// here in the style of the old monophonic phones.
     ///
     /// Recordings are built into the exe as Opus (native\sounds, snd.*.opus) and
     /// decoded the first time they are needed. Played on the controlling PC only,
@@ -86,6 +88,17 @@ namespace TailRemote
             ("sparkle", new[] { (9, 0.0), (11, 0.035), (12, 0.07), (14, 0.105), (16, 0.14) }),
         };
 
+        /// <summary>Short tones and beeps made here in code, each a standalone sound (no key, no pattern).</summary>
+        private static readonly string[] Effects =
+        {
+            "Beep", "Double beep", "Triple beep", "Low beep", "High blip",
+            "Chirp up", "Chirp down", "Swoop up", "Swoop down", "Laser",
+            "Pop", "Click", "Ding", "Warble", "Pip pip", "Buzz",
+        };
+
+        /// <summary>Whether a sound is one of the made-in-code tones and beeps (the --sampler tour uses this).</summary>
+        public static bool IsEffect(string name) => Array.IndexOf(Effects, name) >= 0;
+
         // Classic phone tunes, written here: (MIDI note or 0 for a rest, length in seconds).
         private static readonly (string Name, (int Note, double Len)[] Notes)[] PhoneTunes =
         {
@@ -109,14 +122,13 @@ namespace TailRemote
         {
             var names = new List<string> { NoSound };
             foreach (var i in Instruments) foreach (var p in Patterns) names.Add(i.Name + ", " + p.Name);
+            foreach (var e in Effects) names.Add(e);
             foreach (var t in PhoneTunes) names.Add("Classic phone: " + t.Name);
-            // Recorded fixed sounds: snd.fixed.GROUP.NAME.opus, grouped as they sort.
+            // Recorded fixed sounds: snd.fixed.GROUP.NAME.opus (the Nepalese bells), grouped as they sort.
             foreach (string r in Resources.Value.Where(r => r.StartsWith("snd.fixed.")).OrderBy(r => r, StringComparer.OrdinalIgnoreCase))
             {
                 string rest = r["snd.fixed.".Length..^".opus".Length];
-                int dot = rest.IndexOf('.');
-                string group = rest[..dot], name = rest[(dot + 1)..];
-                names.Add(group switch { "android" => "Android: " + name, "android effect" => "Android effect: " + name, _ => name });
+                names.Add(rest[(rest.IndexOf('.') + 1)..]);
             }
             return names;
         });
@@ -271,15 +283,22 @@ namespace TailRemote
             }
         }
 
-        /// <summary>Whether a sound depends on the key: the patterns do; phone tunes and recordings don't.</summary>
-        private static bool UsesKey(string name) =>
-            !name.StartsWith("Classic phone: ") && FixedResource(name) == null;
+        /// <summary>Whether a sound depends on the key: only the instrument patterns ("Instrument, pattern") do.</summary>
+        private static bool UsesKey(string name) => name.Contains(", ", StringComparison.Ordinal);
 
         /// <summary>The built-in recording a fixed sound plays, or null if it is not one.</summary>
         private static string? FixedResource(string name) =>
-            name.StartsWith("Android effect: ") ? "snd.fixed.android effect." + name["Android effect: ".Length..] + ".opus"
-            : name.StartsWith("Android: ") ? "snd.fixed.android." + name["Android: ".Length..] + ".opus"
-            : name.StartsWith("Nepalese bell") ? "snd.fixed.bell." + name + ".opus" : null;
+            name.StartsWith("Nepalese bell") ? "snd.fixed.bell." + name + ".opus" : null;
+
+        /// <summary>The loudest sample a sound builds to (0 to 1), before it is levelled, or null if it did not build. Tests use it.</summary>
+        internal static double? PeakOf(string name)
+        {
+            var (l, r) = Make(name, Key);
+            if (l == null || r == null) return null;
+            double peak = 0;
+            for (int i = 0; i < l.Length; i++) peak = Math.Max(peak, Math.Max(Math.Abs(l[i]), Math.Abs(r[i])));
+            return peak;
+        }
 
         private static (double[]? L, double[]? R) Make(string name, int key)
         {
@@ -288,6 +307,7 @@ namespace TailRemote
                 var tune = PhoneTunes.FirstOrDefault(t => t.Name == name["Classic phone: ".Length..]);
                 return tune.Notes == null ? (null, null) : PhoneTune(tune.Notes);
             }
+            if (Array.IndexOf(Effects, name) >= 0) return MadeEffect(name);
             // A fixed sound is decoded, made and let go: only its finished WAV is cached. (Keeping the
             // decoded recording as well was 768 KB a second of sound, for every one ever played.)
             if (FixedResource(name) is string res) return Recording(res, keep: false);
@@ -436,6 +456,151 @@ namespace TailRemote
             var right = (double[])v.Clone();
             Room(v, right, 0.08);
             return (v, right);
+        }
+
+        // ---- Tones and beeps made here in code ----
+
+        private static (double[] L, double[] R) MadeEffect(string name)
+        {
+            double[] m = name switch
+            {
+                "Beep" => Beeps(880, 1, 0.12, 0),
+                "Double beep" => Beeps(880, 2, 0.08, 0.06),
+                "Triple beep" => Beeps(1046, 3, 0.07, 0.05),
+                "Low beep" => Beeps(440, 1, 0.16, 0),
+                "High blip" => Beeps(1760, 1, 0.05, 0),
+                "Chirp up" => Sweep(600, 1400, 0.14, false),
+                "Chirp down" => Sweep(1400, 600, 0.14, false),
+                "Swoop up" => Sweep(300, 1600, 0.3, false),
+                "Swoop down" => Sweep(1600, 300, 0.3, false),
+                "Laser" => Sweep(2200, 320, 0.22, true),
+                "Pop" => Pop(),
+                "Click" => Click(),
+                "Ding" => Ding(),
+                "Warble" => Warble(),
+                "Pip pip" => Beeps(1200, 2, 0.045, 0.07),
+                "Buzz" => Buzz(),
+                _ => Beeps(880, 1, 0.12, 0),
+            };
+            var r = (double[])m.Clone();
+            Room(m, r, 0.06); // a touch of room, so a bare tone is not dead flat
+            return (m, r);
+        }
+
+        /// <summary>A soft envelope: a few ms of fade in, a few ms of fade out, so a tone never clicks.</summary>
+        private static double Edge(int i, int n) => Math.Min(1, i / (Rate * 0.004)) * Math.Min(1, (n - i) / (Rate * 0.006));
+
+        /// <summary>n short tones at frequency f (with a faint octave on top), each len seconds, gap seconds apart.</summary>
+        private static double[] Beeps(double f, int n, double len, double gap)
+        {
+            int one = (int)(len * Rate), g = (int)(gap * Rate);
+            var v = new double[n * one + Math.Max(0, n - 1) * g + Rate / 20];
+            for (int k = 0; k < n; k++)
+            {
+                int start = k * (one + g);
+                for (int i = 0; i < one; i++)
+                {
+                    double w = 2 * Math.PI * f * i / Rate;
+                    v[start + i] += (Math.Sin(w) + 0.15 * Math.Sin(2 * w)) * Edge(i, one);
+                }
+            }
+            return v;
+        }
+
+        /// <summary>A glide from f0 to f1 over len seconds, as a sine or a soft square (square: a laser).</summary>
+        private static double[] Sweep(double f0, double f1, double len, bool square)
+        {
+            int n = (int)(len * Rate);
+            var v = new double[n + Rate / 20];
+            double phase = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double f = f0 * Math.Pow(f1 / f0, i / (double)n); // exponential: a musical, even glide
+                phase += 2 * Math.PI * f / Rate;
+                double s = square ? 0.0 : Math.Sin(phase);
+                if (square) for (int h = 1; h <= 7 && h * f < Rate / 2.5; h += 2) s += Math.Sin(h * phase) / h * 0.6;
+                v[i] = s * Math.Min(1, i / (Rate * 0.004)) * Math.Min(1, (n - i) / (Rate * 0.02));
+            }
+            return v;
+        }
+
+        /// <summary>A bubbly pop: a quick downward pitch with a fast decay.</summary>
+        private static double[] Pop()
+        {
+            int n = (int)(0.09 * Rate);
+            var v = new double[n + Rate / 40];
+            double phase = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / (double)Rate;
+                phase += 2 * Math.PI * (180 + 520 * Math.Exp(-t / 0.03)) / Rate;
+                v[i] = Math.Sin(phase) * Math.Exp(-t / 0.03);
+            }
+            return v;
+        }
+
+        /// <summary>A tiny tick of filtered noise.</summary>
+        private static double[] Click()
+        {
+            int n = (int)(0.02 * Rate);
+            var v = new double[n];
+            var rng = new Random(12345);
+            double lp = 0;
+            for (int i = 0; i < n; i++)
+            {
+                lp += 0.5 * ((rng.NextDouble() * 2 - 1) - lp);
+                v[i] = lp * Math.Exp(-i / (Rate * 0.004));
+            }
+            return v;
+        }
+
+        /// <summary>A soft two-tone ding, like a lift arriving.</summary>
+        private static double[] Ding()
+        {
+            int n = (int)(0.5 * Rate);
+            var v = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / (double)Rate;
+                double env = Math.Min(1, i / (Rate * 0.003)) * Math.Exp(-t / 0.22);
+                v[i] = (Math.Sin(2 * Math.PI * 1318 * t) + 0.5 * Math.Sin(2 * Math.PI * 2637 * t) * Math.Exp(-t / 0.1)) * env;
+            }
+            return v;
+        }
+
+        /// <summary>A quick warble, the pitch wobbling around a centre.</summary>
+        private static double[] Warble()
+        {
+            int n = (int)(0.28 * Rate);
+            var v = new double[n + Rate / 20];
+            double phase = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / (double)Rate;
+                phase += 2 * Math.PI * (700 + 180 * Math.Sin(2 * Math.PI * 14 * t)) / Rate;
+                v[i] = Math.Sin(phase) * Edge(i, n);
+            }
+            return v;
+        }
+
+        /// <summary>Two short low buzzes (a soft square wave), like an intercom.</summary>
+        private static double[] Buzz()
+        {
+            int one = (int)(0.1 * Rate), g = (int)(0.05 * Rate);
+            var v = new double[2 * one + g + Rate / 20];
+            for (int k = 0; k < 2; k++)
+            {
+                int start = k * (one + g);
+                double phase = 0;
+                for (int i = 0; i < one; i++)
+                {
+                    phase += 2 * Math.PI * 160 / Rate;
+                    double s = 0;
+                    for (int h = 1; h <= 7; h += 2) s += Math.Sin(h * phase) / h;
+                    v[start + i] = s * 0.7 * Edge(i, one);
+                }
+            }
+            return v;
         }
 
         // ---- Recordings ----

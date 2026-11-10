@@ -190,13 +190,13 @@ namespace TailRemote
 
             if (args.Length >= 1 && args[0] == "--sampler")
             {
-                // A tour of the sounds: --sampler [pattern | classic | android | bells] [key 0-11]
+                // A tour of the sounds: --sampler [pattern | classic | effects | bells] [key 0-11]
                 string what = args.Length > 1 ? args[1] : "rising";
                 if (args.Length > 2 && int.TryParse(args[2], out int key)) Sounds.Key = Math.Clamp(key, 0, 11);
                 var names = what switch
                 {
                     "classic" => Sounds.All.Where(n => n.StartsWith("Classic phone: ")).ToList(),
-                    "android" => Sounds.All.Where(n => n.StartsWith("Android")).ToList(),
+                    "effects" => Sounds.All.Where(n => Sounds.IsEffect(n)).ToList(),
                     "bells" => Sounds.All.Where(n => n.StartsWith("Nepalese")).ToList(),
                     _ => Sounds.All.Where(n => n.EndsWith(", " + what)).ToList(),
                 };
@@ -333,12 +333,15 @@ namespace TailRemote
                 Note("done, microphone was " + (c.MicSending ? "on" : "off") + " at the end");
                 return 0;
             }
-            if (args.Length == 5 && args[0] == "--makecopy")
+            if (args.Length is 5 or 6 && args[0] == "--makecopy")
             {
                 // A copy that connects or hosts by itself (Carried), made without the window, for tests and scripts:
                 // --makecopy FILE connect ADDRESS PASSWORD (the address is looked for as Connect to a PC does), or
                 // --makecopy FILE host WHERE PASSWORD, where WHERE is a relay's address, "direct" or "direct:PORT".
+                // An optional 6th word tray or min hides the copy to the notification area, or starts it minimised.
                 // 0: made. 2: the words cannot be used. 1: it could not be written.
+                HideMode hide = args.Length == 6 ? args[5] switch { "tray" => HideMode.Tray, "min" => HideMode.Minimized, _ => (HideMode)(-1) } : HideMode.None;
+                if ((int)hide < 0) return 2;
                 LaunchPlan plan;
                 if (args[2] == "connect")
                 {
@@ -355,6 +358,7 @@ namespace TailRemote
                 else if (args[2] == "host" && Relay.Parse("x@" + args[3], KovaRelayWire.Wire.DefaultPort, out _) is Relay.Target at)
                     plan = new LaunchPlan { Host = true, Relay = true, RelayAddress = at.RelayHost, RelayPort = at.RelayPort, Password = args[4] };
                 else return 2;
+                plan.Hide = hide;
                 if (!plan.Usable || (plan.Host && new System.Globalization.StringInfo(plan.Password).LengthInTextElements < MainForm.MinPasswordLength)) return 2;
                 try { Carried.WriteCopy(Names.OwnExe, Path.GetFullPath(args[1]), plan); return 0; }
                 catch (Exception e) { CrashNote("--makecopy: " + e.Message); return 1; }
@@ -1639,6 +1643,24 @@ namespace TailRemote
             try { Settings.Import(backup, "wrong password"); return Fail("a settings backup opened with the wrong password"); }
             catch (WrongBackupPasswordException) { }
             lossless += " | settings backup";
+
+            // Every sound in the list builds to real audio: the made tones and beeps, the phone tunes, the
+            // instrument patterns and the bells. A broken generator or a missing recording is caught here, not
+            // by the owner choosing a silent sound. (Trimming has emptied embedded resources before.)
+            {
+                int effects = 0, noSound = 0;
+                foreach (string s in Sounds.All)
+                {
+                    if (s == Sounds.NoSound) continue;
+                    if (Sounds.PeakOf(s) is not double peak) return Fail("the sound " + s + " did not build");
+                    if (peak < 0.01) noSound++;
+                    if (Sounds.IsEffect(s)) effects++;
+                }
+                if (effects < 16) return Fail("only " + effects + " made tones and beeps are in the list");
+                if (noSound > 0) return Fail(noSound + " sounds built but were silent");
+                if (Sounds.All.Any(s => s.StartsWith("Android"))) return Fail("an Android sound is still in the list");
+                lossless += " | " + (Sounds.All.Count - 1) + " sounds build, " + effects + " made tones and beeps, no Android";
+            }
 
             // The real Windows clipboard, as when clipboard text and files arrive. Trimmed too far, the
             // release build hung or crashed here (2.0.0 to 2.1.3), and nothing else noticed.

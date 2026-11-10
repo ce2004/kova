@@ -6,6 +6,9 @@ using System.Text.Json;
 
 namespace TailRemote
 {
+    /// <summary>How a copy's window shows when it is opened by itself (Carried).</summary>
+    internal enum HideMode { None = 0, Tray = 1, Minimized = 2 }
+
     /// <summary>
     /// What a copy of Kova does by itself when it is opened (4.9): connect to one PC, or host the PC it is opened on.
     /// It travels inside the exe (Carried), so the exe alone is all another PC needs.
@@ -14,6 +17,9 @@ namespace TailRemote
     {
         /// <summary>True: host the PC it is opened on. False: connect to Address.</summary>
         public bool Host { get; set; }
+
+        /// <summary>Whether the window shows, hides to the notification area, or starts minimised, once it is opened.</summary>
+        public HideMode Hide { get; set; }
 
         // Connecting: as a saved PC has them (an address "@relay:port#tag" means the PC hosting there with this password).
         public string Address { get; set; } = "";
@@ -39,10 +45,18 @@ namespace TailRemote
             : TailRemote.Relay.IsByPassword(Address) ? "the PC on the relay " + TailRemote.Relay.Shown(Address)
             : Port == Protocol.DefaultPort ? Address : Address + ", port " + Port;
 
+        /// <summary>How the window shows, as a sentence ending, or empty when it shows as usual.</summary>
+        public string HideShown => Hide switch
+        {
+            HideMode.Tray => ", and hides to the notification area",
+            HideMode.Minimized => ", and starts minimised",
+            _ => "",
+        };
+
         /// <summary>What a copy with this plan does when it is opened, as a sentence.</summary>
-        public string Does => !Host ? "connects to " + PcShown
+        public string Does => (!Host ? "connects to " + PcShown
             : "hosts the PC it is opened on, " + (Relay && Direct ? "through the Kova Relay at " + RelayShown + " and directly on port " + HostPort
-                : Relay ? "through the Kova Relay at " + RelayShown : "directly on port " + HostPort);
+                : Relay ? "through the Kova Relay at " + RelayShown : "directly on port " + HostPort)) + HideShown;
 
         /// <summary>Whether it can be used at all (a damaged or hand-made one is ignored rather than half applied).</summary>
         public bool Usable => Password is { Length: > 0 } && Address != null && Name != null && RelayAddress != null && ListenPassword != null
@@ -170,9 +184,9 @@ namespace TailRemote
             byte[] program = RandomNumberGenerator.GetBytes(5000);
             File.WriteAllBytes(a, program);
             if (Read(a) != null) return "a file without a plan was read as having one";
-            var plan = new LaunchPlan { Host = true, Relay = true, RelayAddress = "relay.example.com", RelayPort = 6968, Password = "passéword", ListenPassword = "listening" };
+            var plan = new LaunchPlan { Host = true, Relay = true, RelayAddress = "relay.example.com", RelayPort = 6968, Password = "passéword", ListenPassword = "listening", Hide = HideMode.Tray };
             WriteCopy(a, b, plan);
-            if (Read(b) is not { Host: true, Relay: true, Direct: false, RelayAddress: "relay.example.com", RelayPort: 6968, Password: "passéword", ListenPassword: "listening" })
+            if (Read(b) is not { Host: true, Relay: true, Direct: false, RelayAddress: "relay.example.com", RelayPort: 6968, Password: "passéword", ListenPassword: "listening", Hide: HideMode.Tray })
                 return "a hosting plan did not come back as written";
             var other = new LaunchPlan { Address = "office-pc", Port = 47121, Password = "secret1", Name = "Office" };
             WriteCopy(b, c, other); // a copy of a copy: the new plan, not both

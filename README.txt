@@ -122,6 +122,7 @@ A copy that connects or hosts by itself
 - Settings, Make a copy of Kova that connects or hosts by itself saves a copy of Kova as one file that does one thing as soon as it is opened. Nothing else is needed on the other PC: no settings file, no setup. Just the file.
 - The copy can connect to a PC: one of your saved PCs, or a new one by its address and password.
 - Or the copy can host the PC it is opened on, through a Kova Relay, directly, or both, with a password you choose for it. Put it on a PC, open it, and that PC is ready for you to connect to. Use a hosting copy on one PC at a time.
+- You also choose how the copy's window shows when it is opened: the normal window, hidden to the notification area (it keeps hosting or stays connected out of the way, and Windows B finds it), or minimised in the taskbar.
 - What the copy does is stored inside the file itself. It still does it after it updates itself, and after it is renamed or moved.
 - A hosting copy makes its way of hosting the PC's own, as Host this PC would. On a PC the Kova service already hosts, it says so and changes nothing.
 - The copy is otherwise the whole of Kova, with every menu. To change what a copy does, make a new copy from it, or from any Kova. From a copy, you can also save a plain copy that does nothing by itself.

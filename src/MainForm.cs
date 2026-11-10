@@ -2815,6 +2815,7 @@ namespace TailRemote
             {
                 SwitchTo(plan.Address, plan.Port, plan.Password, plan.PcShown);
                 UpdateMode();
+                ApplyPlanHide(plan.Hide, hosting: false);
                 return;
             }
             if (_service.Checked)
@@ -2824,6 +2825,19 @@ namespace TailRemote
             }
             TakeHostAnswers(new HostWizard.Answer(plan.Direct, plan.Relay, plan.HostPort, plan.RelayAddress.Trim(), plan.RelayPort, plan.Password, plan.ListenPassword));
             StartHost();
+            ApplyPlanHide(plan.Hide, hosting: true);
+        }
+
+        /// <summary>
+        /// A copy that carries a hide choice (Carried) hides to the notification area, or minimises, once it is hosting
+        /// or connected. Hiding to the tray only when it really started (StartHost is async: checked on the window's
+        /// thread next time round), so a copy that could not host stays visible instead of vanishing.
+        /// </summary>
+        private void ApplyPlanHide(HideMode hide, bool hosting)
+        {
+            if (hide == HideMode.Minimized) { WindowState = FormWindowState.Minimized; return; }
+            if (hide != HideMode.Tray) return;
+            BeginInvoke(() => { if ((hosting && _host != null) || (!hosting && Connected)) HideToTray(announce: false); });
         }
 
         /// <summary>A save box for the copy, on a thread of its own like the other file boxes. Null: cancelled.</summary>
@@ -2860,14 +2874,29 @@ namespace TailRemote
             var first = new System.Collections.Generic.List<Control> { connect, host };
             if (own != null) first.Add(plain);
             first.Add(about);
+
+            // How the copy's window shows once it has started connecting or hosting.
+            var showNormal = WizardForm.Choice("Sho&w the Kova window, as usual.", chosen: true);
+            var showTray = WizardForm.Choice("Hide it to the notification &area. It keeps hosting, or stays connected, out of the way. Windows B finds it.");
+            var showMin = WizardForm.Choice("Start &minimised, in the taskbar.");
+            bool DoesSomething() => connect.Checked || host.Checked;
+
             using (var what = new WizardForm("Make a copy of Kova", new System.Collections.Generic.List<WizardForm.Page>
             {
                 new() { Question = "What should the copy do when it is opened?", Controls = first.ToArray(), NextText = () => plain.Checked ? "&Save the copy..." : "&Next" },
+                new()
+                {
+                    Question = "When it is opened, how should the Kova window show?",
+                    Controls = new Control[] { showNormal, showTray, showMin },
+                    Shown = DoesSomething,
+                    NextText = () => "&Save the copy...",
+                },
             }))
             {
                 foreach (var r in new[] { connect, host, plain }) r.CheckedChanged += (_, _) => what.UpdateNext();
                 if (what.ShowDialog(this) != DialogResult.OK) return;
             }
+            HideMode hide = showTray.Checked ? HideMode.Tray : showMin.Checked ? HideMode.Minimized : HideMode.None;
 
             LaunchPlan? plan = null;
             string name = "Kova.exe";
@@ -2876,7 +2905,7 @@ namespace TailRemote
                 var a = ConnectWizard.Run(this, _settings, () => { SaveNow(); FillSaved(); UpdateButtons(); }, forCopy: true);
                 if (a == null) return;
                 if (a.Password.Length == 0) { Say("That saved PC's password could not be read on this Windows account. Choose Edit PC in Connect to a PC and type it again first."); return; }
-                plan = new LaunchPlan { Address = a.Address, Port = a.Port, Password = a.Password, Name = a.Saved?.ToString() ?? a.Name };
+                plan = new LaunchPlan { Address = a.Address, Port = a.Port, Password = a.Password, Name = a.Saved?.ToString() ?? a.Name, Hide = hide };
                 name = "Kova connect.exe";
             }
             else if (host.Checked)
@@ -2885,7 +2914,7 @@ namespace TailRemote
                 var a = HostWizard.Run(this, _settings, Protocol.DefaultPort, "", "", registeredNow: false, service: false, bestAddress: null, myAddresses: null,
                     text => ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(text))), forCopy: true);
                 if (a == null) return;
-                plan = new LaunchPlan { Host = true, Direct = a.Direct, Relay = a.Relay, HostPort = a.Port, RelayAddress = a.RelayAddress, RelayPort = a.RelayPort, Password = a.Password, ListenPassword = a.ListenPassword };
+                plan = new LaunchPlan { Host = true, Direct = a.Direct, Relay = a.Relay, HostPort = a.Port, RelayAddress = a.RelayAddress, RelayPort = a.RelayPort, Password = a.Password, ListenPassword = a.ListenPassword, Hide = hide };
                 name = "Kova host.exe";
             }
 
