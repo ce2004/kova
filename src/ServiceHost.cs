@@ -918,6 +918,7 @@ namespace TailRemote
             // meant a slow line could never update the service. A damaged download throws and changes nothing.
             try { Updater.DownloadAsync(r.Url, fresh, r.Sha256).GetAwaiter().GetResult(); }
             catch { try { File.Delete(fresh); } catch { } throw; }
+            Carried.CarryOver(exe, fresh); // a file the window shares keeps what it does by itself when opened
             // This copy is itself still on trial (updated less than 2 minutes of hosting ago): the copy kept
             // from before it is the last one known to work, and stays the one to go back to.
             string[]? trial = null;

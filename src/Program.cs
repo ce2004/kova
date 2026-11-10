@@ -333,6 +333,32 @@ namespace TailRemote
                 Note("done, microphone was " + (c.MicSending ? "on" : "off") + " at the end");
                 return 0;
             }
+            if (args.Length == 5 && args[0] == "--makecopy")
+            {
+                // A copy that connects or hosts by itself (Carried), made without the window, for tests and scripts:
+                // --makecopy FILE connect ADDRESS PASSWORD (the address is looked for as Connect to a PC does), or
+                // --makecopy FILE host WHERE PASSWORD, where WHERE is a relay's address, "direct" or "direct:PORT".
+                // 0: made. 2: the words cannot be used. 1: it could not be written.
+                LaunchPlan plan;
+                if (args[2] == "connect")
+                {
+                    var found = Route.Find(args[3], args[4]).GetAwaiter().GetResult();
+                    if (found.Address.Length == 0) return 2;
+                    plan = new LaunchPlan { Address = found.Address, Port = found.Port, Password = args[4] };
+                }
+                else if (args[2] == "host" && args[3].StartsWith("direct", StringComparison.OrdinalIgnoreCase))
+                {
+                    int hostPort = Protocol.DefaultPort;
+                    if (args[3].Length > 6 && (args[3][6] != ':' || Protocol.PortProblem(args[3][7..], out hostPort) != null)) return 2;
+                    plan = new LaunchPlan { Host = true, Direct = true, HostPort = hostPort, Password = args[4] };
+                }
+                else if (args[2] == "host" && Relay.Parse("x@" + args[3], KovaRelayWire.Wire.DefaultPort, out _) is Relay.Target at)
+                    plan = new LaunchPlan { Host = true, Relay = true, RelayAddress = at.RelayHost, RelayPort = at.RelayPort, Password = args[4] };
+                else return 2;
+                if (!plan.Usable || (plan.Host && new System.Globalization.StringInfo(plan.Password).LengthInTextElements < MainForm.MinPasswordLength)) return 2;
+                try { Carried.WriteCopy(Names.OwnExe, Path.GetFullPath(args[1]), plan); return 0; }
+                catch (Exception e) { CrashNote("--makecopy: " + e.Message); return 1; }
+            }
             if (args.Length >= 1 && args[0] == "--dialogtest")
             {
                 // A blank window with a menu bar like the real one, opening a list and a typing box,
@@ -386,10 +412,15 @@ namespace TailRemote
             // hosting or connected, whichever was running when the old copy closed.
             string resume = Array.IndexOf(args, "--resume") >= 0 ? Settings.Load().ResumeState : "";
 
+            // A copy that carries what to do when opened (Carried) does it, unless this start already says what to
+            // carry on with: after an update or a rebuild, or the sign-in task.
+            bool told = takingOver || Array.IndexOf(args, "--host") >= 0 || Array.IndexOf(args, "--connect") >= 0;
+
             RunWindow(() => new MainForm(
                 autoHost: Array.IndexOf(args, "--host") >= 0 || resume == "host",
                 autoConnect: Array.IndexOf(args, "--connect") >= 0 || resume == "connect",
-                updated: after >= 0));
+                updated: after >= 0,
+                plan: told ? null : Carried.Own));
             ReleaseWindow();
             return 0;
         }
@@ -991,6 +1022,8 @@ namespace TailRemote
                     byte[] exported = new Settings().Export("selftest password");
                     if (!Settings.LooksLikeBackup(exported) || Settings.LooksLikeBackup(new byte[60]) || Settings.LooksLikeBackup("TRBK1"u8.ToArray()))
                         return Fail("a settings backup was not told apart from other files");
+                    // What a copy does when opened, kept inside the exe (Carried).
+                    if (Carried.SelfTest(settingsDir) is string planProblem) return Fail("launch plan: " + planProblem);
                 }
                 finally
                 {

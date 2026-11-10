@@ -1,3 +1,8 @@
+4.9.0
+New feature: Settings, Make a copy of Kova that connects or hosts by itself saves a copy of Kova as one file that does one thing as soon as it is opened. It can connect to a PC, or host the PC it is opened on, through a Kova Relay, directly, or both. Its settings are stored inside the file, so the file is all the other PC needs.
+New feature: a copy like that keeps what it does when it updates itself, and when you rename or move it. To change what a copy does, make a new copy from it or from any Kova.
+Important: a copy that connects or hosts by itself holds its password inside the file. Anyone who gets the file can use it, so only give it to people you trust.
+
 4.8.0
 New feature: NVDA keys for Kova. The Kova Helper add-on now has commands you can use from any program: connect to saved PC 1 to 9, start controlling the PC in front, send your clipboard, get the remote PC's clipboard, disconnect, hear Kova's status, hear your saved PCs, and show the Kova window. They have no keys until you give them some in NVDA's menu, Preferences, Input gestures, under Kova.
 Changed: Settings, Install the Kova Helper NVDA add-on is always there, so you can put it on the PC you control from too. The NVDA keys need it on that PC.

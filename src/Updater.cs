@@ -259,6 +259,8 @@ namespace TailRemote
             try
             {
                 await DownloadAsync(r.Url, fresh, r.Sha256);
+                // Checked as downloaded; now it takes on what this copy does by itself when opened, if anything.
+                Carried.CarryOver(exe, fresh);
                 // The running copy is swapped for the new one (Windows lets a running program be
                 // renamed or replaced, not deleted). If an older leftover cannot be deleted (a
                 // TailRemote still running from it, or a virus scan holding it), it is left alone

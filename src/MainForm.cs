@@ -9,6 +9,8 @@ namespace TailRemote
     {
         private readonly Settings _settings = Settings.Load();
         private readonly bool _autoHost, _autoConnect, _updated;
+        /// <summary>What this copy does by itself now that it is opened (Carried), or null: nothing, or this start was told what to do.</summary>
+        private readonly LaunchPlan? _plan;
 
         // The window is blank: everything is in the menu bar (Alt), File, Clipboard and Settings.
         private readonly MenuChoice _mode = new("&Mode");
@@ -100,6 +102,8 @@ namespace TailRemote
         private readonly MenuItem _speedRemote = new("Measure the r&emote PC's internet speed...");
         private readonly MenuItem _backup = new("&Back up settings to a file...");
         private readonly MenuItem _restore = new("&Restore settings from a backup...");
+        // A copy of Kova's own exe that connects to a PC, or hosts the PC it is opened on, by itself (Carried).
+        private readonly MenuItem _makeCopy = new("Make a cop&y of Kova that connects or hosts by itself...");
         // Several PCs at once: the one in front is _client; these wait in the background, connected
         // but silent, until switched to (Control 1 to 9, or File, Switch to PC).
         private sealed record Parked(string Name, string Address, int Port, string Password, Client Client);
@@ -185,8 +189,9 @@ namespace TailRemote
         private bool _resumeRemote;     // was controlling the remote PC when the connection dropped
         private bool _quietModeChange;  // the reconnect message already says it
 
-        public MainForm(bool autoHost, bool autoConnect, bool updated)
+        public MainForm(bool autoHost, bool autoConnect, bool updated, LaunchPlan? plan = null)
         {
+            _plan = plan;
             _autoHost = autoHost;
             _autoConnect = autoConnect;
             _updated = updated;
@@ -250,7 +255,7 @@ namespace TailRemote
             {
                 _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds, new ToolStripSeparator(),
                 _captureFrom.Menu, _micOutput.Menu, _startup, _service, _applyService, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
-                _helperHere, _backup, _restore, _logging,
+                _helperHere, _backup, _restore, _makeCopy, _logging,
             });
             // Flow, not the usual single row: a row hides whatever does not fit, with no word to a
             // screen reader, and with Windows' text scaling About did not fit.
@@ -398,6 +403,7 @@ namespace TailRemote
             _speedRemote.Click += (_, _) => Menus.AfterMenu(() => SpeedTestRemote());
             _backup.Click += (_, _) => Menus.AfterMenu(() => BackupSettings());
             _restore.Click += (_, _) => Menus.AfterMenu(() => RestoreSettings());
+            _makeCopy.Click += (_, _) => Menus.AfterMenu(() => MakeCopy());
             _switchTo.DropDownItems.Add("(filled in when opened)");
             _switchTo.DropDownOpening += (_, _) => FillSwitchMenu();
             _announceQuality.CheckedChanged += (_, _) => SaveSettings();
@@ -2307,6 +2313,7 @@ namespace TailRemote
                 BeginInvoke(() => { if (_host != null) HideToTray(announce: false); });
             }
             else if (_autoConnect && !HostMode && _address.Text.Trim().Length > 0) Go();
+            else if (_plan != null) FollowPlan(_plan);
             // Go said nothing (a setting needed fixing, say): "Updated to version" is said now, not glued to something later.
             if (_sayFirst is string pending) { _sayFirst = null; Say(pending); }
         }
@@ -2765,6 +2772,18 @@ namespace TailRemote
             var a = HostWizard.Run(this, _settings, port, _password.Text, _listenPassword.Text, _host?.RelayRegistered == true || _service.Checked, _service.Checked,
                 _bestAddress, _myAddresses, text => ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(text)))); // the clipboard's own thread, never the window's
             if (a == null) return;
+            TakeHostAnswers(a);
+            if (_service.Checked) ApplyService();
+            else
+            {
+                if (_host != null) StopHost();
+                StartHost();
+            }
+        }
+
+        /// <summary>How this PC hosts, as Host this PC (or the plan a copy carries) gave it: into the hidden settings, and saved.</summary>
+        private void TakeHostAnswers(HostWizard.Answer a)
+        {
             _loadingSettings = true; // filled in all at once: nothing below acts on half of it
             try
             {
@@ -2780,12 +2799,113 @@ namespace TailRemote
             _settings.RelayOnly = a.Relay && !a.Direct;
             SaveSettings();
             UpdateMode();
-            if (_service.Checked) ApplyService();
-            else
+        }
+
+        // ---- A copy that connects or hosts by itself (Carried) ----
+
+        /// <summary>
+        /// This copy carries what to do when it is opened, and was just opened: it connects to its PC, or hosts this
+        /// one. Hosting takes the copy's settings as this PC's own, exactly as Host this PC would; a PC the Kova
+        /// service already hosts is left as it is.
+        /// </summary>
+        private void FollowPlan(LaunchPlan plan)
+        {
+            Doing("doing what this copy does when opened");
+            if (!plan.Host)
             {
-                if (_host != null) StopHost();
-                StartHost();
+                SwitchTo(plan.Address, plan.Port, plan.Password, plan.PcShown);
+                UpdateMode();
+                return;
             }
+            if (_service.Checked)
+            {
+                Say("This copy of Kova hosts the PC it is opened on, but the Kova service is hosting this PC already, so nothing was changed.");
+                return;
+            }
+            TakeHostAnswers(new HostWizard.Answer(plan.Direct, plan.Relay, plan.HostPort, plan.RelayAddress.Trim(), plan.RelayPort, plan.Password, plan.ListenPassword));
+            StartHost();
+        }
+
+        /// <summary>A save box for the copy, on a thread of its own like the other file boxes. Null: cancelled.</summary>
+        private static System.Threading.Tasks.Task<string?> PickCopyFile(string name)
+        {
+            var done = new System.Threading.Tasks.TaskCompletionSource<string?>();
+            var t = new System.Threading.Thread(() =>
+            {
+                try
+                {
+                    using var d = new SaveFileDialog { Title = "Save the copy of Kova as", FileName = name, DefaultExt = "exe", Filter = "Programs (*.exe)|*.exe" };
+                    done.TrySetResult(d.ShowDialog() == DialogResult.OK ? d.FileName : null);
+                }
+                catch (Exception e) { done.TrySetException(e); }
+            }) { IsBackground = true, Name = "Kova copy picker" };
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
+            return done.Task;
+        }
+
+        /// <summary>
+        /// Settings, Make a copy of Kova that connects or hosts by itself: asks what the copy should do, then saves this
+        /// Kova's own exe under another name with that inside it. Nothing here changes: not this copy, not its settings.
+        /// </summary>
+        private async void MakeCopy()
+        {
+            Doing("making a copy that connects or hosts by itself");
+            var own = Carried.Own;
+            var connect = WizardForm.Choice("&Connect to a PC as soon as it is opened.", chosen: true);
+            var host = WizardForm.Choice("&Host the PC it is opened on, so you can connect to that PC.");
+            var plain = WizardForm.Choice("N&othing by itself: a plain copy of Kova.");
+            var about = WizardForm.Note(own != null ? "This copy " + own.Does + " when it is opened. The new copy does what you choose here instead."
+                : "The copy is one file with everything inside it. Put it on any PC and open it: nothing else is needed.");
+            var first = new System.Collections.Generic.List<Control> { connect, host };
+            if (own != null) first.Add(plain);
+            first.Add(about);
+            using (var what = new WizardForm("Make a copy of Kova", new System.Collections.Generic.List<WizardForm.Page>
+            {
+                new() { Question = "What should the copy do when it is opened?", Controls = first.ToArray(), NextText = () => plain.Checked ? "&Save the copy..." : "&Next" },
+            }))
+            {
+                foreach (var r in new[] { connect, host, plain }) r.CheckedChanged += (_, _) => what.UpdateNext();
+                if (what.ShowDialog(this) != DialogResult.OK) return;
+            }
+
+            LaunchPlan? plan = null;
+            string name = "Kova.exe";
+            if (connect.Checked)
+            {
+                var a = ConnectWizard.Run(this, _settings, () => { SaveNow(); FillSaved(); UpdateButtons(); }, forCopy: true);
+                if (a == null) return;
+                if (a.Password.Length == 0) { Say("That saved PC's password could not be read on this Windows account. Choose Edit PC in Connect to a PC and type it again first."); return; }
+                plan = new LaunchPlan { Address = a.Address, Port = a.Port, Password = a.Password, Name = a.Saved?.ToString() ?? a.Name };
+                name = "Kova connect.exe";
+            }
+            else if (host.Checked)
+            {
+                // Its own passwords, typed here: on a relay the password is how the PC is found, so never this PC's.
+                var a = HostWizard.Run(this, _settings, Protocol.DefaultPort, "", "", registeredNow: false, service: false, bestAddress: null, myAddresses: null,
+                    text => ClipboardJobs.TryAdd(() => SetClipboard(() => Clipboard.SetText(text))), forCopy: true);
+                if (a == null) return;
+                plan = new LaunchPlan { Host = true, Direct = a.Direct, Relay = a.Relay, HostPort = a.Port, RelayAddress = a.RelayAddress, RelayPort = a.RelayPort, Password = a.Password, ListenPassword = a.ListenPassword };
+                name = "Kova host.exe";
+            }
+
+            string? path;
+            try { path = await PickCopyFile(name); }
+            catch (Exception e) { Say("Could not open the save box: " + e.Message); return; }
+            if (path == null || IsDisposed) return;
+            if (ServiceHost.SameFile(path, Names.OwnExe) || ServiceHost.SameFile(path, Environment.ProcessPath))
+            {
+                Say("That is the copy of Kova that is running now, which cannot be saved over. Choose another name or folder.");
+                return;
+            }
+            try
+            {
+                string from = Names.OwnExe;
+                await System.Threading.Tasks.Task.Run(() => Carried.WriteCopy(from, path, plan));
+                Say(plan == null ? "Saved a plain copy of Kova as " + path + "."
+                    : "Saved the copy as " + path + ". Opened on any PC, it " + plan.Does + ". Its file holds the password, so only give it to people you trust.");
+            }
+            catch (Exception e) { Say("Could not save the copy: " + e.Message); }
         }
 
         /// <summary>The same relay under the listen-only password's code, or null when there is no listen-only password.</summary>

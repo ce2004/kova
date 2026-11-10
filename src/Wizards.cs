@@ -302,7 +302,8 @@ namespace TailRemote
         internal const string AddressHelp = "the PC's name or IP address, or the address of the Kova Relay it hosts through. Add a colon and the port number only if it is not the usual one.";
 
         /// <param name="savedChanged">Called after a saved PC is edited or deleted here, to save the settings at once.</param>
-        public static Answer? Run(IWin32Window owner, Settings settings, Action savedChanged)
+        /// <param name="forCopy">Asked for a copy of Kova that connects by itself (Carried): nothing connects or is saved here.</param>
+        public static Answer? Run(IWin32Window owner, Settings settings, Action savedChanged, bool forCopy = false)
         {
             var list = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
             var radios = new List<(RadioButton Radio, SavedPc? Pc)>();
@@ -314,6 +315,7 @@ namespace TailRemote
             var save = new CheckBox { Text = "Sa&ve this PC for next time", AutoSize = true, Checked = true };
             var (nameLabel, nameBox) = WizardForm.Field("&Name for this PC", "", help: "optional, for example Office PC.");
             save.CheckedChanged += (_, _) => nameLabel.Enabled = nameBox.Enabled = save.Checked;
+            string go = forCopy ? "&Next" : "&Connect";
 
             WizardForm? form = null;
             WizardForm.Page? choosePage = null;
@@ -343,11 +345,11 @@ namespace TailRemote
 
             choosePage = new WizardForm.Page
             {
-                Question = "Which PC do you want to connect to?",
+                Question = forCopy ? "Which PC should the copy connect to?" : "Which PC do you want to connect to?",
                 Controls = new Control[] { list },
                 Shown = () => settings.SavedPcs.Count > 0,
                 FinishesHere = () => Chosen() != null,
-                NextText = () => Chosen() != null ? "&Connect" : "&Next",
+                NextText = () => Chosen() != null ? go : "&Next",
                 Focus = () => radios.FirstOrDefault(r => r.Radio.Checked).Radio,
                 Buttons = new[] { editPc, deletePc },
                 ButtonShown = _ => Chosen() != null,
@@ -355,9 +357,11 @@ namespace TailRemote
             var detailsPage = new WizardForm.Page
             {
                 Question = "The PC's address and password",
-                Controls = new Control[] { addrLabel, addr, pwLabel, pwBox, WizardForm.ShowPassword(pwBox), save, nameLabel, nameBox },
+                // For a copy there is nothing to save here: the name is the one the copy says as it connects.
+                Controls = forCopy ? new Control[] { addrLabel, addr, pwLabel, pwBox, WizardForm.ShowPassword(pwBox), nameLabel, nameBox }
+                    : new Control[] { addrLabel, addr, pwLabel, pwBox, WizardForm.ShowPassword(pwBox), save, nameLabel, nameBox },
                 Shown = () => Chosen() == null,
-                NextText = () => "&Connect",
+                NextText = () => go,
                 Check = async () =>
                 {
                     if (addr.Text.Trim().Length == 0) return ("Enter the address of the PC or of a Kova Relay.", false);
@@ -368,7 +372,7 @@ namespace TailRemote
                     return null;
                 },
             };
-            form = new WizardForm("Connect to a PC", new List<WizardForm.Page> { choosePage, detailsPage });
+            form = new WizardForm(forCopy ? "A copy that connects to a PC" : "Connect to a PC", new List<WizardForm.Page> { choosePage, detailsPage });
             Fill(settings.SavedPcs.FirstOrDefault(p => p.Address == settings.Address && p.Port == settings.Port));
 
             editPc.Click += async (_, _) =>
@@ -402,7 +406,7 @@ namespace TailRemote
                 if (form.ShowDialog(owner) != DialogResult.OK) return null;
                 if (Chosen() is SavedPc chosen) return new Answer(chosen.Address, chosen.Port, Settings.Unprotect(chosen.PasswordEnc), false, chosen.Name, chosen);
                 var f = found!;
-                return new Answer(f.Address, f.Port, pwBox.Text, save.Checked, save.Checked ? nameBox.Text.Trim() : "", null);
+                return new Answer(f.Address, f.Port, pwBox.Text, save.Checked && !forCopy, save.Checked || forCopy ? nameBox.Text.Trim() : "", null);
             }
         }
     }
@@ -455,24 +459,26 @@ namespace TailRemote
         /// <param name="bestAddress">The address other computers on this network would type (null when this PC has none).</param>
         /// <param name="myAddresses">All of this PC's addresses, in words, for the summary.</param>
         /// <param name="copy">Puts text on the clipboard (on Kova's clipboard thread).</param>
+        /// <param name="forCopy">Asked for a copy of Kova that hosts by itself (Carried): about the PC that copy is opened on, and nothing starts here.</param>
         public static Answer? Run(IWin32Window owner, Settings settings, int port, string password, string listen, bool registeredNow, bool service,
-            string? bestAddress, string? myAddresses, Action<string> copy)
+            string? bestAddress, string? myAddresses, Action<string> copy, bool forCopy = false)
         {
+            string pc = forCopy ? "that PC" : "this PC", Pc = forCopy ? "That PC" : "This PC";
             int was = !settings.RelayHosting ? 1 : settings.RelayOnly ? 0 : 2;
-            var viaRelay = WizardForm.Choice("Through a Kova &Relay. Works from anywhere, and nothing needs opening on this PC or your router.", chosen: was == 0);
-            var direct = WizardForm.Choice("&Directly, by this PC's own address. For computers on the same network or a VPN. Kova opens a port in Windows Firewall.", chosen: was == 1);
+            var viaRelay = WizardForm.Choice("Through a Kova &Relay. Works from anywhere, and nothing needs opening on " + pc + " or " + (forCopy ? "its" : "your") + " router.", chosen: was == 0);
+            var direct = WizardForm.Choice("&Directly, by " + pc + "'s own address. For computers on the same network or a VPN. Kova opens a port in Windows Firewall.", chosen: was == 1);
             var both = WizardForm.Choice("B&oth ways: through the relay from anywhere, and directly from the same network or a VPN.", chosen: was == 2);
             bool UsesRelay() => viaRelay.Checked || both.Checked;
             bool UsesDirect() => direct.Checked || both.Checked;
 
-            var (portLabel, portBox) = WizardForm.Field("&Port", port.ToString(), help: "leave it at " + Protocol.DefaultPort + " unless another program on this PC uses that port.");
+            var (portLabel, portBox) = WizardForm.Field("&Port", port.ToString(), help: "leave it at " + Protocol.DefaultPort + " unless another program on " + pc + " uses that port.");
             string relayText = settings.RelayAddress.Length == 0 ? "" : settings.RelayAddress + (settings.RelayPort == KovaRelayWire.Wire.DefaultPort ? "" : ":" + settings.RelayPort);
             var (relayLabel, relayBox) = WizardForm.Field("&Relay address", relayText,
                 help: "for example relay.example.com. Add a colon and the port number only if the relay does not use " + KovaRelayWire.Wire.DefaultPort + ".");
-            var (pwLabel, pwBox) = WizardForm.Field("Pass&word", password, secret: true, help: "at least " + MainForm.MinPasswordLength + " characters. Anyone who has it can control this PC.");
-            var relayNote = WizardForm.Note("On a relay, the password is also how other computers find this PC there, so give each PC its own password.");
+            var (pwLabel, pwBox) = WizardForm.Field("Pass&word", password, secret: true, help: "at least " + MainForm.MinPasswordLength + " characters. Anyone who has it can control " + pc + ".");
+            var relayNote = WizardForm.Note("On a relay, the password is also how other computers find " + pc + " there, so give each PC its own password.");
             var (listenLabel, listenBox) = WizardForm.Field("&Listen-only password", listen, secret: true,
-                help: "optional. It lets someone hear this PC without controlling it. Leave it empty if nobody needs that.");
+                help: "optional. It lets someone hear " + pc + " without controlling it. Leave it empty if nobody needs that.");
             var summary = WizardForm.Reading("");
             var copyAddress = new Button { Text = "Copy this PC's &address" };
             var copyRelay = new Button { Text = "Copy the r&elay address" };
@@ -487,6 +493,23 @@ namespace TailRemote
             string Summary()
             {
                 var lines = new List<string>();
+                if (forCopy)
+                {
+                    // About a PC not known yet: what the copy does there, and how to reach it afterwards.
+                    lines.Add("Opened on any PC, the copy starts hosting that PC at once, " +
+                        (UsesRelay() ? "through the relay " + relayBox.Text.Trim() + (UsesDirect() ? " and " : "") : "") +
+                        (UsesDirect() ? "directly on port " + portBox.Text.Trim() : "") + ".");
+                    string then = "To control it, choose Connect to a PC in Kova's File menu on your computer, then enter ";
+                    if (UsesRelay()) lines.Add((UsesDirect() ? "From anywhere, through the relay: " : "") + then + "the address " + relayBox.Text.Trim() + " and the password you chose here.");
+                    if (UsesDirect())
+                    {
+                        lines.Add((UsesRelay() ? "From the same network or a VPN: " : "") + then + "that PC's address" + PortText() + " and the password you chose here.");
+                        lines.Add("Port " + portBox.Text.Trim() + " must be open in Windows Firewall there. If it is not, the copy asks to open it.");
+                    }
+                    lines.Add("Use the copy on one PC at a time: two PCs hosting with the same password get in each other's way.");
+                    lines.Add("The copy's file holds the password, so anyone who gets the file can control a PC it is hosting. Only give it to people you trust.");
+                    return string.Join(Environment.NewLine, lines);
+                }
                 string how = "On the other computer, choose Connect to a PC in Kova's File menu, then enter ";
                 if (UsesRelay())
                     lines.Add((UsesDirect() ? "From anywhere, through the relay: " : "") + how + "the address " + relayBox.Text.Trim() + " and this PC's password.");
@@ -514,7 +537,7 @@ namespace TailRemote
             {
                 new()
                 {
-                    Question = "How should other computers reach this PC?",
+                    Question = forCopy ? "How should other computers reach the PC the copy is opened on?" : "How should other computers reach this PC?",
                     Controls = new Control[] { viaRelay, direct, both },
                 },
                 new()
@@ -536,7 +559,7 @@ namespace TailRemote
                         if (Relay.Parse("x@" + r, KovaRelayWire.Wire.DefaultPort, out string? why) == null) return (why ?? "That relay address cannot be used.", false);
                         form!.ShowStatus("Checking the relay.", speak: true);
                         var found = await Task.Run(() => Relay.Check(r, null));
-                        if (!found.Up) return (found.Said + " This PC will keep trying to reach it while it hosts.", true);
+                        if (!found.Up) return (found.Said + " " + Pc + " will keep trying to reach it while it hosts.", true);
                         return null;
                     },
                 },
@@ -560,7 +583,7 @@ namespace TailRemote
                             var on = await Task.Run(() => Relay.Check(r, Relay.Channel(pw)));
                             bool thisPc = registeredNow && pw == password && string.Equals(r, relayText, StringComparison.OrdinalIgnoreCase);
                             if (on.HostHere == true && !thisPc)
-                                return ("Another PC is already hosting on this relay with this password. Choose a different password for this PC.", true);
+                                return ("Another PC is already hosting on this relay with this password. Choose a different password for " + pc + ".", true);
                         }
                         summary.Text = Summary();
                         return null;
@@ -568,16 +591,16 @@ namespace TailRemote
                 },
                 new()
                 {
-                    Question = service ? "Ready to give the Kova service these settings" : "Ready to host",
+                    Question = forCopy ? "Ready to make the copy" : service ? "Ready to give the Kova service these settings" : "Ready to host",
                     Controls = new Control[] { summary },
-                    NextText = () => service ? "&Apply to the Kova service" : "Start &hosting",
+                    NextText = () => forCopy ? "&Save the copy..." : service ? "&Apply to the Kova service" : "Start &hosting",
                     // A copy button for each address other computers type: the relay's, and this PC's own.
                     Buttons = new[] { copyRelay, copyAddress },
                     ButtonShown = b => b == copyRelay ? UsesRelay() : UsesDirect() && bestAddress != null,
                 },
             };
 
-            form = new WizardForm(service ? "Host this PC (Kova service)" : "Host this PC", pages);
+            form = new WizardForm(forCopy ? "A copy that hosts the PC it is opened on" : service ? "Host this PC (Kova service)" : "Host this PC", pages);
             using (form)
             {
                 if (form.ShowDialog(owner) != DialogResult.OK) return null;
