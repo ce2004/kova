@@ -36,6 +36,8 @@ namespace TailRemote
 
         private NvdaHelperForm(string title, string text, string yes)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             Text = title;
             Font = new Font("Segoe UI", 10f);
             FormBorderStyle = FormBorderStyle.FixedDialog;

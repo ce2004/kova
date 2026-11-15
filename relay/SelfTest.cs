@@ -14,7 +14,8 @@ using KovaRelayWire;
 namespace KovaRelay
 {
     /// <summary>
-    /// KovaRelay.exe --selftest: runs a relay in this process on a free 127.0.0.1 port with its files in a temp
+    /// KovaRelay.exe --selftest (kovarelay --selftest on Linux: this same file, built into both, so the two relays are
+    /// held to the same checks): runs a relay in this process on a free 127.0.0.1 port with its files in a temp
     /// folder, and plays hosts, controlling PCs and attackers against it with raw sockets that follow RelayWire.cs.
     /// Writes %TEMP%\kova-relay-selftest.txt ("ok, ..." or "FAIL: ...") and exits 0 or 1. No window, no tray.
     /// Junk comes from other loopback addresses (127.0.0.x) so the per-address limits it trips do not block the
@@ -24,9 +25,12 @@ namespace KovaRelay
     {
         private static int _port;
 
+        /// <summary>Where the result is written: the temp folder (%TEMP% on Windows, /tmp on Linux, where kovarelay also prints it).</summary>
+        public static string ResultFile => Path.Combine(Path.GetTempPath(), "kova-relay-selftest.txt");
+
         public static int Run()
         {
-            string outFile = Path.Combine(Path.GetTempPath(), "kova-relay-selftest.txt");
+            string outFile = ResultFile;
             string dir = Path.Combine(Path.GetTempPath(), "kova-relay-selftest-" + Guid.NewGuid().ToString("N")[..8]);
             var done = new List<string>();
             int thrown = 0;
@@ -193,7 +197,7 @@ namespace KovaRelay
             {
                 var rows = server.Snapshot().Rows;
                 Check(rows.Count == 1 && rows[0].Address == "127.0.0.1", "the list of connected hosts is wrong");
-                string line = OptionsForm.RowText(rows[0]);
+                string line = RelayText.RowText(rows[0]);
                 Check(line.StartsWith("Host connected from 127.0.0.1 since ", StringComparison.Ordinal) && !line.Contains("office", StringComparison.OrdinalIgnoreCase),
                     $"a host line in the window reads \"{line}\"");
             }

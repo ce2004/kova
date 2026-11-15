@@ -58,8 +58,6 @@ namespace TailRemote
         private readonly MenuItem _go = new() { WhyNot = "Still connecting." };
         private readonly MenuItem _toggle = new("Control &remote PC") { ShortcutKeyDisplayString = "Ctrl+Shift+Enter" };
         private readonly MenuItem _update = new("Check for &updates (you have " + Updater.Current + ")") { ShortcutKeys = Keys.Control | Keys.U, WhyNot = "Already checking for updates." };
-        private readonly MenuItem _audioSetup = new("Set up au&dio device...") { WhyNot = "Already working on the audio device." };
-        private readonly MenuItem _audioRemove = new("Remove audio de&vice...") { WhyNot = "Already working on the audio device." };
         private readonly MenuItem _portEditor = new("Port &editor...");
         private readonly MenuItem _restart = new("Restart rem&ote PC and reconnect...");
         private readonly MenuItem _updateRemote = new("Update the remote &PC");
@@ -68,14 +66,6 @@ namespace TailRemote
         // its window comes back here and leaves it on; unticking it (here or Control Shift S) turns it off.
         private readonly MenuItem _watch = new("Show the remote &screen") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.S };
         private VideoForm? _screen;
-        // This PC's microphone to the remote PC: a checkbox, off every time Kova starts (never saved). Control Shift M
-        // in the Kova window. Only the PC in front hears it; listen-only connections never get it.
-        private readonly MenuItem _micItem = new("&Your microphone to the remote PC") { ShortcutKeys = Keys.Control | Keys.Shift | Keys.M, Tag = Menus.KeepOpenTag };
-        private bool _micOn;
-        private readonly MenuChoice _micDevice = new("Microphone to &use");
-        // Host: where the controlling PC's microphone plays. Kova's own pick first: a virtual cable that is not what it sends.
-        private readonly MenuChoice _micOutput = new("Play the controlling PC's microphone &into");
-        private readonly System.Collections.Generic.List<(string Id, string Name)> _micDevices = new(), _micOutputs = new();
         // The remote NVDA: heard through the remote PC's sound, said here as text (and brailled) with no remote sound, or both.
         private readonly MenuChoice _remoteNvda = new("Remote NVDA s&peech");
         // The Kova Helper NVDA add-on (4.4): on this PC (what it says follows where it stands: install, update or remove),
@@ -127,8 +117,8 @@ namespace TailRemote
 
         /// <summary>
         /// Both device choices from the devices there now, each keeping its setting's device. Done again every
-        /// time the Settings menu opens: filled once at start, a headset plugged in (or the Kova device set up)
-        /// later never showed until Kova restarted, and Kova runs for months.
+        /// time the Settings menu opens: filled once at start, a headset plugged in later never showed until
+        /// Kova restarted, and Kova runs for months.
         /// </summary>
         private void FillDevices()
         {
@@ -152,21 +142,6 @@ namespace TailRemote
             {
                 Fill(_device, _outDevices, _settings.OutputDevice, "output");
                 Fill(_captureFrom, _capDevices, _settings.CaptureDevice, "capture");
-                // The microphone's lists the same way: recording devices here, and on a host its outputs, Kova's pick first.
-                _micDevices.Clear();
-                _micDevices.Add(("", "Windows default"));
-                _micDevices.AddRange(Wasapi.InputDevices());
-                if (_settings.MicDevice.Length > 0 && !_micDevices.Exists(d => d.Id == _settings.MicDevice)) _micDevices.Add((_settings.MicDevice, "The microphone chosen before (not connected now: Windows default until it is back)"));
-                _micDevice.Clear();
-                foreach (var d in _micDevices) _micDevice.Add(d.Name);
-                _micDevice.SelectedIndex = Math.Max(0, _micDevices.FindIndex(d => d.Id == _settings.MicDevice));
-                _micOutputs.Clear();
-                _micOutputs.Add(("", "a virtual cable Kova picks, never the one it sends"));
-                _micOutputs.AddRange(now);
-                if (_settings.MicOutput.Length > 0 && !_micOutputs.Exists(d => d.Id == _settings.MicOutput)) _micOutputs.Add((_settings.MicOutput, "The device chosen before (not connected now)"));
-                _micOutput.Clear();
-                foreach (var d in _micOutputs) _micOutput.Add(d.Name);
-                _micOutput.SelectedIndex = Math.Max(0, _micOutputs.FindIndex(d => d.Id == _settings.MicOutput));
             }
             finally { _fillingDevices = false; _fillingCapture = wasFilling; }
         }
@@ -197,7 +172,9 @@ namespace TailRemote
             _updated = updated;
             Text = "Kova";
             Font = new Font("Segoe UI", 10f);
-            ClientSize = new Size(420, 120);
+            // Room for the home screen (LookHome.cs). It was 420 by 120 while the window was only a menu bar.
+            ClientSize = new Size(760, 600);
+            MinimumSize = new Size(560, 460);
             StartPosition = FormStartPosition.CenterScreen;
             KeyPreview = true;
 
@@ -238,7 +215,7 @@ namespace TailRemote
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
                 _go, _connectWizard, _hostWizard, _switchTo, _wake, new ToolStripSeparator(),
-                _toggle, _watch, _micItem, _restart, _remoteInfo, _updateRemote, _helperThere, _reachPort, _portsOpen, _streaming.Item, new ToolStripSeparator(),
+                _toggle, _watch, _restart, _remoteInfo, _updateRemote, _helperThere, _reachPort, _portsOpen, _streaming.Item, new ToolStripSeparator(),
                 _speedHere, _speedRemote, new ToolStripSeparator(),
                 Menus.Action("E&xit", ExitForGood),
             });
@@ -253,8 +230,8 @@ namespace TailRemote
             var set = _setMenu = new MenuItem("&Settings");
             set.DropDownItems.AddRange(new ToolStripItem[]
             {
-                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds, new ToolStripSeparator(),
-                _captureFrom.Menu, _micOutput.Menu, _startup, _service, _applyService, _portEditor, _audioSetup, _audioRemove, new ToolStripSeparator(),
+                _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _speedUp, _sounds, new ToolStripSeparator(),
+                _captureFrom.Menu, _startup, _service, _applyService, _portEditor, new ToolStripSeparator(),
                 _helperHere, _backup, _restore, _makeCopy, _logging,
             });
             // Flow, not the usual single row: a row hides whatever does not fit, with no word to a
@@ -264,6 +241,17 @@ namespace TailRemote
             Menus.Attach(bar);
             Controls.Add(bar);
             MainMenuStrip = bar;
+
+            // The window's face for somebody who can see it: what is going on, and the things done most, as large
+            // targets for the mouse. It never takes the keyboard, so nothing changes for a screen reader (LookHome.cs).
+            _home.Dock = DockStyle.Fill;
+            _home.Chosen += HomeChosen;
+            Controls.Add(_home);
+            _home.BringToFront(); // in front means docked last: it takes what the menu bar leaves
+            _home.Look.Style(bar);
+            _home.LookChanged += look => { look.Style(bar); if (IsHandleCreated) look.Frame(Handle); };
+            try { Icon = Look.AppIcon(32); _tray.Icon = Look.AppIcon(32); } catch { } // the mark, in place of Windows' blank program icon
+            ShowHome("Not connected"); // something to see from the first moment, before the title's own clock ticks
 
             _mode.SelectedIndex = _settings.HostMode ? 1 : 0;
             _address.Text = _settings.Address;
@@ -320,7 +308,7 @@ namespace TailRemote
                 if (_player != null) { _player.SetDevice(device); _playerDevice = device; }
             };
             _captureFrom.SelectedIndexChanged += (_, _) => CaptureChanged();
-            set.DropDownOpening += (_, _) => { FillDevices(); _helperHere.Text = NvdaHelper.MenuText(NvdaHelper.GetState(_host?.NvdaHelperServer)); ShowWhatApplies(lookAtAudio: true); };
+            set.DropDownOpening += (_, _) => { FillDevices(); _helperHere.Text = NvdaHelper.MenuText(NvdaHelper.GetState(_host?.NvdaHelperServer)); ShowWhatApplies(); };
             _applyService.Click += (_, _) => Menus.AfterMenu(() => ApplyService());
             _helperHere.Click += (_, _) => Menus.AfterMenu(() => HelperHere());
             _helperThere.Click += (_, _) => Menus.AfterMenu(() =>
@@ -330,20 +318,6 @@ namespace TailRemote
                 if (!NvdaHelperForm.AskRemote(this)) return;
                 Say(c.InstallNvdaHelperThere() ? "Asked the remote PC to install the Kova Helper. NVDA there restarts when it is in." : "The remote PC could not be asked.");
             });
-            _micItem.Click += (_, _) => ToggleMic();
-            _micDevice.SelectedIndexChanged += (_, _) =>
-            {
-                if (_fillingDevices) return;
-                SaveSettings();
-                ApplyMic(); // a microphone that is on moves to the new one at once
-            };
-            _micOutput.SelectedIndexChanged += (_, _) =>
-            {
-                if (_fillingDevices) return;
-                SaveSettings();
-                if (_host != null) _host.MicDevice = _settings.MicOutput;
-                if (_service.Checked) Say(ToTheService);
-            };
             _remoteNvda.Add("through the remote PC's sound");
             _remoteNvda.Add("here, as text and braille from this PC's NVDA, with no remote sound");
             _remoteNvda.Add("both: the remote sound, and text and braille here");
@@ -412,8 +386,6 @@ namespace TailRemote
             _wake.DropDownItems.Add(new ToolStripMenuItem("...")); // so it shows as a submenu before it is first filled
             _muteLocal.CheckedChanged += (_, _) => { SaveSettings(); ApplyMute(); };
             _rideOut.CheckedChanged += (_, _) => { SaveSettings(); if (_player != null) _player.RideOut = _rideOut.Checked; };
-            _audioSetup.Click += (_, _) => Menus.AfterMenu(() => SetUpAudio());
-            _audioRemove.Click += (_, _) => Menus.AfterMenu(() => RemoveAudio());
             _portEditor.Click += (_, _) => Menus.AfterMenu(() => { SaveSettings(); using var f = new PortEditorForm(KovaFirewall.Book(_settings), PortsInUse()); f.ShowDialog(this); });
             _startup.CheckedChanged += (_, _) => Menus.AfterMenu(StartupChanged); // after the menu closes, so NVDA reads what comes up
             _service.CheckedChanged += (_, _) => { if (!_settingService) Menus.AfterMenu(ServiceChanged); };
@@ -503,9 +475,8 @@ namespace TailRemote
         /// hosted). Connected: the connection's items. Neither: Connect to a PC and Host this PC. Settings shows the
         /// settings for hosting while this PC hosts (or last hosted), and those for controlling otherwise. An item that
         /// could only refuse (no saved PCs to wake, a listen-only connection's control items) is hidden, not refused.
-        /// lookAtAudio: Settings is opening, so whether the Kova audio device is there is looked at too.
         /// </summary>
-        private void ShowWhatApplies(bool lookAtAudio = false)
+        private void ShowWhatApplies()
         {
             if (_fileMenu == null) return; // still building the window
             bool connected = Connected, hosting = _host != null, service = ServiceHosting;
@@ -525,26 +496,18 @@ namespace TailRemote
             _toggle.Available = _watch.Available = _restart.Available = _remoteInfo.Available = _updateRemote.Available = _helperThere.Available = _speedRemote.Available = control;
             _reachPort.Available = control;
             _portsOpen.Available = _tunnels.Count > 0; // a PC in the background (or reconnecting) keeps its ports open
-            _micItem.Available = connected && _client?.ListenOnly != true; // it can be turned on before the connection is made
             _streaming.Item.Available = connected;
             _speedHere.Available = !idle;
             TidySeparators(_fileMenu.DropDownItems);
 
             // Settings: one group or the other, never both.
             bool hostSide = !connected && (hosting || HostMode || _service.Checked);
-            foreach (var item in new ToolStripItem[] { _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _micDevice.Menu, _speedUp, _sounds })
+            foreach (var item in new ToolStripItem[] { _quality.Menu, _announceQuality, _announceHealth, _muteLocal, _rideOut, _device.Menu, _remoteNvda.Menu, _speedUp, _sounds })
                 item.Available = !hostSide;
-            foreach (var item in new ToolStripItem[] { _captureFrom.Menu, _micOutput.Menu, _service, _portEditor })
+            foreach (var item in new ToolStripItem[] { _captureFrom.Menu, _service, _portEditor })
                 item.Available = hostSide;
             _startup.Available = hostSide && !_service.Checked; // the service already starts with Windows, before anyone signs in
             _applyService.Available = hostSide && _service.Checked;
-            if (lookAtAudio && _audioSetup.Usable) // not while it is being set up or removed
-            {
-                bool installed = AudioSetup.Installed();
-                _audioSetup.Available = hostSide && !(installed && AudioSetup.IsReady());
-                _audioRemove.Available = hostSide && installed;
-            }
-            else if (!hostSide) _audioSetup.Available = _audioRemove.Available = false;
             _restore.Available = !Busy; // a backup goes in only while nothing is connected or hosted here
             TidySeparators(_setMenu.DropDownItems);
         }
@@ -638,6 +601,7 @@ namespace TailRemote
         {
             base.OnHandleCreated(e);
             _handle = Handle;
+            _home.Look.Frame(Handle);
             WatchForeground();
         }
 
@@ -959,34 +923,7 @@ namespace TailRemote
 
         // ---- Which output the host sends ----
 
-        // ---- Your microphone to the remote PC, and the remote NVDA as text ----
-
-        /// <summary>Control Shift M, or the File menu: turns this PC's microphone on or off for the PC in front.</summary>
-        private void ToggleMic()
-        {
-            if (_host != null) { Say("This PC is hosting. Your microphone goes only to a PC you control."); return; }
-            _micOn = !_micOn;
-            _micItem.Checked = _micOn;
-            ApplyMic();
-            if (!_micOn) { Say("Microphone off."); return; }
-            var c = _client;
-            if (c == null) Say("Microphone on. It goes to the remote PC once you connect.");
-            else if (c.ListenOnly) Say("Microphone on, but it never goes to a PC you only listen to.");
-            else if (c.HostVersion != null && !c.CanMic) Say("Microphone on, but the remote PC's Kova is too old to take it. Update it with File, Update the remote PC.");
-            else Say("Microphone on.");
-        }
-
-        /// <summary>The microphone, to the PC in front only, on the chosen recording device.</summary>
-        private void ApplyMic()
-        {
-            string device = _micDevices.Count > 0 ? _micDevices[Math.Max(0, _micDevice.SelectedIndex)].Id : _settings.MicDevice;
-            _client?.SetMic(_micOn, device);
-        }
-
-        private void SayIfNoMic(Client c)
-        {
-            if (_micOn && !c.ListenOnly && !c.CanMic) Speak("The remote PC's Kova is too old to take your microphone. Update it with File, Update the remote PC.");
-        }
+        // ---- The remote NVDA as text ----
 
         private bool _helperBusy;
 
@@ -1510,7 +1447,6 @@ namespace TailRemote
         {
             if (_keys?.Remote == true) { _quietModeChange = true; _keys.Toggle(); } // keys come home first
             _keys?.SetClient(null);
-            c.SetMic(false, null); // only the PC in front hears the microphone
             c.Muted = true;
             c.LockedStep = Protocol.OpusSteps.Length - 1; // a few kilobits, so it takes nothing from the one in front
             _parked.Add(new Parked(NameFor(FrontAddress, FrontPort), FrontAddress, FrontPort, FrontPassword, c));
@@ -1552,7 +1488,6 @@ namespace TailRemote
             c.StartBest();
             ApplyMute();
             ApplyNvda(c);
-            ApplyMic();
             if (!c.ListenOnly) _keys?.SetClient(c);
             Tone(Sounds.Tone.Connected);
             Say("Switched to " + p.Name + "." + (c.ListenOnly ? " Listen only." : " Press Control Shift Enter to control it.") + DroppedNote());
@@ -2416,6 +2351,83 @@ namespace TailRemote
                   (WlanStreaming.State is string wifi ? ". " + wifi : "") +
                   (_client.UdpBlocked ? ". NO SOUND: UDP port " + _client.Port + " is blocked between the PCs. On the remote PC, open it with Port editor, or check its firewall" : "");
             if (_streaming.Text != st) _streaming.Text = st;
+            ShowHome(st);
+        }
+
+        // ---- the home screen (for the eye and the mouse; see LookHome.cs) ----
+
+        private readonly HomeView _home = new();
+
+        /// <summary>What the home screen shows, from what the window knows right now. Called with every title update.</summary>
+        private void ShowHome(string streaming)
+        {
+            var saved = new System.Collections.Generic.List<(string Name, string Address)>();
+            foreach (var pc in _settings.SavedPcs)
+            {
+                // A PC reached through a relay by password is never shown by its channel: only "through the relay".
+                string where = Relay.IsByPassword(pc.Address) ? Relay.Shown(pc.Address) + ", through the relay"
+                    : pc.Port == Protocol.DefaultPort ? pc.Address : pc.Address + ", port " + pc.Port;
+                saved.Add((pc.Name.Trim(), where));
+            }
+            string transfers = _transferStatus.Text == TransferIdle ? "" : _transferStatus.Text;
+
+            HomeState state;
+            if (_client != null)
+            {
+                var front = _settings.SavedPcs.Find(p => SamePc(p.Address, p.Port, FrontAddress, FrontPort));
+                string name = front?.ToString() ?? (Relay.IsByPassword(FrontAddress) ? Relay.Shown(FrontAddress) : FrontAddress);
+                state = new HomeState(HomeState.Kind.Connected, (_client.ListenOnly ? "Listening to " : "Connected to ") + name,
+                    streaming + (_parked.Count > 0 ? ". " + _parked.Count + " more in the background." : ""),
+                    _keys?.Remote == true, _client.ListenOnly, _screen is { IsDisposed: false }, saved, transfers, Updater.Current.ToString());
+            }
+            else if (_reconnecting || _connecting)
+                state = new HomeState(HomeState.Kind.Connecting, _reconnecting ? "Reconnecting" : "Connecting",
+                    _reconnecting ? "The connection dropped. Kova tries again every second until it is back, or until you disconnect." : "Reaching the other PC.",
+                    false, false, false, saved, transfers, Updater.Current.ToString());
+            else if (_host != null || ServiceHosting)
+            {
+                var counts = _host?.Connected ?? (_serviceLink?.Connected == true ? _serviceLink.Counts : null);
+                string who = counts is (int controlling, int listening) && controlling + listening > 0
+                    ? (controlling + listening == 1 ? "1 PC is connected" : (controlling + listening) + " PCs are connected") +
+                      ": " + controlling + " controlling" + (listening > 0 ? ", " + listening + " listening" : "") + "."
+                    : "No PC is connected right now.";
+                state = new HomeState(HomeState.Kind.Hosting, "This PC can be controlled",
+                    who + (_host == null ? " The Kova service is hosting, so it works at the lock screen and sign-in too." : ""),
+                    false, false, false, saved, transfers, Updater.Current.ToString());
+            }
+            else
+                state = new HomeState(HomeState.Kind.Idle, "Not connected", "Connect to a PC to control it, or host this one so another PC can.",
+                    false, false, false, saved, transfers, Updater.Current.ToString());
+            _home.Show(state);
+        }
+
+        /// <summary>
+        /// A target on the home screen was clicked. Each one is a menu item's own action, so the mouse and the keyboard
+        /// can never come to do different things; what does not apply right now does nothing, as its menu item would.
+        /// </summary>
+        private void HomeChosen(HomeAction action, int index)
+        {
+            ShowWhatApplies(); // the menu items are only brought up to date as their menus open
+            switch (action)
+            {
+                case HomeAction.Connect: _connectWizard.PerformClick(); break;
+                case HomeAction.Host: _hostWizard.PerformClick(); break;
+                case HomeAction.ConnectSaved:
+                    if (index >= 0 && index < _settings.SavedPcs.Count)
+                    {
+                        var pc = _settings.SavedPcs[index];
+                        SwitchTo(pc.Address, pc.Port, Settings.Unprotect(pc.PasswordEnc), pc.ToString());
+                    }
+                    break;
+                case HomeAction.ToggleControl: _toggle.PerformClick(); break;
+                case HomeAction.Screen: _watch.PerformClick(); break;
+                case HomeAction.SendFiles: _sendFiles.PerformClick(); break;
+                case HomeAction.GetFiles: _getFiles.PerformClick(); break;
+                case HomeAction.SendClipboard: _sendClipboard.PerformClick(); break;
+                case HomeAction.Disconnect:
+                case HomeAction.StopHosting: _go.PerformClick(); break;
+            }
+            UpdateTitle();
         }
 
         // The save problem last said, so a setting changed again and again says it once, not each time.
@@ -2503,8 +2515,6 @@ namespace TailRemote
             _settings.MuteWhenNotFocused = _muteLocal.Checked;
             _settings.RideOutStalls = _rideOut.Checked;
             _settings.SoundQuality = _quality.SelectedIndex - 1;
-            if (_micDevices.Count > 0) _settings.MicDevice = _micDevices[Math.Max(0, _micDevice.SelectedIndex)].Id;
-            if (_micOutputs.Count > 0) _settings.MicOutput = _micOutputs[Math.Max(0, _micOutput.SelectedIndex)].Id;
             _settings.RemoteNvda = Math.Max(0, _remoteNvda.SelectedIndex);
             SaveNow(now: closing, retries: closing ? 5 : 1);
         }
@@ -2586,14 +2596,12 @@ namespace TailRemote
                 _host.ClipboardRequested += () => SendClipboardToControllers(hosting); // a controller pulled this host's clipboard
                 _host.TransferProgress += t => Later(() => ShowTransfer(t));
                 _host.UpdateRequested += (version, reply) => Later(() => RemoteUpdate(version, reply));
-                _host.MicDevice = _settings.MicOutput;
                 _host.StartNvdaHelper(); // the Kova Helper NVDA add-on, if installed here, hands NVDA's speech to controlling PCs
                 Say((relayOnly ? "Hosting through the Kova Relay at " + RelayShown + ". No ports are opened on this PC."
                     : "Hosting on port " + port + ". Waiting for a connection.") + (listen.Length > 0 ? " The listen-only password is on." : ""));
-                // Audio settings and device names are never changed by themselves (they are other
-                // programs' too): only Set up audio device does that, when pressed.
-                if (Wasapi.OutputDevices().Count == 0)
-                    Speak("This PC has no sound output, so the other PC will hear nothing. Press Set up audio device if you want Kova to add one.");
+                // Sound devices are never added, renamed or made the default by Kova (they are other programs' too). A PC
+                // with no output still hosts: the host says so once a PC wants its sound (Host.OutputState), that PC
+                // says "There is no output device on the host.", and the sound starts by itself when a device appears.
                 if (!Startup.IsElevated()) Log("Not running as administrator, so keys cannot reach administrator windows. Start hosting when Windows starts runs it as administrator.");
             }
             catch (Exception e) { Say("Could not start hosting: " + e.Message); }
@@ -3172,8 +3180,7 @@ namespace TailRemote
                     if (!there) { missingSaid = true; Speak("The remote PC doesn't have the Kova Helper NVDA add-on, so only its sound comes through. Install it with File, Install the Kova Helper on the remote PC."); }
                     else if (missingSaid) { missingSaid = false; Speak("The remote PC's NVDA is coming through as text now."); }
                 });
-                c.MicNote += note => Later(() => { if (c == _client) Speak(note); });
-                c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoMic(c); SayIfNoNvda(c); } });
+                c.FeaturesKnown += () => Later(() => { if (c == _client) { ApplyNvda(c); SayIfNoNvda(c); } });
                 // Its ports reached from here carry on over this connection (a reconnect), and a saved PC's kept ones open
                 // again, once it has said it can (its features can come before this line: then at once).
                 if (!c.ListenOnly) _tunnels.Attach(PcKey(address, port), c); // a listen-only connection can never carry them
@@ -3185,7 +3192,6 @@ namespace TailRemote
                 if (c.HostVersion != null) Later(ReopenOnce);
                 _client = c;
                 ApplyNvda(c);
-                ApplyMic();
                 if (!c.ListenOnly) _keys?.SetClient(c); // a listener never sends keys
                 ApplyMute();
                 bool wasReconnecting = _reconnecting;
@@ -3465,40 +3471,6 @@ namespace TailRemote
             }
             _reallyExit = true;
             Close();
-        }
-
-        private async void SetUpAudio()
-        {
-            if (AudioSetup.IsReady()) { Say("The Kova audio device is already set up."); return; }
-            bool have = AudioSetup.FindCable() != null;
-            string plan = "Set up audio device gives this PC an output called Kova, so everything this PC plays can be heard on the other PC. It will:" + Environment.NewLine + Environment.NewLine +
-                (have ? "" :
-                "1. Download VB-Cable, a free virtual audio device by VB-Audio, from vb-audio.com, and check it is genuine." + Environment.NewLine +
-                "2. Open VB-Cable's installer. You press Install Driver." + Environment.NewLine) +
-                (have ? "1. " : "3. ") + "Name VB-Cable's output Kova and make it this PC's default output. Your speakers stop being the default." + Environment.NewLine +
-                (have ? "2. " : "4. ") + "Turn off VB-Cable's extra output, CABLE In 16 Ch." + Environment.NewLine + Environment.NewLine +
-                "Windows asks for administrator permission first. Remove audio device undoes all of it.";
-            if (MessageBox.Show(this, plan, "Set up audio device", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
-            _audioSetup.Enabled = _audioRemove.Enabled = false;
-            bool ok = await AudioSetup.RunElevatedAsync();
-            Say(ok ? "The Kova audio device is set up." : "Audio device setup did not finish.");
-            _audioSetup.Enabled = _audioRemove.Enabled = true;
-        }
-
-        private async void RemoveAudio()
-        {
-            if (!AudioSetup.Installed()) { Say("There is no Kova audio device on this PC."); return; }
-            var other = AudioSetup.OtherOutput();
-            string plan = "Remove audio device will:" + Environment.NewLine + Environment.NewLine +
-                "1. " + (other != null ? "Make " + other.Value.Name + " the default output." : "There is no other output on this PC, so it will have no sound output afterwards.") + Environment.NewLine +
-                "2. Move programs off the Kova device. Any program still using it is cut off." + Environment.NewLine +
-                "3. Remove VB-Cable completely, including its driver. If you use VB-Cable for anything else, that stops working too." + Environment.NewLine + Environment.NewLine +
-                "Windows asks for administrator permission first.";
-            if (MessageBox.Show(this, plan, "Remove audio device", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) return; // default Cancel: removing the driver is destructive
-            _audioSetup.Enabled = _audioRemove.Enabled = false;
-            bool ok = await AudioSetup.RemoveElevatedAsync();
-            Say(ok ? "The Kova audio device is removed." : "Removing the audio device did not finish.");
-            _audioSetup.Enabled = _audioRemove.Enabled = true;
         }
 
         // ---- The Windows service ----

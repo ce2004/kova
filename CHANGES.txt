@@ -1,3 +1,14 @@
+4.11.0
+New feature: Kova has a look for people who can see it. The main window now shows what is going on in large type, with a coloured status, big Connect to a PC and Host this PC buttons, and your saved PCs as a list you click to connect. While connected it shows Control the remote PC, Show the screen, Send files, Get files, Send the clipboard and Disconnect. It follows Windows' light or dark setting, and Windows' contrast themes are left as they are.
+New feature: every other Kova window is dressed the same way: the wizards, the lists, the transfer and sound windows. The button that Enter presses is filled in colour.
+New feature: Kova has its own icon, in the window, the taskbar and the notification area.
+Changed: none of this changes Kova for a screen reader. The home screen is for the mouse only: it never takes the keyboard, adds nothing to Tab through, and every button on it does exactly what a menu item with a shortcut already does. The menus, the shortcuts and what is spoken are as they were.
+Changed: the microphone is gone. Kova no longer sends your microphone to the remote PC, and Control Shift M does nothing. Kova carries the remote PC's own sound to you, and nothing the other way.
+Changed: Kova no longer installs or sets up a virtual audio device. Set up audio device and Remove audio device are gone from Settings. It is up to you to give a PC a sound output. Kova never adds one, renames one or changes which one is the default.
+New feature: if the PC you connect to has no sound output device, Kova says so once: There is no output device on the host. Keys, the screen and files work as ever, and the sound starts by itself, with no reconnecting, once that PC has an output.
+New feature: Kova Relay now runs on Linux as well as Windows. It is one program with no window, called kovarelay, for x64 and ARM64 servers, with a ready service file and a short guide beside it in the release. The Windows relay is as it was.
+Changed: a PC still on 4.10 can connect to a 4.11 PC and the other way round. If its microphone item is ticked it says the remote PC is too old to take the microphone; that goes away when it updates.
+
 4.10.0
 New feature: when you make a copy of Kova that connects or hosts by itself, you can now choose how its window shows when the copy is opened: the normal window, hidden to the notification area (it keeps hosting or stays connected out of the way, and Windows B finds it), or minimised in the taskbar.
 Changed: the notification sounds are tidied up. The Android sounds are gone, and in their place are new tones and beeps made by Kova itself: a beep, a double and triple beep, a low beep, a high blip, a chirp up and down, a swoop up and down, a laser, a pop, a click, a ding, a warble, pip pip, and a buzz. If you had chosen an Android sound for an event, that event goes back to its default piano sound.

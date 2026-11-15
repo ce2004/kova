@@ -52,6 +52,8 @@ namespace TailRemote
 
         public WizardForm(string title, List<Page> pages)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             _pages = pages;
             Text = title;
             Font = new Font("Segoe UI", 10f);

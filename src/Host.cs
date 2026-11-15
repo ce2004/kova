@@ -167,10 +167,8 @@ namespace TailRemote
             public volatile byte NvdaWant;
             public readonly List<byte[]> NvdaOut = new(); // under its own lock
             public bool NvdaPumping; // under NvdaOut's lock
-            // Its microphone: the newest packet number seen (an older one is a replay or hopelessly late), and
-            // whether it was told another PC's microphone is already on.
-            public uint MicHigh;
-            public bool MicAny, MicBusyTold;
+            // It was told this PC has no sound output to send (NoOutput), and not yet that the sound is back. Under _outputGate.
+            public bool NoOutputTold;
             // Its connections to this PC's own ports (Reach a port on the remote PC), all closed when it ends; and how many
             // places it holds, counted from before the local connection is made. Both under _gate.
             public readonly List<TunnelPipe> Tunnels = new();
@@ -198,7 +196,6 @@ namespace TailRemote
             _key = Protocol.DeriveKey(password, _salt);
             _listenKey = string.IsNullOrEmpty(listenPassword) ? null : Protocol.DeriveKey(listenPassword, _salt);
             _status = msg => { DiagLog.Write("host: " + msg); status(msg); };
-            _mic = new MicIn(() => _captureDevice, _status);
             _screenSource = new ScreenSource();
             var screen = new ScreenVideo(_screenSource.Take, _screenSource.Screens);
             VideoUpdate = screen.Update;
@@ -239,77 +236,92 @@ namespace TailRemote
             new Thread(UdpLoop) { IsBackground = true, Name = "Kova host udp" }.Start();
         }
 
-        // ---- The controlling PC's microphone (MicIn) ----
+        // ---- No sound output on this PC ----
+        // A cloud PC often has no sound card, and Kova never adds or changes a sound device: that is the owner's to do.
+        // With nothing to take the sound from, every PC that wants it is told once (NoOutput), this PC's own window and
+        // log say it once, and the capture keeps looking, so the sound starts by itself when a device appears. Keys,
+        // the screen and files never depend on any of this.
 
-        private readonly MicIn _mic;
-        private readonly object _micGate = new();
-        private Session? _micOwner; // under _micGate: whose microphone plays (one at a time)
-        private long _micOwnerAt;
+        private readonly object _outputGate = new();
+        private bool _noOutput;     // under _outputGate: the capture running now found nothing it could take
+        private bool _noOutputSaid; // under _outputGate: said in this PC's own window, and no sound has been taken since
+        private long _noOutputSince = -1; // under _outputGate: when the capture running now first failed to find one; -1 while it has not
+        // A try or two failing is not "no output device": at boot Windows' sound may be a moment from ready, and when
+        // headphones are unplugged there is a gap before the next device is the default. Only this long with nothing counts.
+        private const int NoOutputAfterMs = 2000;
 
-        /// <summary>The output chosen on this PC for the controlling PC's microphone ("" or null: Kova picks a virtual cable).</summary>
-        public string? MicDevice { get => _mic.Chosen; set => _mic.Chosen = value; }
+        /// <summary>Test only: whether the host knows right now that it has no sound output to send.</summary>
+        internal bool TestNoOutput { get { lock (_outputGate) return _noOutput; } }
 
-        /// <summary>Test only: whether a microphone is being played.</summary>
-        internal bool TestMicPlaying => _mic.Playing;
-
-        private void HandleMic(byte[] d, IPEndPoint from)
+        /// <summary>
+        /// Test only: what a 4.10 host sent a controller whose microphone was on, made by hand (this Kova has no
+        /// microphone): its words about it (0x8A) and the step it wanted (0x8B), to every connected PC.
+        /// </summary>
+        internal void TestOldMicrophoneWords()
         {
-            var s = Array.Find(AllSessions(), x => d.AsSpan(1, 8).SequenceEqual(x.Token));
-            // Only a PC controlling this one: a listener hears, it never speaks into this PC.
-            if (s == null || s.Role != Protocol.RoleControl || !s.Ready) return;
-            var addr = from.Address.IsIPv4MappedToIPv6 ? from.Address.MapToIPv4() : from.Address;
-            if (!Bucket(addr).Equals(Bucket(s.Address))) return;
-            if (!s.Link.OpenMic(d, d.Length)) return; // forged or damaged
-            int ticks = d[Protocol.MicHeadBytes];
-            if (ticks < 1 || ticks > 24) return;
-            uint seq = BitConverter.ToUInt32(d, 9);
-            // Only newer than every packet seen from it: a packet played back (even the newest, over and over) is nothing, so a
-            // recording can neither be heard again nor keep the microphone (and its device) taken. A packet that arrives
-            // after a newer one would be too late to play anyway.
-            if (s.MicAny && (int)(seq - s.MicHigh) <= 0) return;
-            s.MicHigh = seq;
-            s.MicAny = true;
-            long now = Environment.TickCount64;
-            lock (_micGate)
+            foreach (var s in AllSessions())
             {
-                if (Array.IndexOf(AllSessions(), s) < 0) return; // it has just ended: never the owner again
-                if (_micOwner != s)
+                Queue(s, Protocol.TextMessage(0x8A, "Your microphone is on the remote PC now."));
+                Queue(s, new byte[] { 0x8B, 4 });
+            }
+        }
+
+        /// <summary>The capture opened an output (problem null), or could not (Windows' reason). It says so at every try.</summary>
+        private void OutputState(string? problem)
+        {
+            string? say = null;
+            lock (_outputGate)
+            {
+                if (problem != null)
                 {
-                    // Still connected: looked up in the ready-made list, never under _gate (End holds _gate and then takes this lock).
-                    if (_micOwner != null && now - _micOwnerAt < 1500 && Array.IndexOf(AllSessions(), _micOwner) >= 0)
+                    long now = Environment.TickCount64;
+                    if (_noOutputSince < 0) _noOutputSince = now;
+                    if (now - _noOutputSince < NoOutputAfterMs) return; // too soon to say: the capture tries again in a moment
+                    if (!_noOutput) { _noOutput = true; _audioNudge.Set(); } // the PCs that want sound are told at once (AudioDemand)
+                    if (!_noOutputSaid)
                     {
-                        if (!s.MicBusyTold) { s.MicBusyTold = true; Tell(s, Protocol.MicNote, "Another PC's microphone is already on there. Yours plays once theirs is off."); }
-                        return;
+                        _noOutputSaid = true;
+                        say = "This PC has no sound output device that Kova can take, so the PCs connected to it hear nothing. Keys, the screen and files work as ever. " +
+                            "Kova does not add a sound device: once this PC has one, the sound starts by itself. (Windows said: " + problem + ")";
                     }
-                    _mic.Stop(); // a new owner starts afresh
-                    _micOwner = s;
-                    s.MicBusyTold = false;
-                    Tell(s, Protocol.MicQuality, new[] { (byte)Protocol.MicBestStep });
                 }
-                _micOwnerAt = now;
+                else
+                {
+                    _noOutput = false;
+                    _noOutputSince = -1;
+                    if (_noOutputSaid) { _noOutputSaid = false; say = "This PC has a sound output now, so the PCs connected to it hear it again."; }
+                    // Everyone who was told there was none: the sound is coming. An older Kova was told in plain words
+                    // and has nothing more to hear about it.
+                    foreach (var s in AllSessions())
+                    {
+                        if (!s.NoOutputTold) continue;
+                        s.NoOutputTold = false;
+                        if ((s.PeerFeatures & Protocol.FeatureNoOutput) != 0) Queue(s, new[] { Protocol.NoOutput, (byte)0 });
+                    }
+                }
             }
-            var owner = s;
-            _mic.Push(seq, ticks, d.AsSpan(Protocol.MicHeadBytes + 1, d.Length - Protocol.MicHeadBytes - 1 - SecureLink.TagSize), msg => Tell(owner, Protocol.MicNote, msg));
+            if (say != null) _status(say);
         }
 
-        /// <summary>The microphone's owner said it is off, or went: the device is let go at once.</summary>
-        private void MicOff(Session s)
+        /// <summary>
+        /// While there is no output to take: each PC that wants the sound is told, once. One that connects or unmutes
+        /// later is told then; one that was told is not told again until the sound has worked in between.
+        /// </summary>
+        private void TellNoOutput()
         {
-            lock (_micGate)
+            lock (_outputGate)
             {
-                if (_micOwner != s) return;
-                _micOwner = null;
+                if (!_noOutput) return;
+                foreach (var s in AllSessions())
+                {
+                    if (s.NoOutputTold || !s.Ready || s.Paused) continue;
+                    s.NoOutputTold = true;
+                    // Through the PC's ordered queue, so "none" and "back" can never swap places on the way.
+                    Queue(s, (s.PeerFeatures & Protocol.FeatureNoOutput) != 0
+                        ? new[] { Protocol.NoOutput, (byte)1 }
+                        : Protocol.TextMessage(Protocol.Message, Protocol.NoOutputText)); // 4.10 and older: the same words, as an ordinary message
+                }
             }
-            _mic.Stop();
-        }
-
-        /// <summary>Once a second: the microphone's step, and letting go of its device when it stops coming.</summary>
-        private void MicTick()
-        {
-            Session? owner;
-            lock (_micGate) owner = _micOwner;
-            int step = _mic.Tick(owner == null ? null : msg => Tell(owner, Protocol.MicNote, msg));
-            if (step >= 0 && owner != null) Tell(owner, Protocol.MicQuality, new[] { (byte)step });
         }
 
         // ---- This PC's NVDA, through the Kova Helper add-on (NvdaHelper, NvdaEvent; 4.4) ----
@@ -478,22 +490,11 @@ namespace TailRemote
         internal static bool IsDroppableNvda(byte[] m) => m.Length >= 2 && m[0] == Protocol.NvdaEventMsg
             && m[1] is (byte)NvdaEventKind.Speak or (byte)NvdaEventKind.Braille or (byte)NvdaEventKind.Beep or (byte)NvdaEventKind.Wave;
 
-        /// <summary>A small message to one PC, off the caller's thread (the UDP thread must never wait on a connection).</summary>
-        private static void Tell(Session s, byte type, string text) => Tell(s, type, System.Text.Encoding.UTF8.GetBytes(text));
-        private static void Tell(Session s, byte type, byte[] body)
-        {
-            byte[] m = new byte[1 + body.Length];
-            m[0] = type;
-            body.CopyTo(m, 1);
-            ThreadPool.QueueUserWorkItem(_ => { try { s.Link.Send(s.Stream, m); } catch { } });
-        }
-
         public void Dispose()
         {
             _stop = true;
             _wifi?.Dispose();
             _screenSource?.Dispose();
-            _mic.Dispose();
             lock (_nvdaGate) { _helper?.Dispose(); _helper = null; }
             try { _listener.Stop(); } catch { }
             try { _udp.Dispose(); } catch { }
@@ -923,6 +924,7 @@ namespace TailRemote
                 {
                     unwantedSince = 0;
                     if (!running) lock (_switching) lock (_gate) StartCapture();
+                    else TellNoOutput(); // no output to take: whoever wants the sound and has not heard so is told, once
                 }
                 else if (running)
                 {
@@ -959,13 +961,17 @@ namespace TailRemote
             // under the same number.
             LoopbackCapture? mine = null;
             mine = _capture = new LoopbackCapture((seq, pcm) => { if (ReferenceEquals(Volatile.Read(ref _capture), mine)) SendAudio(seq, pcm); },
-                msg => { _status(msg); Broadcast(msg); }, _captureDevice, _nextSeq);
+                problem => { if (ReferenceEquals(Volatile.Read(ref _capture), mine)) OutputState(problem); }, _captureDevice, _nextSeq);
         }
 
         private void StopCapture(LoopbackCapture? c)
         {
             if (c == null) return;
             bool stopped = c.Stop();
+            // Nobody is looking for an output now, so nothing is known about one: a device may be added while no PC
+            // listens, and the next PC must not be told there is none before the next capture has looked. (What this
+            // PC's own window said stays said until the sound has really been taken again.)
+            lock (_outputGate) { _noOutput = false; _noOutputSince = -1; }
             // A second's gap (the player starts fresh); far more if the thread would not stop.
             _nextSeq = c.NextSeq + (stopped ? 172u : 1u << 24);
         }
@@ -990,7 +996,6 @@ namespace TailRemote
                 // Taken every second, logging or not: left adding up for months they wrapped round, and the
                 // first line after logging was turned on said nonsense.
                 int packets = Interlocked.Exchange(ref _txPackets, 0), bytes = Interlocked.Exchange(ref _txBytes, 0);
-                try { MicTick(); } catch { }
                 try { SweepTunnels(); } catch { }
                 if (!DiagLog.Enabled) continue;
                 int fills = Interlocked.Exchange(ref LoopbackCapture.TestGapFills, 0);
@@ -2093,9 +2098,7 @@ namespace TailRemote
                             });
                         else Queue(s, Protocol.TextMessage(Protocol.NvdaNote, "The remote PC is already installing the Kova Helper."));
                         break;
-                    case Protocol.MicState when m.Length == 2:
-                        if (m[1] == 0) MicOff(s);
-                        break;
+                    // 18 (a 4.10 controller's microphone on or off) lands in "anything else" below: ignored, never an error.
                     case Protocol.Features when m.Length >= 5:
                         s.PeerFeatures = BitConverter.ToUInt32(m, 1);
                         s.Ready = true;
@@ -2290,7 +2293,6 @@ namespace TailRemote
         private void End(Session s, string? why)
         {
             ReleaseHeld(s);
-            MicOff(s);
             // Worked out again once it has left the list of sessions (End is called under _gate, before Rebuild).
             s.NvdaWant = 0;
             // Its connections to this PC's ports end with it: only closed here (quick), each one's own thread tidies up.
@@ -2406,12 +2408,8 @@ namespace TailRemote
                 catch { if (_stop) return; Thread.Sleep(20); continue; }
                 // From the relay: its header off, and the sender becomes the relayed PC's stand-in address.
                 if (_relay is RelayHost via && !via.Unwrap(ref d, ref any)) continue;
-                if (d.Length >= Protocol.MinMicPacketBytes && d[0] == Protocol.UdpMic)
-                {
-                    if (d.Length <= Protocol.MicHeadBytes + 1 + Protocol.MaxOpusBytes + SecureLink.TagSize)
-                        try { HandleMic(d, any); } catch (Exception e) { DiagLog.Write("host: microphone packet failed: " + e.Message); }
-                    continue;
-                }
+                // Only hellos are read. Anything else is dropped here unread and uncounted, a 4.10 controller's microphone
+                // packets (0xA7) among it: nothing is held against the PC that sent it, and its connection goes on.
                 if (d.Length != Protocol.UdpHelloBytes || d[0] != Protocol.UdpHello) continue;
                 Session? s;
                 s = Array.Find(AllSessions(), x => d.AsSpan(1, 8).SequenceEqual(x.Token));

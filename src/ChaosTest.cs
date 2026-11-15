@@ -1639,7 +1639,133 @@ namespace TailRemote
                 }
             });
 
-            Scenario("the remote NVDA (Kova Helper add-on): speech, a cut-off, a beep and braille reach a controller in order, never a listener; without the add-on the controller is told; a listener's microphone is never played", 30, () =>
+            Scenario("no output device on the host: each controller is told once, keys and the clipboard work on, the sound starts by itself when a device appears, and it is said again only after the sound worked in between", 90, () =>
+            {
+                // A host of its own, on a PC made to look as if it had no sound output at all (a cloud PC with no sound card).
+                long mine = CurrentGeneration;
+                LoopbackCapture.TestNoDevice = true;
+                LoopbackCapture.TestToneDevice = false;
+                var hostSaid = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                var svc = new Host(Port + 10, Password, ListenPassword, hostSaid.Enqueue);
+                var keys = new System.Collections.Concurrent.ConcurrentQueue<(ushort, bool)>();
+                try
+                {
+                    int HostSaidNone() => hostSaid.Count(s => s.StartsWith("This PC has no sound output device"));
+                    var said = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    int Told(System.Collections.Concurrent.ConcurrentQueue<string> q, string words) => q.Count(s => s == words);
+                    using var c = Client.Connect("127.0.0.1", Port + 10, Password, new Player(Player.NoDevice, _ => { }), said.Enqueue);
+                    if (!WaitFor(() => Told(said, Protocol.NoOutputText) > 0, 8000)) return "FAIL: the controller was never told (it heard: " + string.Join(" | ", said) + ")";
+                    if (!c.HostHasNoOutput || !svc.TestNoOutput) return "FAIL: told, but the controller or the host does not know there is no output";
+                    // The host keeps trying (every 300 ms at first): none of those tries may be said again, here or there.
+                    Thread.Sleep(5000);
+                    if (Told(said, Protocol.NoOutputText) != 1) return "FAIL: the controller said it " + Told(said, Protocol.NoOutputText) + " times while the host kept trying";
+                    if (said.Count != 1) return "FAIL: the controller said more than the one line: " + string.Join(" | ", said);
+                    if (HostSaidNone() != 1) return "FAIL: the host's own window said it " + HostSaidNone() + " times: " + string.Join(" | ", hostSaid);
+                    if (c.TestClosed) return "FAIL: the connection dropped";
+
+                    // Everything else works on: keys (recorded, never typed), the ping, the clipboard (which goes by the file lanes).
+                    Native.KeySink = (vk, scan, up, ext) => { keys.Enqueue((vk, up)); return true; };
+                    const ushort F24 = 0x87;
+                    for (int i = 0; i < 5; i++) { c.SendKey(F24, 0, false, false); c.SendKey(F24, 0, true, false); }
+                    if (!WaitFor(() => keys.Count >= 10, 3000)) return "FAIL: only " + keys.Count + " of 10 key messages arrived with no output device";
+                    if (c.LastPingMs < 0) return "FAIL: no ping with no output device";
+                    string? clip = null;
+                    svc.ClipboardReceived += t => clip = t;
+                    WaitFor(() => svc.ControllerFiles != null, 3000);
+                    c.SendClipboard("no sound, still here");
+                    if (!WaitFor(() => clip == "no sound, still here", 5000)) return "FAIL: clipboard text did not arrive with no output device";
+
+                    // A second controller that comes later is told too, once. So is a listener. And a 4.10 controller, which
+                    // does not know the new message, gets the same words as an ordinary message from the host.
+                    var said2 = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    var saidL = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    var saidOld = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    using var c2 = Client.Connect("127.0.0.1", Port + 10, Password, new Player(Player.NoDevice, _ => { }), said2.Enqueue);
+                    using var l = Client.Connect("127.0.0.1", Port + 10, ListenPassword, new Player(Player.NoDevice, _ => { }), saidL.Enqueue);
+                    Client old;
+                    Protocol.TestHideFeatures = Protocol.FeatureNoOutput;
+                    try { old = Client.Connect("127.0.0.1", Port + 10, Password, new Player(Player.NoDevice, _ => { }), saidOld.Enqueue); }
+                    finally { Protocol.TestHideFeatures = 0; }
+                    using var oldToo = old;
+                    if (!WaitFor(() => Told(said2, Protocol.NoOutputText) > 0 && Told(saidL, Protocol.NoOutputText) > 0 && Told(saidOld, "Host: " + Protocol.NoOutputText) > 0, 8000))
+                        return "FAIL: later PCs were not all told: second controller " + string.Join(" | ", said2) + "; listener " + string.Join(" | ", saidL) + "; 4.10 controller " + string.Join(" | ", saidOld);
+                    Thread.Sleep(2500);
+                    if (said2.Count != 1 || saidL.Count != 1 || saidOld.Count != 1 || said.Count != 1)
+                        return "FAIL: someone was told more than once: " + said.Count + ", " + said2.Count + ", " + saidL.Count + ", " + saidOld.Count;
+                    if (old.HostHasNoOutput) return "FAIL: the 4.10 stand-in was sent the new message";
+
+                    // A device appears (a made-up one playing a tone, so this works on a PC with no sound card): the sound
+                    // starts by itself, on the same connections, and nothing is said about it on the controlling PCs.
+                    long before = c.UdpBytesReceived, beforeOld = old.UdpBytesReceived;
+                    LoopbackCapture.TestToneDevice = true;
+                    LoopbackCapture.TestNoDevice = false;
+                    if (!WaitFor(() => !svc.TestNoOutput && !c.HostHasNoOutput && !c2.HostHasNoOutput, 6000)) return "FAIL: the host did not find the new device by itself, or did not say so";
+                    if (!WaitFor(() => c.UdpBytesReceived - before > 20_000 && old.UdpBytesReceived - beforeOld > 20_000, 6000))
+                        return "FAIL: no sound arrived after the device appeared (" + (c.UdpBytesReceived - before) + " bytes; 4.10 stand-in " + (old.UdpBytesReceived - beforeOld) + ")";
+                    long heard = c.UdpBytesReceived - before;
+                    if (said.Count != 1 || said2.Count != 1) return "FAIL: the sound coming back was announced: " + string.Join(" | ", said);
+                    if (hostSaid.Count(s => s.StartsWith("This PC has a sound output now")) != 1) return "FAIL: the host's window did not say once that the sound is back: " + string.Join(" | ", hostSaid);
+
+                    // A gap of under a second (headphones unplugged, the next output not yet the default) is not worth a
+                    // word to anyone: the sound just carries on once the capture has an output again.
+                    LoopbackCapture.TestNoDevice = true;
+                    Thread.Sleep(600);
+                    LoopbackCapture.TestNoDevice = false;
+                    Thread.Sleep(3500);
+                    if (said.Count != 1 || said2.Count != 1 || saidL.Count != 1 || saidOld.Count != 1 || HostSaidNone() != 1 || svc.TestNoOutput)
+                        return "FAIL: a gap of 600 ms was announced: controller " + said.Count + ", second " + said2.Count + ", listener " + saidL.Count + ", 4.10 stand-in " + saidOld.Count + ", host " + HostSaidNone();
+                    long afterGap = c.UdpBytesReceived;
+                    if (!WaitFor(() => c.UdpBytesReceived - afterGap > 20_000, 4000)) return "FAIL: the sound did not carry on after a short gap";
+
+                    // The device goes away again while the sound is being taken: said once more, because it worked in between.
+                    LoopbackCapture.TestNoDevice = true;
+                    if (!WaitFor(() => Told(said, Protocol.NoOutputText) == 2 && Told(saidOld, "Host: " + Protocol.NoOutputText) == 2, 8000))
+                        return "FAIL: the device going away again was not said (controller " + said.Count + ", 4.10 stand-in " + saidOld.Count + ")";
+                    Thread.Sleep(3000);
+                    if (said.Count != 2 || said2.Count != 2 || saidL.Count != 2 || saidOld.Count != 2 || HostSaidNone() != 2)
+                        return "FAIL: after the device went again: controller " + said.Count + ", second " + said2.Count + ", listener " + saidL.Count + ", 4.10 stand-in " + saidOld.Count + ", host " + HostSaidNone() + " (2 each expected)";
+                    if (c.TestClosed || c2.TestClosed || l.TestClosed || old.TestClosed) return "FAIL: a connection dropped along the way";
+                    return "two controllers, a listener and a 4.10 stand-in were each told once, keys, ping and clipboard worked with no device, the sound started by itself (" +
+                        heard / 1000 + " KB heard) with nothing said, a 600 ms gap went by unannounced, and the device going again was said once more; the host's window said each change once";
+                }
+                finally
+                {
+                    svc.Dispose();
+                    // Only if no later scenario has started meanwhile (this one froze and was left running): see CurrentGeneration.
+                    if (CurrentGeneration == mine) { Native.KeySink = null; LoopbackCapture.TestNoDevice = false; LoopbackCapture.TestToneDevice = false; Protocol.TestHideFeatures = 0; }
+                }
+            });
+
+            Scenario("a 4.10 peer's microphone: its on and off messages and 300 microphone packets are ignored by this host, a 4.10 host's microphone words are ignored by this controller, and nobody is dropped or blocked", 30, () =>
+            {
+                var svc = new Host(Port + 11, Password, ListenPassword, _ => { });
+                try
+                {
+                    var said = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    using var c = Client.Connect("127.0.0.1", Port + 11, Password, new Player(Player.NoDevice, _ => { }), said.Enqueue);
+                    using var l = Client.Connect("127.0.0.1", Port + 11, ListenPassword, new Player(Player.NoDevice, _ => { }), said.Enqueue);
+                    if (!WaitFor(() => c.HostVersion != null && l.HostVersion != null, 3000)) return "FAIL: the host's features never came";
+                    if ((c.TestPeerFeatures & 4096) != 0) return "FAIL: this host still offers the microphone's feature bit";
+                    c.TestOldMicrophone(300);
+                    l.TestOldMicrophone(50);
+                    svc.TestOldMicrophoneWords();
+                    Thread.Sleep(1500);
+                    if (c.TestClosed || l.TestClosed) return "FAIL: a connection was dropped over a 4.10 peer's microphone";
+                    if (!said.IsEmpty) return "FAIL: something was said about it: " + string.Join(" | ", said);
+                    int pingBefore = c.LastPingMs;
+                    string? clip = null;
+                    svc.ClipboardReceived += t => clip = t;
+                    WaitFor(() => svc.ControllerFiles != null, 3000);
+                    c.SendClipboard("after the old microphone");
+                    if (!WaitFor(() => clip == "after the old microphone", 5000)) return "FAIL: the connection stopped working after a 4.10 peer's microphone";
+                    // Nothing was held against the address either: a new login gets straight in.
+                    using var again = Client.Connect("127.0.0.1", Port + 11, Password, new Player(Player.NoDevice, _ => { }), _ => { });
+                    return "all of it was ignored quietly: both connections stayed up (ping " + pingBefore + " ms), the clipboard still went across, and a new login got in";
+                }
+                finally { svc.Dispose(); }
+            });
+
+            Scenario("the remote NVDA (Kova Helper add-on): speech, a cut-off, a beep and braille reach a controller in order, never a listener; without the add-on the controller is told", 30, () =>
             {
                 var svc = new Host(Port + 8, Password, ListenPassword, _ => { });
                 try
@@ -1667,19 +1793,7 @@ namespace TailRemote
                     string all = string.Join("|", got);
                     if (got.Count != 4 || !all.StartsWith("Speak:Start button") || !all.Contains("|Cancel:|Beep:880|Braille:btn Start")) return "FAIL: the controller got " + all;
                     if (listenerGot != 0) return "FAIL: a listen-only login got the remote NVDA";
-                    // A listener's microphone packets, sent by hand: never played (it may only listen).
-                    int mic = 0;
-                    MicIn.TestHeard = (_, t) => Interlocked.Add(ref mic, t);
-                    try
-                    {
-                        short[] tone = new short[Protocol.TickFrames * 2];
-                        for (int i = 0; i < tone.Length; i++) tone[i] = (short)(i * 37 % 4000);
-                        for (uint s = 0; s < 60; s++) l.TestMicTick(s, tone);
-                        Thread.Sleep(400);
-                        if (mic != 0) return "FAIL: a listener's microphone was played";
-                    }
-                    finally { MicIn.TestHeard = null; }
-                    return "speech, a cut-off, a beep and braille came in order to the controller only, it was told the add-on was missing, and a listener's microphone was refused";
+                    return "speech, a cut-off, a beep and braille came in order to the controller only, and it was told the add-on was missing";
                 }
                 finally { svc.Dispose(); }
             });

@@ -126,7 +126,7 @@ namespace TailRemote
         public const byte WakeRequest = 16; // 6-byte network card address: send a Wake-on-LAN packet on the host's network (Wake)
         public const byte NvdaWant = 17;  // u8 flags (NvdaSpeechFlag, NvdaBrailleFlag): what of the host's NVDA this PC wants as text; 0 = nothing
         public const byte NvdaHelperInstall = 19; // the controller asks the host to install (or update) the Kova Helper NVDA add-on there; the answer is an NvdaNote
-        public const byte MicState = 18;  // u8 1 = this PC's microphone is on (its packets follow over UDP), 0 = off: the host lets go of the device at once
+        // 18 was MicState, the controller's microphone on or off (4.3 to 4.10): never reuse it. A 4.10 controller never sends it to a host that does not offer the microphone, and a host ignores it anyway
         public const byte NvdaSpeechFlag = 1, NvdaBrailleFlag = 2;
         public const byte ClipboardRequest = 13; // the controller asks the host to send its clipboard here (text or files), like Send the clipboard but pulled
         // A clipboard pull reads the clipboard and fans a transfer out to every controller; the host
@@ -145,13 +145,18 @@ namespace TailRemote
         public const byte SpeedResult = 0x87; // UTF-8 lines: the host's internet speed test
         public const byte WakeInfo = 0x88;    // UTF-8 (Wake.Describe): the host's network cards, kept with the saved PC to wake it later
         public const byte HealthAlert = 0x89; // UTF-8 sentence: something about the host PC worth saying (HealthWatch)
-        public const byte MicNote = 0x8A;     // UTF-8 sentence about this PC's microphone on the host (where it plays, or why it cannot)
-        public const byte MicQuality = 0x8B;  // u8: the bitrate step the host wants the microphone sent at (it follows how the microphone arrives)
+        // 0x8A and 0x8B were MicNote and MicQuality, a host's words about the controller's microphone and the step it wanted (4.3 to 4.10): never reuse them
         // 0x8C and 0x8D were NVDA's Speech Viewer text and braille (4.3): never reuse them.
         public const byte NvdaNote = 0x8E;    // UTF-8 sentence about the host's NVDA text (installing the Kova Helper there, and how it went)
         public const byte NvdaEventMsg = 0x90; // one thing the host's NVDA did (NvdaEvent.Encode: speech with pitch and capitals, a cut-off, a beep, a sound, braille), from the Kova Helper add-on
         public const byte NvdaAvailable = 0x91; // u8 1 = the Kova Helper add-on is talking to the host, so NVDA comes as text; 0 = it is not (only the sound carries NVDA); NvdaSecureScreen = the host shows a secure screen (sign-in, lock, UAC), where NVDA runs without add-ons: only the sound carries it (4.6.2 and older take it as 0)
         public const byte NvdaSecureScreen = 2;
+        // The host has no sound to send: it has no output device, or the one it should take cannot be opened. u8 1 = no
+        // sound until there is a device (the host keeps trying by itself), 0 = there is one again and the sound is coming.
+        // Only to a PC that says it knows this (FeatureNoOutput); an older one gets the same words once as a Message.
+        public const byte NoOutput = 0x92;
+        /// <summary>What a controlling PC says and shows, word for word, when the host has no sound output to send.</summary>
+        public const string NoOutputText = "There is no output device on the host.";
         public const byte DeviceTicket = 0x8F; // 32 bytes (HostIdentity.NewTicket): shown in later logins, it lets this PC in while strangers are being turned away
         public const byte Leaving = 0x83; // u8 why (Leaving*), then UTF-8 detail (the new version when updating): sent just before the host closes on purpose
         // 0x84 was CaptureBurst (1.7.x): no longer sent, never reuse it
@@ -166,13 +171,7 @@ namespace TailRemote
         public const byte UdpPong = 0xA8;   // stamp[8] mac[16], host to client: the hello's stamp straight back, so the audio path's own ping is measured
         // 0xA1 to 0xA5 were the lossless formats (up to 1.7): never reuse them
         public const byte UdpOpus = 0xA6; // u32 sequence (5 ms ticks), then sealed: u8 ticks, Opus packet
-        // The controller's microphone, controller to host: token (8, so the host knows whose), u32 sequence (5 ms ticks, from 0
-        // per connection), then sealed with the microphone's own key: u8 ticks, Opus packet. Never from a listen-only connection.
-        public const byte UdpMic = 0xA7;
-        public const int MicHeadBytes = 1 + 8 + 4;
-        public const int MinMicPacketBytes = MicHeadBytes + 1 + SecureLink.TagSize;
-        /// <summary>The microphone's best step (128 kbit/s in 5 ms packets: low delay, and plenty for a voice) and where it starts.</summary>
-        public const int MicBestStep = 4;
+        // 0xA7 was UdpMic, the controller's microphone (4.3 to 4.10): never reuse it. A host drops such a packet unread, like anything that is not a hello
 
         // Roles
         public const byte RoleControl = 1, RoleListen = 2;
@@ -191,10 +190,11 @@ namespace TailRemote
         public const uint FeatureVideo = 512; // the remote screen (video lanes)
         public const uint FeatureMouse = 1024; // Mouse messages and mouse buttons as keys
         public const uint FeatureWake = 2048;  // WakeRequest
-        public const uint FeatureMic = 4096;   // takes the controller's microphone (UdpMic, MicState)
+        // 4096 was FeatureMic, a host that took the controller's microphone (4.3 to 4.10): never reuse it. A 4.10 host still sets it, which means nothing now
         public const uint FeatureNvda = 8192;  // sends its NVDA's speech and braille as text (NvdaWant)
         public const uint FeatureNvdaSecureScreen = 16384; // a controller that understands NvdaAvailable = NvdaSecureScreen (older ones are never sent it)
         public const uint FeatureTunnel = 32768; // takes tunnel lanes (TunnelMagic): Reach a port on the remote PC
+        public const uint FeatureNoOutput = 65536; // a controller that understands NoOutput (older ones are never sent it)
 
         /// <summary>
         /// The bitrate steps, best first. 5 ms packets down to 128 kbit/s (Opus's
@@ -216,7 +216,7 @@ namespace TailRemote
         public static int WireKbps(int step) => OpusSteps[step].Kbps + 1000 / OpusSteps[step].Ms * PacketOverheadBytes * 8 / 1000;
 
         /// <summary>What this version supports, sent to the other side after login.</summary>
-        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureMic | FeatureNvda | FeatureNvdaSecureScreen | FeatureTunnel;
+        public const uint OurFeatures = FeatureClipboard | FeatureFiles | FeatureRestart | FeatureRemoteTools | FeatureSendTo | FeatureVideo | FeatureMouse | FeatureWake | FeatureNvda | FeatureNvdaSecureScreen | FeatureTunnel | FeatureNoOutput;
 
 
         // ---- The login, damage-proof ----
@@ -297,13 +297,16 @@ namespace TailRemote
         /// <summary>The message a client gets when its login was damaged on the way: it tries again.</summary>
         public const string DamagedLogin = "The connection damaged the login on the way.";
 
+        /// <summary>Test only: features left out of what this copy says it supports, to stand in for an older Kova.</summary>
+        internal static uint TestHideFeatures;
+
         /// <summary>The features, then this copy's version (so the other side knows when it is older).</summary>
         public static byte[] FeaturesMessage(uint extra = 0)
         {
             byte[] v = Encoding.UTF8.GetBytes(Updater.Current.ToString());
             byte[] m = new byte[5 + v.Length];
             m[0] = Features;
-            BitConverter.TryWriteBytes(m.AsSpan(1), OurFeatures | extra);
+            BitConverter.TryWriteBytes(m.AsSpan(1), (OurFeatures | extra) & ~TestHideFeatures);
             v.CopyTo(m, 5);
             return m;
         }

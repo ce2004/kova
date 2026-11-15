@@ -74,7 +74,6 @@ namespace TailRemote
                     {
                         SecureAttention = SendSecureAttention,
                         FileUser = NativeService.ConsoleUser, // file tools with the signed-in user's rights, never SYSTEM's
-                        MicDevice = cfg.MicDevice,
                     };
                     break;
                 }
@@ -125,7 +124,7 @@ namespace TailRemote
             agent.ClipboardFiles = paths => { if (NativeService.ConsoleUser() is { } user) _host?.SendClipboardFiles(paths, user); };
             ServiceHost.Log("Hosting on port " + cfg.Port + ", from the service.");
             ServiceHost.HostingStarted(); // only now can a new version count as good
-            // Audio settings and device names are never touched here: only Set up audio device, when pressed.
+            // Audio settings and device names are never touched, here or anywhere in Kova.
         }
 
         public static void StopHosting(byte why = Protocol.LeavingStopped)

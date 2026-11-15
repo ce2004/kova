@@ -52,6 +52,8 @@ namespace TailRemote
 
         public RemoteFilesForm(Func<Client?> client, Action<string> say, Action<string> tell)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             _client = client;
             _say = say;
             _tell = tell;
@@ -342,6 +344,8 @@ namespace TailRemote
 
         public RemoteInfoForm(Func<Client?> client, string first, Action<string> say)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             Text = "Remote PC info";
             // Let go of when the window closes: it is opened again and again over months.
             var font = new System.Drawing.Font("Segoe UI", 10f);

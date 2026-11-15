@@ -135,10 +135,15 @@ namespace KovaRelay
             Socket? tcp = null, udp = null;
             try
             {
-                IPAddress any = LoopbackOnly ? IPAddress.Loopback : IPAddress.IPv6Any;
+                // One socket for IPv4 and IPv6 alike. A Linux server with IPv6 switched off in its kernel has no such
+                // socket to give: there the relay listens on IPv4 alone rather than not starting.
+                bool both = Socket.OSSupportsIPv6;
+                IPAddress any = LoopbackOnly ? IPAddress.Loopback : both ? IPAddress.IPv6Any : IPAddress.Any;
                 tcp = new Socket(any.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
                 udp = new Socket(any.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-                if (!LoopbackOnly) { tcp.DualMode = true; udp.DualMode = true; }
+                if (!LoopbackOnly && both) { tcp.DualMode = true; udp.DualMode = true; }
+                // On Windows this keeps any other program off the port. Linux never lets two programs listen on one
+                // port unless both ask to share it, which this does not, so there it changes nothing.
                 tcp.ExclusiveAddressUse = true;
                 udp.ExclusiveAddressUse = true;
                 tcp.Bind(new IPEndPoint(any, port));
@@ -147,9 +152,11 @@ namespace KovaRelay
                 // not be turned away by Windows before the relay even sees them.
                 tcp.Listen();
                 // Without this, Windows reports an ICMP "port unreachable" from some earlier send as an error on the
-                // next receive, which would make one vanished PC disturb everyone's UDP.
+                // next receive, which would make one vanished PC disturb everyone's UDP. Linux never does that to a
+                // socket that is not connected to one address, and has no such switch.
                 const int SIO_UDP_CONNRESET = -1744830452;
-                try { udp.IOControl(SIO_UDP_CONNRESET, new byte[4], null); } catch (Exception) { }
+                if (OperatingSystem.IsWindows())
+                    try { udp.IOControl(SIO_UDP_CONNRESET, new byte[4], null); } catch (Exception) { }
                 try { udp.ReceiveBufferSize = Limits.UdpReceiveBuffer; } catch (Exception) { }
                 try { udp.SendBufferSize = Limits.UdpReceiveBuffer; } catch (Exception) { }
             }
@@ -159,7 +166,9 @@ namespace KovaRelay
                 string why = e.SocketErrorCode switch
                 {
                     SocketError.AddressAlreadyInUse => $"Port {port} is already used by another program. Choose another port.",
-                    SocketError.AccessDenied => $"Windows would not let the relay use port {port}. Another program may have it, or Windows may keep it reserved. Choose another port.",
+                    SocketError.AccessDenied => OperatingSystem.IsWindows()
+                        ? $"Windows would not let the relay use port {port}. Another program may have it, or Windows may keep it reserved. Choose another port."
+                        : $"This system would not let the relay use port {port}. Ports below 1024 are kept for programs with special rights. Choose another port.",
                     _ => $"The relay could not use port {port}: {e.Message} Choose another port.",
                 };
                 lock (_gate) { Problem = why; Port = port; Running = false; }
@@ -182,6 +191,7 @@ namespace KovaRelay
             }
             // The relay only moves bytes between other people's PCs: a little above normal keeps it ahead of whatever
             // else runs on the same PC (a build, a backup), which would otherwise show up as lag at both ends.
+            // (Linux only lets root raise a priority: there the relay quietly stays at normal.)
             try { using var me = Process.GetCurrentProcess(); if (me.PriorityClass == ProcessPriorityClass.Normal) me.PriorityClass = ProcessPriorityClass.AboveNormal; }
             catch (Exception) { }
             _log.Write($"Started on port {port}" + (LoopbackOnly ? " (this PC only)." : "."));

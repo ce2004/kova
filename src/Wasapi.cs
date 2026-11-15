@@ -19,7 +19,7 @@ namespace TailRemote
             if (o == null || !Marshal.IsComObject(o)) return;
             try { Marshal.ReleaseComObject(o); } catch { }
         }
-        public const int eRender = 0, eCapture = 1, eConsole = 0;
+        public const int eRender = 0, eConsole = 0;
         public const uint DEVICE_STATE_ACTIVE = 1;
         public const uint CLSCTX_ALL = 23;
         public const uint AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000;
@@ -84,16 +84,6 @@ namespace TailRemote
             finally { Release(store); }
         }
 
-        /// <summary>Writes a string property. Needs administrator rights for endpoint names.</summary>
-        public static void WriteString(IMMDevice dev, Guid fmtid, uint pid, string value)
-        {
-            dev.OpenPropertyStore(2 /* STGM_READWRITE */, out var store);
-            var key = new PropertyKey { fmtid = fmtid, pid = pid };
-            var pv = new PropVariant { vt = 31, ptr = Marshal.StringToCoTaskMemUni(value) };
-            try { store.SetValue(ref key, ref pv); store.Commit(); }
-            finally { PropVariantClear(ref pv); Release(store); }
-        }
-
         [StructLayout(LayoutKind.Sequential)]
         public struct PropertyKey { public Guid fmtid; public uint pid; }
 
@@ -152,9 +142,6 @@ namespace TailRemote
         /// <summary>Output devices as (id, friendly name).</summary>
         public static List<(string Id, string Name)> OutputDevices() => Devices(eRender);
 
-        /// <summary>Microphones and other recording devices as (id, friendly name).</summary>
-        public static List<(string Id, string Name)> InputDevices() => Devices(eCapture);
-
         private static List<(string Id, string Name)> Devices(int flow)
         {
             var list = new List<(string, string)>();
@@ -199,9 +186,6 @@ namespace TailRemote
         /// enumerator each time was 86,400 COM objects a day waiting on the finalizer.
         /// </summary>
         public static IMMDevice OutputDevice(IMMDeviceEnumerator e, string? id) => Device(e, id, eRender);
-
-        /// <summary>The chosen microphone, or the default one when id is empty or gone.</summary>
-        public static IMMDevice InputDevice(IMMDeviceEnumerator e, string? id) => Device(e, id, eCapture);
 
         /// <summary>The id of Windows' default output now, or null if there is none.</summary>
         public static string? DefaultOutputId()

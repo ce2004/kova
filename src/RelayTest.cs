@@ -14,7 +14,7 @@ namespace TailRemote
     /// Kova.exe --relaytest RELAYPORT [HOSTPORT]: end to end through a real Kova Relay already running on this PC
     /// (127.0.0.1:RELAYPORT). A host here registers on it, a controlling PC here connects through it by name, and
     /// everything is checked across it: login, keys (F24 only, recorded, never typed), the UDP path (sound's hellos
-    /// and pongs), the microphone (counted, never played), files and clipboard text both ways, NVDA text; then the
+    /// and pongs), files and clipboard text both ways, NVDA text; then the
     /// refusals: a wrong password, a second host claiming the same name, and a flood of junk connections. Writes
     /// %TEMP%\kova-relaytest.txt; exit 0 when every check passes.
     /// </summary>
@@ -89,16 +89,6 @@ namespace TailRemote
                 long before = c.UdpBytesReceived;
                 Thread.Sleep(3500);
                 Check(c.UdpBytesReceived > before, "UDP came back through the relay (" + (c.UdpBytesReceived - before) + " bytes in 3.5 s of hellos and pongs, no sound playing)");
-
-                // The microphone, counted at the host (never played).
-                int micTicks = 0;
-                MicIn.TestHeard = (_, t) => Interlocked.Add(ref micTicks, t);
-                c.SetMic(true, null);
-                for (int i = 0; i < 100 && micTicks == 0; i++) Thread.Sleep(50);
-                Thread.Sleep(1000);
-                c.SetMic(false, null);
-                MicIn.TestHeard = null;
-                Check(micTicks > 0, "the microphone reached the host through the relay (" + micTicks * 5 + " ms of it)" + (micTicks == 0 ? " (no recording device here?)" : ""));
 
                 // Clipboard text both ways.
                 string? toHost = null, toClient = null;
@@ -283,7 +273,6 @@ namespace TailRemote
             finally
             {
                 Native.KeySink = null;
-                MicIn.TestHeard = null;
                 c?.Dispose();
                 fake?.Dispose();
                 host?.Dispose();

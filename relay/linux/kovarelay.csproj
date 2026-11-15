@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Kova Relay for Linux: the same relay as KovaRelay.exe (the files in the folder above), with no window, started
+       from a shell or by systemd. It is a project of its own, in its own folder, so that nothing it builds (obj, bin)
+       can get in the way of the Windows relay's build, and so that the Windows parts (tray, window, firewall, Windows
+       service) are simply not compiled here.
+       Build (on Windows or Linux, nothing but the .NET 8 SDK needed):
+         dotnet publish relay/linux/kovarelay.csproj -c Release -r linux-x64 -o <dir>
+         dotnet publish relay/linux/kovarelay.csproj -c Release -r linux-arm64 -o <dir>
+       The one file to copy to the server is <dir>/kovarelay. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>kovarelay</AssemblyName>
+    <RootNamespace>KovaRelay</RootNamespace>
+    <Product>Kova Relay</Product>
+    <AssemblyTitle>Kova Relay</AssemblyTitle>
+    <!-- One version number for both relays: the one in ..\KovaRelay.csproj (or -p:Version=..., as the release build passes). -->
+    <Version Condition="'$(Version)' == ''">$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)../KovaRelay.csproj')), '&lt;Version&gt;([^&lt;]+)&lt;/Version&gt;').Groups[1].Value)</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">linux-x64</RuntimeIdentifier>
+
+    <!-- One self-contained file, so the server needs no .NET installed. Nothing is unpacked when it starts (the
+         Windows relay's IncludeNativeLibrariesForSelfExtract is left out on purpose): a systemd service with no home
+         folder would have nowhere to unpack to. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>embedded</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The relay itself, the very files the Windows relay is built from: protocol, server and limits, settings and
+         log, the words it says, and the self-test. -->
+    <Compile Include="..\RelayWire.cs" Link="Shared\RelayWire.cs" />
+    <Compile Include="..\RelayServer.cs" Link="Shared\RelayServer.cs" />
+    <Compile Include="..\RelayFiles.cs" Link="Shared\RelayFiles.cs" />
+    <Compile Include="..\RelayText.cs" Link="Shared\RelayText.cs" />
+    <Compile Include="..\SelfTest.cs" Link="Shared\SelfTest.cs" />
+    <!-- Linux only: starting, the command line, where files go, stopping on a signal. -->
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <TrimmerRootAssembly Include="kovarelay" />
+  </ItemGroup>
+
+</Project>

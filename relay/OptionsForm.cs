@@ -239,30 +239,10 @@ namespace KovaRelay
             return string.Join(" ", parts);
         }
 
-        internal static string CountsText(RelaySnapshot s) =>
-            (s.Hosts switch { 0 => "No hosts are connected.", 1 => "1 host is connected.", _ => $"{s.Hosts} hosts are connected." }) + " " +
-            (s.ControllingPcs switch
-            {
-                0 => "No controlling PCs are connected.",
-                1 => "1 controlling PC is connected.",
-                _ => $"{s.ControllingPcs} controlling PCs are connected.",
-            });
+        // The words themselves are in RelayText.cs, which the relay on Linux (no window) is built from too.
+        internal static string CountsText(RelaySnapshot s) => RelayText.CountsText(s);
 
-        /// <summary>"Host connected from 203.0.113.5 since 14:02", with the date when it is not today, and its controlling PCs.</summary>
-        internal static string RowText(HostRow r)
-        {
-            DateTime local = r.SinceUtc.ToLocalTime();
-            string since = local.Date == DateTime.Now.Date
-                ? local.ToString("HH:mm", CultureInfo.InvariantCulture)
-                : local.ToString("d MMMM yyyy 'at' HH:mm", CultureInfo.InvariantCulture);
-            string text = $"Host connected from {r.Address} since {since}";
-            return r.ControllingPcs switch
-            {
-                0 => text,
-                1 => text + ", 1 controlling PC",
-                _ => text + $", {r.ControllingPcs} controlling PCs",
-            };
-        }
+        internal static string RowText(HostRow r) => RelayText.RowText(r);
 
         // ------------------------------------------------------------ actions
 

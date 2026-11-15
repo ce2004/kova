@@ -40,7 +40,14 @@ jobs:
             dotnet publish relay/KovaRelay.csproj -c Release -r "win-$arch" -o "out/relay-$arch" -p:Version=${{ steps.ver.outputs.version }} -p:BaseOutputPath=relay/obj/pubout/
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             Copy-Item "out/relay-$arch/KovaRelay.exe" "dist/KovaRelay-$arch.exe"
+            # Kova Relay for Linux (4.11): one self-contained file, no window. Not an .exe, so it is not in the signed
+            # list below, which is only what Kova's own update check installs.
+            dotnet publish relay/linux/kovarelay.csproj -c Release -r "linux-$arch" -o "out/relay-linux-$arch" -p:Version=${{ steps.ver.outputs.version }}
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Copy-Item "out/relay-linux-$arch/kovarelay" "dist/kovarelay-linux-$arch"
           }
+          Copy-Item relay/linux/kovarelay.service dist/kovarelay.service
+          Copy-Item relay/linux/README.txt dist/kovarelay-linux-README.txt
           Get-ChildItem dist
 
       - name: Self-test (x64)

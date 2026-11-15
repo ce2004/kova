@@ -51,14 +51,14 @@ The File and Settings menus only show what you can use right now, so they change
 File
 - When this PC is neither hosting nor connected: Connect to a PC, Host this PC, Wake a saved PC and connect (once you have saved PCs), and Exit.
 - While this PC hosts: Stop hosting, Measure this PC's internet speed, and Exit. While the Kova service hosts it, there is also Change how this PC is hosted, and Stop hosting removes the service.
-- While connected: Disconnect, Connect to another PC, Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Your microphone to the remote PC, Restart remote PC and reconnect, Remote PC info, Update the remote PC, Install the Kova Helper on the remote PC, Reach a port on the remote PC, Remote ports open on this PC (while any are open), the streaming status, Measure this PC's internet speed, Measure the remote PC's internet speed, and Exit. On a listen-only connection, the items that need control are not shown.
+- While connected: Disconnect, Connect to another PC, Switch to PC, Wake a saved PC and connect, Control remote PC, Show the remote screen, Restart remote PC and reconnect, Remote PC info, Update the remote PC, Install the Kova Helper on the remote PC, Reach a port on the remote PC, Remote ports open on this PC (while any are open), the streaming status, Measure this PC's internet speed, Measure the remote PC's internet speed, and Exit. On a listen-only connection, the items that need control are not shown.
 
 Clipboard
 - The current file transfer, the history of transfers, Send the clipboard (Control B), Send files (Control I), Send a folder and its contents (Control T), Get files from the remote PC (Control G), Get the remote PC's clipboard (Control Shift B), Stop the file transfer, the received files folder, and Accept text and files sent by the remote PC without asking.
 
 Settings
-- For controlling another PC, shown unless this PC hosts: Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Remote NVDA speech, Microphone to use, Catch up by speeding up audio instead of skipping, and Notification sounds.
-- For hosting, shown while this PC hosts or after it last hosted: Capture audio from, Play the controlling PC's microphone into, Start hosting when Windows starts (not while the Kova service is installed, which already starts with Windows), Run as a Windows service, Apply settings to the Kova service (while it is installed), Port editor, and Set up audio device or Remove audio device.
+- For controlling another PC, shown unless this PC hosts: Audio quality, Announce audio quality changes, Announce remote PC health alerts, Mute Kova when it is not the active window, Compensate for Wi-Fi interruptions, Output device, Remote NVDA speech, Catch up by speeding up audio instead of skipping, and Notification sounds.
+- For hosting, shown while this PC hosts or after it last hosted: Capture audio from, Start hosting when Windows starts (not while the Kova service is installed, which already starts with Windows), Run as a Windows service, Apply settings to the Kova service (while it is installed), and Port editor.
 - Always: Install the Kova Helper NVDA add-on, Back up settings to a file, Restore settings from a backup (while nothing is connected or hosted in this window), and Diagnostic logging.
 
 About
@@ -71,11 +71,6 @@ Remote screen
 - File, Show the remote screen (Control Shift S) opens a window with the remote PC's screen. While the screen changes, it is shown as smooth video at up to 60 frames per second, using the remote PC's graphics hardware when available. When it stops changing, an exact picture is shown. NVDA plus R reads it with Windows text recognition.
 - The title bar shows the frame rate. Escape returns to the main window and leaves the screen on; Control Shift S turns it off. F5 requests a fresh picture. With several monitors, the keys 1 to 9 choose a monitor, and Page Up and Page Down move between them.
 - When the remote PC runs Kova as a service, the sign-in screen, the lock screen and administrator prompts are shown too.
-
-Microphone
-- File, Your microphone to the remote PC (Control Shift M) sends your microphone to the PC you control. It is off each time Kova starts. Settings, Microphone to use chooses the microphone.
-- On the remote PC, your microphone plays into a virtual audio cable, so programs there can use it as their microphone. Use headphones, or the remote PC will hear its own sound through your microphone.
-- A PC whose only sound device is the Kova audio device needs a second virtual cable for this, such as VB-Audio's free Hi-Fi Cable. Kova finds it automatically.
 
 Remote NVDA speech
 - Settings, Remote NVDA speech chooses how you hear the remote PC's NVDA: through the remote PC's audio, as text and braille spoken by your own NVDA, or both.
@@ -164,6 +159,14 @@ Running Kova Relay
 - Run as a Windows service starts the relay with Windows, before anyone signs in, with limited rights. The relay must then be in a folder only administrators can change, such as Program Files.
 - The relay limits the connections from any one address, closes connections that send invalid data or nothing at all, and keeps its memory use bounded. Its log never contains passwords or session content.
 
+Running the relay on Linux
+- The relay also runs on a Linux server, as a program called kovarelay with no window. It is the same relay as on Windows, and Kova works with either in the same way. It needs no .NET installed and runs on Debian, Ubuntu and similar systems, on x64 and ARM64.
+- Start it with kovarelay, and stop it with Control C. kovarelay --help lists its options, and kovarelay --selftest tests it on that computer.
+- It uses port 47200 unless told otherwise, with --port, with the KOVA_RELAY_PORT environment variable, or in /etc/kovarelay/settings.json, which holds the port in the same form as on Windows.
+- It does not touch the firewall. Open its port on the server for both TCP and UDP, and in your cloud provider's firewall if there is one.
+- To run it as a service that starts with the server, use kovarelay.service from the relay, linux folder. It runs the relay as a user of its own with no rights, restarts it if it fails, and keeps its log in /var/lib/kovarelay and in the journal, which journalctl -u kovarelay shows.
+- README.txt in the relay, linux folder gives the steps: building kovarelay, copying it to the server, turning on the service and opening the port.
+
 
 Updates
 
@@ -174,6 +177,7 @@ Updates
 
 Audio and latency
 
+- You hear whatever the remote PC plays through its sound output. If it has no output device, see A PC with no sound output below.
 - Audio is Opus at 48 kHz stereo, up to 510 kilobits per second, sent in 5 millisecond packets that are never delayed or resent.
 - Audio quality: Variable follows the connection, lowering the bitrate when needed, down to 6 kilobits per second. You can also lock it to one bitrate.
 - Kova always stays live: old audio is never played. The buffer adapts to how evenly packets arrive and never exceeds 40 milliseconds. After a stall, the delayed audio is skipped, or, with Catch up by speeding up audio instead of skipping, played faster at the same pitch until it has caught up.
@@ -186,7 +190,7 @@ Security
 - Both PCs prove they know the password before anything is sent, and wrong passwords are slowed down. Each host has a lasting identity that signs every connection. Your PC remembers it and asks before connecting if it ever changes.
 - After that, everything is encrypted with keys that are new for every connection, and anything altered in transit is rejected.
 - An address that keeps guessing is blocked for a while. PCs that have never connected before get 30 wrong passwords per minute, 200 per hour and 1,000 per day in total. PCs that have connected before are always let in.
-- A listen-only connection receives audio only: no keys, mouse, files, clipboard, microphone or NVDA text.
+- A listen-only connection receives audio only: no keys, mouse, files, clipboard or NVDA text.
 - While the remote PC is locked, Get files and Get the remote PC's clipboard wait until someone signs in.
 - Reach a port on the remote PC only works with the full password, never listen-only. It only reaches ports on the remote PC itself, never other computers on its network. Its end on your PC only listens on your PC itself, so nobody else on your network can use it, though other people signed in to your PC could. Ports work even while the remote PC is locked, so anyone with the full Kova password can reach programs like a web settings page there without the Windows password.
 - Received files are marked as coming from the internet, and file names that disguise a file's type are made safe.
@@ -199,18 +203,18 @@ Limits
 - Control Alt Delete and Windows L on your own keyboard always act on your own PC. Use Control Alt End to send Control Alt Delete to the remote PC.
 - Without the Kova service, the remote PC's lock screen and administrator prompts cannot be used.
 - Remote NVDA text requires the Kova Helper add-on, and does not include the sign-in screen, where a separate copy of NVDA runs.
-- The microphone only goes to a PC you connected to with its full password, and a PC plays one controlling PC's microphone at a time.
 
+A PC with no sound output
 
-About the audio device
-
-- A PC without a sound card, such as a cloud server, needs a virtual audio device. Settings, Set up audio device installs VB-Cable by VB-Audio (donationware, www.vb-cable.com), names it Kova and makes it the default output. Its licence requires that you press its Install Driver button yourself. Remove audio device removes it.
-- If Windows asks for a restart after installing it, restart and start hosting; Kova completes the setup.
+- Kova sends the sound of the remote PC's own output device: Windows' default output, or the one chosen there in Settings, Capture audio from. Kova does not install, rename or choose sound devices. A PC with no sound card, such as a cloud server, needs an output device before you can hear it, and adding one is up to whoever looks after that PC.
+- If the remote PC has no output device, or its output cannot be opened, Kova on your PC says There is no output device on the host. It says so once. The connection stays up, and keys, the remote screen, files and the clipboard all work as usual.
+- As soon as the remote PC has an output device, its sound starts by itself. There is no need to reconnect.
 
 
 For developers
 
 - build.bat builds this PC's architecture quickly, with Kova Relay beside Kova. build.bat x64 or build.bat arm64 chooses one; build.bat full builds both exactly as a release is built. If Kova is running from the bin folder, the new build replaces it and restarts it.
 - Tests: Kova.exe --selftest, --securitytest and --chaostest; KovaRelay.exe --selftest; and Kova.exe --relaytest PORT against a Kova Relay running on this PC. Each writes its result to a file in the temp folder.
+- The relay for Linux is its own project, relay\linux\kovarelay.csproj, built from the same relay code. dotnet publish relay\linux\kovarelay.csproj -c Release -r linux-x64 -o out\linux-x64 builds it on Windows or Linux, and -r linux-arm64 builds the ARM64 one. kovarelay --selftest runs the same self-test there.
 - To release, add a section to CHANGES.txt (the version on its own line, then one change per line) and push a tag such as v4.6.0. GitHub builds, signs and publishes both programs.
 - Kova.exe --licence writes the NVDA controller client licence beside the program.

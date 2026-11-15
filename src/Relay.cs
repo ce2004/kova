@@ -16,7 +16,7 @@ namespace TailRemote
     /// own: the relay tells the host, the host dials back with a one-time token, and the relay then only
     /// copies bytes both ways. Kova's own login and encryption run end to end through it unchanged: the
     /// relay never sees the password or anything inside a session, and the host's signed hello means a
-    /// relay cannot pretend to be the host either. UDP (sound and the microphone) goes through the relay's
+    /// relay cannot pretend to be the host either. UDP (the sound) goes through the relay's
     /// same port with a small header naming the pairing (Wire.UdpHead).
     /// </summary>
     internal static class Relay

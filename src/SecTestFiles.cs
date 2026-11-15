@@ -24,7 +24,7 @@ namespace TailRemote
             FileChannel.DownloadsOverride = Path.Combine(root, "downloads");
             try
             {
-                return RemotePaths() ?? PeerWords() ?? VbCable() ?? Unasked(root) ?? Names() ?? Memory() ?? Space();
+                return RemotePaths() ?? PeerWords() ?? Unasked(root) ?? Names() ?? Memory() ?? Space();
             }
             catch (Exception e) { return "Files: the test itself failed: " + e; }
             finally
@@ -78,15 +78,7 @@ namespace TailRemote
             return null;
         }
 
-        // ---- Fix 8: only the VB-Cable zip Kova knows is unpacked ----
-
-        private static string? VbCable()
-        {
-            const string pack45 = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip";
-            if (AudioSetup.KnownPack(pack45, RandomNumberGenerator.GetBytes(4096))) return "an unknown VB-Cable zip was taken as genuine";
-            if (AudioSetup.KnownPack("https://example.invalid/x.zip", Array.Empty<byte>())) return "a VB-Cable zip from elsewhere was taken";
-            return null;
-        }
+        // (Fix 8 was about the virtual sound cable Kova used to download; Kova installs no sound device since 4.11.)
 
         // ---- Fixes 1 and 2: nothing unasked onto the clipboard; received files marked from the internet ----
 

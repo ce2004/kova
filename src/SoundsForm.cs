@@ -21,6 +21,8 @@ namespace TailRemote
 
         public SoundsForm(Settings settings)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             _settings = settings;
             _keyBefore = Math.Clamp(settings.SoundKey, 0, 11);
             Text = "Sounds";

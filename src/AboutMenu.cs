@@ -161,6 +161,8 @@ namespace TailRemote
 
         public ListViewerForm(string title, IReadOnlyList<string> lines, Func<string, bool> heading)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             Text = title;
             Font = new System.Drawing.Font("Segoe UI", 10f);
             StartPosition = FormStartPosition.CenterParent;

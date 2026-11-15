@@ -104,6 +104,8 @@ namespace TailRemote
         /// <param name="close">Closes a tunnel (and forgets it on its saved PC); returns what to say.</param>
         public TunnelsForm(TunnelBook book, Func<TunnelBook.Tunnel, bool> kept, Func<TunnelBook.Tunnel, string> close, Action<string> copy, Action<string> say)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             _book = book;
             _kept = kept;
             _close = close;

@@ -261,6 +261,8 @@ namespace TailRemote
 
         public TextForm(string title, string prompt, string text, bool secret)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             Text = title;
             Font = new System.Drawing.Font("Segoe UI", 10f);
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -305,6 +307,8 @@ namespace TailRemote
     {
         public RestartConfirmForm()
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             Text = "Restart remote PC";
             Font = new System.Drawing.Font("Segoe UI", 10f);
             FormBorderStyle = FormBorderStyle.FixedDialog;

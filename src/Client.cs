@@ -813,9 +813,6 @@ namespace TailRemote
             Interlocked.Exchange(ref _infoRequest, null)?.TrySetException(gone);
             foreach (var id in _folderRequests.Keys) if (_folderRequests.TryRemove(id, out var w)) w.TrySetException(gone);
             _toSend.Release();
-            LoopbackCapture? mic;
-            lock (_micGate) { mic = _mic; _mic = null; }
-            if (mic != null) ThreadPool.QueueUserWorkItem(_ => mic.Stop()); // the microphone is let go with the connection
             try { _tcp.Dispose(); } catch { }
             try { _udp.Dispose(); } catch { }
             if (_files != null)
@@ -1046,103 +1043,38 @@ namespace TailRemote
         public bool TakeKeyPressed() => Interlocked.Exchange(ref _keyPressed, 0) == 1;
         private int _keyPressed;
 
-        // ---- This PC's microphone, sent to the host (it plays it into a virtual cable there: MicIn) ----
+        // ---- The host has no sound output to send (NoOutput) ----
 
-        /// <summary>The host takes this PC's microphone: it is new enough, and this PC controls it (a listener never sends one).</summary>
-        public bool CanMic => !ListenOnly && (_peerFeatures & Protocol.FeatureMic) != 0;
+        /// <summary>
+        /// The host said it has no output device (true), or that the sound is coming again (false). Said, by Status, once
+        /// per connection, and again only after the sound worked in between: the host keeps looking for a device by
+        /// itself, and none of its tries is news. Keys, the screen and files never wait on it.
+        /// </summary>
+        public bool HostHasNoOutput => _hostNoOutput;
+        private volatile bool _hostNoOutput;
 
-        /// <summary>Something the host says about the microphone (where it plays, or why it cannot). Raised on the network thread.</summary>
-        public event Action<string>? MicNote;
+        /// <summary>Test only: the features the host said it has, as it sent them.</summary>
+        internal uint TestPeerFeatures => _peerFeatures;
 
-        private readonly object _micGate = new();
-        private LoopbackCapture? _mic; // the one capture allowed to send: changed only under _micSend too
-        private bool _micWanted;
-        private string? _micDevice;
-        // The packet number is the nonce: only the current capture sends, one tick at a time under _micSend, and a new capture
-        // numbers from past everything ever sent. A capture being stopped (which can take seconds) sends nothing more.
-        private readonly object _micSend = new();
-        private uint _micSentEnd; // under _micSend: the number after the last packet sent
-        private volatile int _micStep = Protocol.MicBestStep;
-        private readonly OpusBank _micBank = new();
-        private readonly bool[] _micSteps = new bool[Protocol.OpusSteps.Length];
-        private readonly byte[] _micPacket = new byte[Protocol.MicHeadBytes + 1 + Protocol.MaxOpusBytes + SecureLink.TagSize];
-
-        /// <summary>True while the microphone is being taken and sent.</summary>
-        public bool MicSending { get { lock (_micGate) return _mic != null; } }
-
-        /// <summary>Turns the microphone on or off for this host (device: a recording device id, null or "" for Windows' default).</summary>
-        public void SetMic(bool on, string? device)
+        /// <summary>
+        /// Test only: what a 4.10 controller sent while its microphone was on, made by hand (this Kova has no microphone):
+        /// "on" (message 18), so many packets of type 0xA7 with this connection's token, then "off".
+        /// </summary>
+        internal void TestOldMicrophone(int packets)
         {
-            LoopbackCapture? stop = null;
-            bool started = false;
-            lock (_micGate)
+            Write(new byte[] { 18, 1 });
+            var rnd = new Random(3);
+            for (uint i = 0; i < packets; i++)
             {
-                bool deviceChanged = (device ?? "") != (_micDevice ?? "");
-                _micWanted = on;
-                _micDevice = device;
-                bool want = on && CanMic && !_closed;
-                if (_mic != null && (!want || deviceChanged)) lock (_micSend) { stop = _mic; _mic = null; } // sends nothing from here on
-                if (want && _mic == null)
-                {
-                    uint first;
-                    lock (_micSend) first = _micSentEnd + 200; // past everything sent, with a gap: the host starts afresh
-                    LoopbackCapture? cap = null;
-                    cap = new LoopbackCapture((s, pcm) => MicTick(cap, s, pcm), msg => Status?.Invoke(msg), string.IsNullOrEmpty(device) ? null : device, first, microphone: true);
-                    lock (_micSend) _mic = cap;
-                    started = true;
-                }
+                byte[] p = new byte[1 + 8 + 4 + 1 + 80 + SecureLink.TagSize]; // type, token, number, ticks, Opus, tag
+                rnd.NextBytes(p);
+                p[0] = 0xA7;
+                _token.CopyTo(p, 1);
+                BitConverter.TryWriteBytes(p.AsSpan(9), i * 4);
+                try { UdpSend(p, p.Length); } catch { }
             }
-            if (started && stop == null) Write(new[] { Protocol.MicState, (byte)1 });
-            if (stop != null)
-            {
-                if (!started) Write(new[] { Protocol.MicState, (byte)0 });
-                // Stopping waits for the capture thread (up to 2 seconds): never on the caller's (window's) thread.
-                ThreadPool.QueueUserWorkItem(_ => stop.Stop());
-            }
+            Write(new byte[] { 18, 0 });
         }
-
-        /// <summary>Every 5 ms tick of the microphone (null: silence), on its capture thread: encoded and sent, by the current capture only.</summary>
-        private void MicTick(LoopbackCapture? from, uint seq, short[]? pcm)
-        {
-            bool worn = false;
-            lock (_micSend)
-            {
-                if (_closed || from == null || !ReferenceEquals(from, _mic)) return; // a capture being stopped, or not yet the current one
-                worn = !MicSend(seq, pcm);
-            }
-            // Months of microphone on one connection: it reconnects with new keys rather than use a number twice.
-            if (worn) Close("Disconnected: the microphone has been on for months, so the connection starts afresh.");
-        }
-
-        /// <summary>Under _micSend. False when the numbers are nearly used up for this connection's key.</summary>
-        private bool MicSend(uint seq, short[]? pcm)
-        {
-            int step = _micStep;
-            Array.Clear(_micSteps);
-            _micSteps[step] = true;
-            _micBank.Feed(seq, pcm, _micSteps);
-            if (!_micBank.Ready(step, out uint first, out int ticks, out var packet)) return true;
-            if (first >= SecureLink.MicSeqSpan - 100_000) return false;
-            if (_micSentEnd != 0 && (int)(first - _micSentEnd) < 0) return true; // never a number at or before one already sent
-            _micSentEnd = first + (uint)ticks;
-            byte[] p = _micPacket;
-            p[0] = Protocol.UdpMic;
-            _token.CopyTo(p, 1);
-            BitConverter.TryWriteBytes(p.AsSpan(9), first);
-            p[Protocol.MicHeadBytes] = (byte)ticks;
-            packet.CopyTo(p.AsSpan(Protocol.MicHeadBytes + 1));
-            int payload = 1 + packet.Length;
-            try
-            {
-                _link.SealMic(p, payload);
-                UdpSend(p, Protocol.MicHeadBytes + payload + SecureLink.TagSize);
-            }
-            catch { }
-            return true;
-        }
-
-        /// <summary>Test only (--selftest): the microphone's packets from given sound, as if a microphone had made them.</summary>
-        internal void TestMicTick(uint seq, short[]? pcm, bool replay = false) { lock (_micSend) { if (replay) _micSentEnd = 0; MicSend(seq, pcm); } } // replay: old numbers on purpose, to check the host refuses them
 
         /// <summary>Back to the best sound at once (coming to the front), unless the quality is locked.</summary>
         public void StartBest()
@@ -1242,7 +1174,7 @@ namespace TailRemote
                     byte[] m = _link.Receive(_stream);
                     // Words from the host are read aloud: anything that size is not words, and a hostile host could
                     // tie up this PC's screen reader with megabytes of them. (The file lanes carry big things.)
-                    if (m.Length > MaxSaidMessage && m[0] is Protocol.NvdaEventMsg or Protocol.NvdaNote or Protocol.MicNote or Protocol.Message or Protocol.HealthAlert or Protocol.WakeInfo)
+                    if (m.Length > MaxSaidMessage && m[0] is Protocol.NvdaEventMsg or Protocol.NvdaNote or Protocol.Message or Protocol.HealthAlert or Protocol.WakeInfo)
                         continue;
                     if (m.Length == 1 + HostIdentity.TicketBytes && m[0] == Protocol.DeviceTicket)
                     {
@@ -1302,18 +1234,17 @@ namespace TailRemote
                     {
                         NvdaNote?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1)); // only ever sent when asked for: NVDA wanted, or the add-on installed
                     }
-                    else if (m.Length >= 2 && m[0] == Protocol.MicNote)
+                    else if (m.Length == 2 && m[0] == Protocol.NoOutput)
                     {
-                        bool on;
-                        lock (_micGate) on = _micWanted;
-                        if (on) MicNote?.Invoke(System.Text.Encoding.UTF8.GetString(m, 1, m.Length - 1));
+                        // 1: the host has no output device to take its sound from. Said and shown once; the host tells this
+                        // PC again only after the sound came back (0) and went. 0 itself needs no words: the sound says it.
+                        bool none = m[1] == 1;
+                        bool was = _hostNoOutput;
+                        _hostNoOutput = none;
+                        DiagLog.Write("client: the host says " + (none ? "it has no sound output" : "its sound is back"));
+                        if (none && !was) Status?.Invoke(Protocol.NoOutputText);
                     }
-                    else if (m.Length == 2 && m[0] == Protocol.MicQuality)
-                    {
-                        int step = Math.Clamp((int)m[1], Protocol.MicBestStep, Protocol.OpusSteps.Length - 1);
-                        if (step != _micStep) DiagLog.Write("client: the host asked for the microphone at " + Protocol.OpusSteps[step].Kbps + " kbit/s");
-                        _micStep = step;
-                    }
+                    // 0x8A and 0x8B (a 4.10 host's words about the microphone) fall through to the end: ignored.
                     else if (m.Length >= 1 && m[0] == Protocol.Message)
                     {
                         Leaving = 0; // still here after all (a restart that failed says so this way)
@@ -1342,10 +1273,6 @@ namespace TailRemote
                         DiagLog.Write("client: host features " + _peerFeatures + (ListenOnly ? ", listen only" : ", control"));
                         // What was asked for before the host said what it can do: told now.
                         SendNvdaWant();
-                        bool mic;
-                        string? micDevice;
-                        lock (_micGate) { mic = _micWanted; micDevice = _micDevice; }
-                        if (mic) SetMic(true, micDevice);
                         FeaturesKnown?.Invoke();
                     }
                     // Anything else is from a newer version: ignore it.

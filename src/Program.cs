@@ -76,7 +76,7 @@ namespace TailRemote
                 sound++;
                 foreach (short s in pcm) peak = Math.Max(peak, Math.Abs((int)s));
                 if (firstSound < 0) firstSound = clock.ElapsedMilliseconds;
-            }, msg => { lock (lines) lines.Add(msg); }, null, 0);
+            }, why => { if (why != null) lock (lines) { string msg = "no output could be taken: " + why; if (!lines.Contains(msg)) lines.Add(msg); } }, null, 0);
             System.Threading.Thread.Sleep(10_000);
             cap.Stop();
             using var me = System.Security.Principal.WindowsIdentity.GetCurrent();
@@ -137,18 +137,6 @@ namespace TailRemote
             if (args.Length >= 1 && args[0] == "--startup")
                 return (args.Length == 2 || args.Length == 3) && OnOff(args[1], "on", "off") is bool startupOn ? Startup.Apply(startupOn, args.Length == 3 ? args[2] : null) : 2;
 
-            if (args.Length == 1 && args[0] == "--setup-audio")
-            {
-                Speech.Init();
-                SetupForm? setup = null;
-                RunWindow(() => setup = new SetupForm("Setting up the Kova audio device", async (report, ct) =>
-                {
-                    await AudioSetup.RunAsync(report, ct);
-                    return "Done. The Kova audio device is ready and is the default output.";
-                }));
-                return setup!.Result;
-            }
-
             if (args.Length >= 1 && args[0] == "--firewall")
                 return Firewall.Command(args[1..]);
 
@@ -167,14 +155,6 @@ namespace TailRemote
             if (args.Length == 1 && args[0] == "--agent") return Agent.Run();
             if (args.Length == 2 && args[0] == "--agent" && int.TryParse(args[1], out int servicePid)) return Agent.Run(servicePid);
             if (args.Length == 2 && args[0] == "--capturetest") return CaptureTest(args[1]);
-
-            if (args.Length == 1 && args[0] == "--remove-audio")
-            {
-                Speech.Init();
-                SetupForm? remove = null;
-                RunWindow(() => remove = new SetupForm("Removing the Kova audio device", AudioSetup.RemoveAsync));
-                return remove!.Result;
-            }
 
             if (args.Length == 1 && args[0] == "--licence")
             {
@@ -269,37 +249,21 @@ namespace TailRemote
                     if (target != null) host.UseRelay(target);
                     else try { File.AppendAllText(said, "relay: " + relayProblem + Environment.NewLine); } catch { }
                 }
-                // KOVA_MIC_TEST=1: the controlling PC's microphone is counted, not played (a test PC may have no second cable).
-                if (Environment.GetEnvironmentVariable("KOVA_MIC_TEST") == "1")
-                {
-                    int ticks = 0;
-                    MicIn.TestHeard = (_, t) => System.Threading.Interlocked.Add(ref ticks, t);
-                    new System.Threading.Thread(() =>
-                    {
-                        while (true)
-                        {
-                            System.Threading.Thread.Sleep(1000);
-                            int n = System.Threading.Interlocked.Exchange(ref ticks, 0);
-                            if (n > 0) try { File.AppendAllText(said, "microphone ticks this second: " + n + Environment.NewLine); } catch { }
-                        }
-                    }) { IsBackground = true }.Start();
-                }
                 System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
                 return 0;
             }
             if (args.Length >= 4 && args[0] == "--testcontrol" && int.TryParse(args[1], out int controlPort) && int.TryParse(args[3], out int controlSecs))
             {
-                // A controlling PC with no window, for testing a host's microphone and NVDA text against (4.3):
-                // --testcontrol PORT PASSWORD SECONDS [mic] [nvda] [micoff=N]. Connects to this PC, turns on the
-                // microphone (Windows' default recording device) and asks for the remote NVDA as text with no sound,
-                // the way the window does; never sends a key. What it hears goes to %TEMP%\kova-testcontrol.txt.
+                // A controlling PC with no window, for testing a host's NVDA text against (4.3):
+                // --testcontrol PORT PASSWORD SECONDS [nvda]. Connects to this PC and, with nvda, asks for the remote
+                // NVDA as text with no sound, the way the window does; never sends a key. What it hears goes to
+                // %TEMP%\kova-testcontrol.txt.
                 string said = Path.Combine(Path.GetTempPath(), "kova-testcontrol.txt");
                 void Note(string s) { try { File.AppendAllText(said, DateTime.Now.ToString("HH:mm:ss.fff ") + s + Environment.NewLine); } catch { } }
                 Speech.Init();
-                bool mic = Array.IndexOf(args, "mic") >= 0, nvda = Array.IndexOf(args, "nvda") >= 0;
-                int micOff = 0, soundOffAt = 0, soundOnAt = 0;
+                bool nvda = Array.IndexOf(args, "nvda") >= 0;
+                int soundOffAt = 0, soundOnAt = 0;
                 string to = "127.0.0.1";
-                foreach (var a in args) if (a.StartsWith("micoff=") && int.TryParse(a[7..], out int mo)) micOff = mo;
                 // 4.4: to=ADDRESS (a relay address, name@relay:port, works too); soundoff=N / soundon=N turn the sound off and on
                 // at those seconds (text-only mode), and every 5 seconds the bytes received over UDP are noted, to measure both.
                 foreach (var a in args) if (a.StartsWith("to=")) to = a[3..];
@@ -312,25 +276,21 @@ namespace TailRemote
                 c.NvdaEventArrived += ev => { Note(ev.Kind == NvdaEventKind.Speak ? "remote NVDA: " + ev.SpokenText : "remote NVDA " + ev); NvdaEvent.Perform(ev, sounds: true); };
                 c.NvdaHelperThere += there => Note(there ? "the remote PC has the Kova Helper" : "the remote PC has no Kova Helper");
                 c.NvdaNote += n => Note("NVDA note: " + n);
-                c.MicNote += n => Note("microphone note: " + n);
                 c.Disconnected += why => Note("disconnected: " + why);
                 c.SoundOff = nvda;
                 c.NvdaText = nvda;
-                c.SetMic(mic, null);
                 for (int i = 0; i < 50 && c.HostVersion == null; i++) System.Threading.Thread.Sleep(20);
-                Note("host " + c.HostVersion + ": microphone " + (c.CanMic ? "taken" : "not taken") + ", NVDA text " + (c.CanNvda ? "offered" : "not offered") + ", sending microphone " + c.MicSending);
+                Note("host " + c.HostVersion + ": NVDA text " + (c.CanNvda ? "offered" : "not offered"));
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                bool offDone = false;
                 long lastBytes = 0, lastBytesAt = 0;
                 while (sw.Elapsed.TotalSeconds < controlSecs)
                 {
                     System.Threading.Thread.Sleep(200);
-                    if (micOff > 0 && !offDone && sw.Elapsed.TotalSeconds >= micOff) { offDone = true; c.SetMic(false, null); Note("microphone turned off"); }
                     if (soundOffAt > 0 && sw.Elapsed.TotalSeconds >= soundOffAt) { soundOffAt = 0; c.SoundOff = true; Note("sound turned off"); }
                     if (soundOnAt > 0 && sw.Elapsed.TotalSeconds >= soundOnAt) { soundOnAt = 0; c.SoundOff = false; Note("sound turned on"); }
                     if (sw.ElapsedMilliseconds / 5000 != lastBytesAt) { lastBytesAt = sw.ElapsedMilliseconds / 5000; long b = c.UdpBytesReceived; Note("UDP bytes received in the last 5 seconds: " + (b - lastBytes)); lastBytes = b; }
                 }
-                Note("done, microphone was " + (c.MicSending ? "on" : "off") + " at the end");
+                Note("done");
                 return 0;
             }
             if (args.Length is 5 or 6 && args[0] == "--makecopy")
@@ -363,6 +323,9 @@ namespace TailRemote
                 try { Carried.WriteCopy(Names.OwnExe, Path.GetFullPath(args[1]), plan); return 0; }
                 catch (Exception e) { CrashNote("--makecopy: " + e.Message); return 1; }
             }
+            // Pictures of Kova's windows, made off screen: --lookshot FOLDER [dark|light] (LookShot.cs).
+            if (args.Length >= 2 && args[0] == "--lookshot")
+                return LookShot.Run(args[1], args.Length > 2 ? args[2] == "dark" ? true : args[2] == "light" ? false : null : null);
             if (args.Length >= 1 && args[0] == "--dialogtest")
             {
                 // A blank window with a menu bar like the real one, opening a list and a typing box,
@@ -897,12 +860,6 @@ namespace TailRemote
                     || Native.SystemTool(@"C:\x\y.exe") != @"C:\x\y.exe")
                     return Fail("a Windows tool was not given its full System32 path");
             }
-            // VB-Cable's signer: exactly VB-Audio's name, not any name that holds it.
-            if (!AudioSetup.SignerIsVbAudio("CN=BUREL VINCENT, O=BUREL VINCENT, L=Paris, C=FR")
-                || !AudioSetup.SignerIsVbAudio("CN=BUREL VINCENT Entrepreneur individuel, O=BUREL VINCENT Entrepreneur individuel, STREET=21 avenue des Marguerites, L=Eymet, S=Dordogne, C=FR, OID.1.3.6.1.4.1.311.60.2.1.3=FR, SERIALNUMBER=423 734 177, OID.2.5.4.15=Private Organization")
-                || AudioSetup.SignerIsVbAudio("CN=NOT BUREL VINCENT LTD, O=Someone, C=US")
-                || AudioSetup.SignerIsVbAudio("CN=Someone, OU=BUREL VINCENT, C=US"))
-                return Fail("VB-Cable's signer check took the wrong certificate names");
             // The remote PC's health: each thing said once, at the right moment, and again only after it got better.
             {
                 var w = new HealthWatch();
@@ -1137,30 +1094,22 @@ namespace TailRemote
             System.Threading.Thread.Sleep(100);
             if (toHost != "from client ✓" || toClient != "from host ✓") return Fail("clipboard: host got " + toHost + ", client got " + toClient);
 
-            // The microphone (4.3): a controller's reaches the host under its own key; a listener's is never played;
-            // a packet played back later, or tampered with, is dropped.
+            // The microphone went in 4.11. A 4.10 PC may still send its messages and packets: all of it is ignored, by
+            // the host and by the controller, and nobody is dropped for it. Its numbers are never given to anything else.
             {
-                int heard = 0;
-                MicIn.TestHeard = (_, t) => System.Threading.Interlocked.Add(ref heard, t);
-                try
-                {
-                    for (int i = 0; i < 100 && (c.HostVersion == null || listener.HostVersion == null); i++) System.Threading.Thread.Sleep(20);
-                    if (!c.CanMic) return Fail("the host does not take a microphone");
-                    if (listener.CanMic) return Fail("a listen-only connection was offered the microphone");
-                    short[] tone = new short[Protocol.TickFrames * 2];
-                    for (int i = 0; i < Protocol.TickFrames; i++) tone[2 * i] = tone[2 * i + 1] = (short)(8000 * Math.Sin(i * 2 * Math.PI * 440 / Protocol.AudioRate));
-                    for (uint s = 0; s < 100; s++) { c.TestMicTick(s, tone); if (s % 10 == 9) System.Threading.Thread.Sleep(5); }
-                    for (int i = 0; i < 100 && System.Threading.Volatile.Read(ref heard) < 90; i++) System.Threading.Thread.Sleep(20);
-                    if (heard < 90) return Fail("microphone: the host heard " + heard + " of 100 ticks");
-                    if (!host.TestMicPlaying) return Fail("microphone: the host is not playing it");
-                    int before = heard;
-                    for (uint s = 0; s < 50; s++) listener.TestMicTick(s, tone);
-                    for (uint s = 0; s < 20; s++) c.TestMicTick(s, tone, replay: true); // the controller's oldest numbers again: a replay
-                    System.Threading.Thread.Sleep(300);
-                    if (heard != before) return Fail("microphone: a listener's or a replayed packet was played (" + (heard - before) + " ticks)");
-                    lossless += " | microphone: " + heard + " ticks heard, listener and replay refused";
-                }
-                finally { MicIn.TestHeard = null; }
+                for (int i = 0; i < 100 && (c.HostVersion == null || listener.HostVersion == null); i++) System.Threading.Thread.Sleep(20);
+                if ((c.TestPeerFeatures & 4096) != 0) return Fail("the host still offers the microphone's feature bit");
+                if ((c.TestPeerFeatures & Protocol.FeatureNoOutput) == 0) return Fail("the features that came do not include the newest one");
+                c.TestOldMicrophone(100);
+                listener.TestOldMicrophone(20);
+                host.TestOldMicrophoneWords();
+                System.Threading.Thread.Sleep(500);
+                if (c.TestClosed || listener.TestClosed) return Fail("a 4.10 PC's microphone messages dropped the connection");
+                if (log.Any(s => s.Contains("icrophone"))) return Fail("something was said about a 4.10 PC's microphone: " + Dump());
+                // And the connection still answers.
+                try { if (!c.RequestInfoAsync().Wait(5000)) return Fail("no answer after a 4.10 PC's microphone messages"); }
+                catch (Exception e) { return Fail("the connection stopped answering after a 4.10 PC's microphone messages: " + e.Message); }
+                lossless += " | a 4.10 PC's microphone ignored quietly";
             }
 
             // The remote NVDA as text (4.3): lines go to a PC that asked, and to nobody else.
@@ -1760,7 +1709,7 @@ namespace TailRemote
                 }
             }
             Directory.Delete(dir, true);
-            File.WriteAllText(Path.Combine(Path.GetTempPath(), "tailremote-selftest.txt"), "ok, ping " + c.LastPingMs + " ms. " + Dump() + lossless + CableReport());
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "tailremote-selftest.txt"), "ok, ping " + c.LastPingMs + " ms. " + Dump() + lossless);
             return 0;
 
             // Connects through a relay that flips one byte at 'at' in one direction; the error, or null.
@@ -1809,19 +1758,6 @@ namespace TailRemote
                     return null;
                 }
                 catch (Exception e) { return e; }
-            }
-
-            // Read-only: which virtual cable output setup would rename.
-            static string CableReport()
-            {
-                var d = AudioSetup.FindCable();
-                string name = "none";
-                if (d != null) { d.GetId(out string id); name = id; }
-                string sig = "";
-                // TAILREMOTE_VBCHECK: a real VB-Cable installer, and something that is not one.
-                if (Environment.GetEnvironmentVariable("TAILREMOTE_VBCHECK") is string vb && File.Exists(vb))
-                    sig = ", VB-Audio signature: genuine " + AudioSetup.SignedByVbAudio(vb) + ", other exe " + AudioSetup.SignedByVbAudio(Environment.ProcessPath!);
-                return " | cable output: " + name + sig;
             }
 
             int Fail(string why)

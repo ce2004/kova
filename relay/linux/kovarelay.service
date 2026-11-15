@@ -1,0 +1,66 @@
+# Kova Relay as a systemd service. See README.txt beside this file for how to install it.
+#
+# Copy this file to /etc/systemd/system/kovarelay.service and the program to /usr/local/bin/kovarelay.
+#
+# The relay runs as a user of its own that exists only while the service runs (DynamicUser), never as root.
+# All it may write is its own folder, /var/lib/kovarelay, where it keeps relay-log.txt. Everything it logs is
+# in the journal as well: journalctl -u kovarelay
+
+[Unit]
+Description=Kova Relay
+Documentation=https://github.com/ce2004/kova
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/kovarelay
+
+# The port comes from /etc/kovarelay/settings.json, which looks like this: { "Port": 47200 }
+# With no such file the relay uses port 47200. To set the port here instead, remove the mark
+# in front of the next line:
+#Environment=KOVA_RELAY_PORT=47200
+
+# Its own user, and a folder that user owns. systemd tells the relay where the folder is.
+DynamicUser=yes
+StateDirectory=kovarelay
+
+# Started again if it ever crashes or loses its port, but not when the settings file or the
+# options above are wrong (the relay ends with 2 then): starting it again would change nothing.
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+
+# Stopping: the relay closes every connection and writes its log when it is sent SIGTERM,
+# which takes a moment at most.
+TimeoutStopSec=15
+
+# Every connection is an open file to Linux. The relay takes up to 20,000 connections.
+LimitNOFILE=65536
+
+# The relay needs the network, its own folder, and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# No special rights at all. A port below 1024 would need CAP_NET_BIND_SERVICE in both of these lines.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Do not add MemoryDenyWriteExecute=yes: the relay is a .NET program, which makes its machine code
+# as it runs, and would not start.
+
+[Install]
+WantedBy=multi-user.target

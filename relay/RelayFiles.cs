@@ -87,6 +87,37 @@ namespace KovaRelay
             return new RelaySettings(oldPort);
         }
 
+        /// <summary>
+        /// The port in one settings.json, with plain words when the file is there but cannot be used. On Linux an
+        /// administrator writes /etc/kovarelay/settings.json by hand, so a slip in it is said at start rather than
+        /// quietly replaced by port 47200 (the Windows window shows the port; a headless relay shows nothing).
+        /// Null port and null problem: there is no such file.
+        /// </summary>
+        public static int? ReadPort(string file, out string? problem)
+        {
+            problem = null;
+            try
+            {
+                if (!File.Exists(file)) return null;
+                using var doc = JsonDocument.Parse(File.ReadAllBytes(file));
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("Port", out var p)) return null;
+                if (p.TryGetInt32(out int n) && n >= 1 && n <= 65535) return n;
+                problem = $"The port in {file} must be a number from 1 to 65535.";
+                return null;
+            }
+            catch (JsonException)
+            {
+                problem = $"{file} is not valid JSON. It should look like this: {{ \"Port\": {DefaultPort} }}";
+                return null;
+            }
+            catch (Exception e)
+            {
+                problem = $"{file} could not be read: {e.Message}";
+                return null;
+            }
+        }
+
         /// <summary>Writes settings.json (the elevated copy, and the self-test). False if it could not be written.</summary>
         public bool SaveSettings(RelaySettings settings)
         {
@@ -134,7 +165,16 @@ namespace KovaRelay
         private const long MaxBytes = 1 << 20;
         private const int MaxQueued = 2000;
 
+        /// <summary>The log file, or "" when there is nowhere to write one (Linux only: the lines still go to Echo).</summary>
         public string Path { get; private set; }
+
+        /// <summary>
+        /// Every line as it is written, time stamp included (the first StampLength characters). The relay on Linux
+        /// prints them, so systemd's journal has the log too. Called from the log's own thread, never the network's.
+        /// </summary>
+        public Action<string>? Echo { get; set; }
+        public const int StampLength = 21;   // "yyyy-MM-dd HH:mm:ss" and two spaces
+
         private readonly Queue<string> _queue = new();
         private readonly object _gate = new();
         private readonly AutoResetEvent _wake = new(false);
@@ -142,10 +182,17 @@ namespace KovaRelay
         private int _dropped;
         private volatile bool _stopping;
 
-        public RelayLog(string folder)
+        /// <param name="folder">Where relay-log.txt goes. Null (Linux, when no folder can be written): no file, Echo only.</param>
+        public RelayLog(string? folder)
         {
-            Path = System.IO.Path.Combine(folder, "relay-log.txt");
-            if (!CanWrite(Path))
+            Path = folder is null ? "" : System.IO.Path.Combine(folder, "relay-log.txt");
+            // The relay on Linux chooses a folder it can write before it gets here (linux\Program.cs), and there is
+            // no LocalAppData to fall back to: a log that still cannot be written is only printed.
+            if (!OperatingSystem.IsWindows())
+            {
+                if (Path.Length > 0 && !CanWrite(Path)) Path = "";
+            }
+            else if (!CanWrite(Path))
             {
                 string alt = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KovaRelay");
                 try { Directory.CreateDirectory(alt); } catch (Exception) { }
@@ -191,14 +238,25 @@ namespace KovaRelay
         private void WriteQueued()
         {
             if (_queue.Count == 0 && _dropped == 0) return;
+            // Windows line ends on Windows as before; plain ones on Linux, where tail and less are what reads the log.
+            string end = Environment.NewLine;
+            Action<string>? echo = Echo;
             var sb = new StringBuilder();
-            while (_queue.Count > 0) sb.Append(_queue.Dequeue()).Append("\r\n");
+            while (_queue.Count > 0)
+            {
+                string line = _queue.Dequeue();
+                sb.Append(line).Append(end);
+                Say(echo, line);
+            }
             if (_dropped > 0)
             {
-                sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture))
-                  .Append("  ").Append(_dropped).Append(" further log lines were not written because too many arrived at once.\r\n");
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                    + "  " + _dropped + " further log lines were not written because too many arrived at once.";
+                sb.Append(line).Append(end);
+                Say(echo, line);
                 _dropped = 0;
             }
+            if (Path.Length == 0) return;
             try
             {
                 var info = new FileInfo(Path);
@@ -209,6 +267,13 @@ namespace KovaRelay
                 fs.Write(bytes, 0, bytes.Length);
             }
             catch (Exception) { }   // a log that cannot be written must never stop the relay
+        }
+
+        // A closed terminal or a full pipe must never stop the relay, any more than a full disk may.
+        private static void Say(Action<string>? echo, string line)
+        {
+            if (echo is null) return;
+            try { echo(line); } catch (Exception) { }
         }
 
         public void Dispose()

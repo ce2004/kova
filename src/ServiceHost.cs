@@ -41,8 +41,6 @@ namespace TailRemote
             public string PasswordEnc { get; set; } = "";
             public string ListenPasswordEnc { get; set; } = "";
             public string CaptureDevice { get; set; } = "";
-            /// <summary>Where the controlling PC's microphone plays ("": Kova picks a virtual cable).</summary>
-            public string MicDevice { get; set; } = "";
             public bool Logging { get; set; }
             public bool WeSetSasPolicy { get; set; }
             /// <summary>Hosting at sign-in was on before the service replaced it: Remove turns it back on unless this is false.</summary>
@@ -241,7 +239,6 @@ namespace TailRemote
             public string Password { get; set; } = "";
             public string ListenPassword { get; set; } = "";
             public string CaptureDevice { get; set; } = "";
-            public string MicDevice { get; set; } = "";
             public bool Logging { get; set; }
             public string User { get; set; } = "";
             /// <summary>The window's lasting identity as a host (PKCS#8, base64): the service hosts as the same PC, so controlling PCs know it.</summary>
@@ -316,7 +313,7 @@ namespace TailRemote
                                 WriteBlock(pipe, JsonSerializer.SerializeToUtf8Bytes(new Handover
                                 {
                                     Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword,
-                                    CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging, User = me.Name,
+                                    CaptureDevice = s.CaptureDevice, Logging = s.Logging, User = me.Name,
                                     Identity = Settings.Unprotect(s.HostIdentityEnc),
                                     RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName, RelayOnly = s.RelayOnly,
                                 }));
@@ -374,7 +371,7 @@ namespace TailRemote
             var s = Settings.Load();
             return new Handover
             {
-                Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, MicDevice = s.MicOutput, Logging = s.Logging,
+                Port = s.Port, Password = s.Password, ListenPassword = s.ListenPassword, CaptureDevice = s.CaptureDevice, Logging = s.Logging,
                 Identity = Settings.Unprotect(s.HostIdentityEnc),
                 RelayHosting = s.RelayHosting, RelayAddress = s.RelayAddress, RelayPort = s.RelayPort, RelayName = s.RelayName, RelayOnly = s.RelayOnly,
             };
@@ -436,7 +433,6 @@ namespace TailRemote
                     PasswordEnc = Config.Seal(s.Password),
                     ListenPasswordEnc = Config.Seal(s.ListenPassword),
                     CaptureDevice = s.CaptureDevice,
-                    MicDevice = s.MicDevice ?? "",
                     Logging = s.Logging,
                     WeSetSasPolicy = old?.WeSetSasPolicy ?? false,
                     // Asked before the task goes (below); a reinstall keeps what the first install found.

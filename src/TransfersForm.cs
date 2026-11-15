@@ -36,6 +36,8 @@ namespace TailRemote
 
         public TransfersForm(Func<IReadOnlyList<FileChannel.Transfer>> going, Func<FileChannel.Transfer, int, string?, string> stop, Action stopAll, Action<string> say)
         {
+            // Colours and edges for somebody who can see it; nothing a screen reader meets changes (Look.Dress).
+            Load += (_, _) => Look.Dress(this);
             _going = going;
             _stop = stop;
             _say = say;
